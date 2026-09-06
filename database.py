@@ -1,21 +1,21 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
-DB_NAME = "mafia.db"
+DB_NAME = "chaoscore.db"
 
 
-def connect():
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_db():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def now():
-    return datetime.utcnow().isoformat()
-
-
 def init_db():
-    conn = connect()
+    conn = get_db()
     cur = conn.cursor()
 
     cur.execute("""
@@ -23,10 +23,7 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
-            coins INTEGER DEFAULT 1000,
-            games_played INTEGER DEFAULT 0,
-            wins INTEGER DEFAULT 0,
-            betrayals INTEGER DEFAULT 0,
+            coins INTEGER DEFAULT 0,
             created_at TEXT
         )
     """)
@@ -34,7 +31,6 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS admins (
             user_id INTEGER PRIMARY KEY,
-            added_by INTEGER,
             added_at TEXT
         )
     """)
@@ -42,26 +38,23 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS coin_transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER,
-            target_user_id INTEGER,
+            user_id INTEGER,
             amount INTEGER,
-            action TEXT,
+            reason TEXT,
             created_at TEXT
         )
     """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS games (
-            game_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            host_id INTEGER NOT NULL,
-            status TEXT DEFAULT 'lobby',
-            phase TEXT DEFAULT 'lobby',
-            round INTEGER DEFAULT 0,
-            night_target INTEGER,
-            doctor_target INTEGER,
-            detective_target INTEGER,
-            created_at TEXT
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            host_id INTEGER,
+            game_type TEXT,
+            status TEXT,
+            current_turn INTEGER DEFAULT 0,
+            created_at TEXT,
+            ended_at TEXT
         )
     """)
 
@@ -69,153 +62,108 @@ def init_db():
         CREATE TABLE IF NOT EXISTS game_players (
             game_id INTEGER,
             user_id INTEGER,
-            role TEXT,
-            alive INTEGER DEFAULT 1,
-            score INTEGER DEFAULT 0,
-            secret_mission TEXT,
+            position INTEGER,
+            joined_at TEXT,
             PRIMARY KEY(game_id, user_id)
         )
     """)
 
+    conn.commit()
+    conn.close()
+
+
+# ---------------- USER ----------------
+
+def add_user(user_id, username=None, first_name=None):
+    conn = get_db()
+    cur = conn.cursor()
+
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS game_votes (
-            game_id INTEGER,
-            voter_id INTEGER,
-            target_id INTEGER,
-            phase TEXT,
-            PRIMARY KEY(game_id, voter_id, phase)
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-def ensure_user(user):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT user_id FROM users WHERE user_id = ?",
-        (user.id,)
-    )
-
-    if cur.fetchone() is None:
-        cur.execute("""
-            INSERT INTO users
-            (user_id, username, first_name, coins, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            user.id,
-            user.username,
-            user.first_name,
-            1000,
-            now()
-        ))
-    else:
-        cur.execute("""
-            UPDATE users
-            SET username = ?, first_name = ?
-            WHERE user_id = ?
-        """, (
-            user.username,
-            user.first_name,
-            user.id
-        ))
-
-    conn.commit()
-    conn.close()
-
-
-def get_balance(user_id):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT coins FROM users WHERE user_id = ?",
-        (user_id,)
-    )
-
-    row = cur.fetchone()
-    conn.close()
-
-    return row["coins"] if row else 0
-
-
-def change_coins(admin_id, target_user_id, amount, action):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT coins FROM users WHERE user_id = ?",
-        (target_user_id,)
-    )
-
-    row = cur.fetchone()
-
-    if not row:
-        conn.close()
-        return None
-
-    old_balance = row["coins"]
-
-    if action == "add":
-        new_balance = old_balance + amount
-    else:
-        new_balance = max(0, old_balance - amount)
-
-    actual_change = new_balance - old_balance
+        INSERT OR IGNORE INTO users
+        (user_id, username, first_name, coins, created_at)
+        VALUES (?, ?, ?, 0, ?)
+    """, (user_id, username, first_name, now()))
 
     cur.execute("""
         UPDATE users
-        SET coins = ?
+        SET username = ?, first_name = ?
         WHERE user_id = ?
-    """, (
-        new_balance,
-        target_user_id
-    ))
-
-    cur.execute("""
-        INSERT INTO coin_transactions
-        (admin_id, target_user_id, amount, action, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        admin_id,
-        target_user_id,
-        actual_change,
-        action,
-        now()
-    ))
+    """, (username, first_name, user_id))
 
     conn.commit()
     conn.close()
 
-    return new_balance
+
+def get_user(user_id):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM users WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+    conn.close()
+    return row
 
 
-def add_admin(user_id, added_by):
-    conn = connect()
+def get_balance(user_id):
+    row = get_user(user_id)
+
+    if not row:
+        return 0
+
+    return row["coins"]
+
+
+def change_coins(user_id, amount, reason=""):
+    conn = get_db()
     cur = conn.cursor()
 
+    cur.execute(
+        "UPDATE users SET coins = coins + ? WHERE user_id = ?",
+        (amount, user_id)
+    )
+
     cur.execute("""
+        INSERT INTO coin_transactions
+        (user_id, amount, reason, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, amount, reason, now()))
+
+    conn.commit()
+    conn.close()
+
+
+# ---------------- ADMINS ----------------
+
+def is_admin(user_id):
+    conn = get_db()
+
+    row = conn.execute(
+        "SELECT user_id FROM admins WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return row is not None
+
+
+def add_admin(user_id):
+    conn = get_db()
+
+    conn.execute("""
         INSERT OR IGNORE INTO admins
-        (user_id, added_by, added_at)
-        VALUES (?, ?, ?)
-    """, (
-        user_id,
-        added_by,
-        now()
-    ))
+        (user_id, added_at)
+        VALUES (?, ?)
+    """, (user_id, now()))
 
     conn.commit()
     conn.close()
 
 
 def remove_admin(user_id):
-    conn = connect()
-    cur = conn.cursor()
+    conn = get_db()
 
-    cur.execute(
+    conn.execute(
         "DELETE FROM admins WHERE user_id = ?",
         (user_id,)
     )
@@ -224,87 +172,38 @@ def remove_admin(user_id):
     conn.close()
 
 
-def is_admin(user_id):
-    conn = connect()
-    cur = conn.cursor()
+# ---------------- LEADERBOARD ----------------
 
-    cur.execute(
-        "SELECT user_id FROM admins WHERE user_id = ?",
-        (user_id,)
-    )
+def leaderboard(limit=10):
+    conn = get_db()
 
-    result = cur.fetchone()
-
-    conn.close()
-
-    return result is not None
-
-
-def leaderboard(limit=20):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
+    rows = conn.execute("""
         SELECT user_id, username, first_name, coins
         FROM users
         ORDER BY coins DESC
         LIMIT ?
-    """, (limit,))
+    """, (limit,)).fetchall()
 
-    rows = cur.fetchall()
     conn.close()
 
     return rows
 
 
-def get_stats():
-    conn = connect()
-    cur = conn.cursor()
+# ---------------- GAME ----------------
 
-    cur.execute("SELECT COUNT(*) AS count FROM users")
-    users = cur.fetchone()["count"]
+def create_game(chat_id, host_id, game_type="parchi"):
+    conn = get_db()
 
-    cur.execute("SELECT COUNT(*) AS count FROM admins")
-    admins = cur.fetchone()["count"]
-
-    cur.execute("""
-        SELECT COALESCE(SUM(coins), 0) AS total
-        FROM users
-    """)
-    coins = cur.fetchone()["total"]
-
-    cur.execute("""
-        SELECT COUNT(*) AS count
-        FROM games
-        WHERE status = 'active'
-    """)
-    games = cur.fetchone()["count"]
-
-    conn.close()
-
-    return {
-        "users": users,
-        "admins": admins,
-        "coins": coins,
-        "games": games
-    }
-
-
-# =========================
-# GAME DATABASE
-# =========================
-
-def create_game(chat_id, host_id):
-    conn = connect()
     cur = conn.cursor()
 
     cur.execute("""
         INSERT INTO games
-        (chat_id, host_id, status, phase, round, created_at)
-        VALUES (?, ?, 'lobby', 'lobby', 0, ?)
+        (chat_id, host_id, game_type, status, current_turn, created_at)
+        VALUES (?, ?, ?, 'lobby', 0, ?)
     """, (
         chat_id,
         host_id,
+        game_type,
         now()
     ))
 
@@ -316,362 +215,137 @@ def create_game(chat_id, host_id):
     return game_id
 
 
-def get_active_game(chat_id):
-    conn = connect()
-    cur = conn.cursor()
+def get_game(game_id):
+    conn = get_db()
 
-    cur.execute("""
+    row = conn.execute("""
+        SELECT *
+        FROM games
+        WHERE id = ?
+    """, (game_id,)).fetchone()
+
+    conn.close()
+
+    return row
+
+
+def get_active_game(chat_id):
+    conn = get_db()
+
+    row = conn.execute("""
         SELECT *
         FROM games
         WHERE chat_id = ?
         AND status IN ('lobby', 'active')
-        ORDER BY game_id DESC
+        ORDER BY id DESC
         LIMIT 1
-    """, (chat_id,))
-
-    row = cur.fetchone()
+    """, (chat_id,)).fetchone()
 
     conn.close()
 
     return row
 
 
-def get_game(game_id):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT *
-        FROM games
-        WHERE game_id = ?
-    """, (game_id,))
-
-    row = cur.fetchone()
-
-    conn.close()
-
-    return row
-
-
-def add_game_player(game_id, user_id):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT OR IGNORE INTO game_players
-        (game_id, user_id)
-        VALUES (?, ?)
-    """, (
-        game_id,
-        user_id
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def get_game_players(game_id, alive_only=False):
-    conn = connect()
-    cur = conn.cursor()
-
-    if alive_only:
-        cur.execute("""
-            SELECT gp.*, u.username, u.first_name
-            FROM game_players gp
-            JOIN users u ON u.user_id = gp.user_id
-            WHERE gp.game_id = ?
-            AND gp.alive = 1
-        """, (game_id,))
-    else:
-        cur.execute("""
-            SELECT gp.*, u.username, u.first_name
-            FROM game_players gp
-            JOIN users u ON u.user_id = gp.user_id
-            WHERE gp.game_id = ?
-        """, (game_id,))
-
-    rows = cur.fetchall()
-
-    conn.close()
-
-    return rows
-
-
-def get_player(game_id, user_id):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT gp.*, u.username, u.first_name
-        FROM game_players gp
-        JOIN users u ON u.user_id = gp.user_id
-        WHERE gp.game_id = ?
-        AND gp.user_id = ?
-    """, (
-        game_id,
-        user_id
-    ))
-
-    row = cur.fetchone()
-
-    conn.close()
-
-    return row
-
-
-def update_game(game_id, **fields):
-    allowed = {
-        "status",
-        "phase",
-        "round",
-        "night_target",
-        "doctor_target",
-        "detective_target"
-    }
-
-    fields = {
-        key: value
-        for key, value in fields.items()
-        if key in allowed
-    }
-
-    if not fields:
-        return
-
-    conn = connect()
-    cur = conn.cursor()
-
-    assignments = ", ".join(
-        f"{key} = ?" for key in fields
-    )
-
-    values = list(fields.values())
-    values.append(game_id)
-
-    cur.execute(
-        f"""
-        UPDATE games
-        SET {assignments}
-        WHERE game_id = ?
-        """,
-        values
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def assign_player_role(
-    game_id,
-    user_id,
-    role,
-    mission
-):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        UPDATE game_players
-        SET role = ?, secret_mission = ?
-        WHERE game_id = ?
-        AND user_id = ?
-    """, (
-        role,
-        mission,
-        game_id,
-        user_id
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def kill_player(game_id, user_id):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        UPDATE game_players
-        SET alive = 0
-        WHERE game_id = ?
-        AND user_id = ?
-    """, (
-        game_id,
-        user_id
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def add_score(game_id, user_id, points):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        UPDATE game_players
-        SET score = score + ?
-        WHERE game_id = ?
-        AND user_id = ?
-    """, (
-        points,
-        game_id,
-        user_id
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def has_voted(game_id, voter_id, phase):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT 1
-        FROM game_votes
-        WHERE game_id = ?
-        AND voter_id = ?
-        AND phase = ?
-    """, (
-        game_id,
-        voter_id,
-        phase
-    ))
-
-    result = cur.fetchone()
-
-    conn.close()
-
-    return result is not None
-
-
-def add_vote(
-    game_id,
-    voter_id,
-    target_id,
-    phase
-):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT OR IGNORE INTO game_votes
-        (game_id, voter_id, target_id, phase)
-        VALUES (?, ?, ?, ?)
-    """, (
-        game_id,
-        voter_id,
-        target_id,
-        phase
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def get_votes(game_id, phase):
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT voter_id, target_id
-        FROM game_votes
-        WHERE game_id = ?
-        AND phase = ?
-    """, (
-        game_id,
-        phase
-    ))
-
-    rows = cur.fetchall()
-
-    conn.close()
-
-    return rows
-
-
-def clear_night_actions(game_id):
-    update_game(
-        game_id,
-        night_target=None,
-        doctor_target=None,
-        detective_target=None
-    )
-
-
-def increment_game_stats(game_id, winners):
-    conn = connect()
-    cur = conn.cursor()
-
-    players = get_game_players(game_id)
-
-    for player in players:
-
-        cur.execute("""
-            UPDATE users
-            SET games_played = games_played + 1
-            WHERE user_id = ?
-        """, (
-            player["user_id"],
-        ))
-
-        if player["user_id"] in winners:
-
-            cur.execute("""
-                UPDATE users
-                SET wins = wins + 1
-                WHERE user_id = ?
-            """, (
-                player["user_id"],
-            ))
-
-    conn.commit()
-    conn.close()
-
-
-def reward_players(game_id, winners):
-    conn = connect()
-    cur = conn.cursor()
-
-    for user_id in winners:
-
-        cur.execute("""
-            UPDATE users
-            SET coins = coins + 250
-            WHERE user_id = ?
-        """, (
-            user_id,
-        ))
-
-        cur.execute("""
-            INSERT INTO coin_transactions
-            (admin_id, target_user_id, amount, action, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            0,
-            user_id,
-            250,
-            "game_win",
-            now()
-        ))
+def update_game(game_id, status=None, current_turn=None):
+    conn = get_db()
+
+    if status is not None and current_turn is not None:
+        conn.execute("""
+            UPDATE games
+            SET status = ?, current_turn = ?
+            WHERE id = ?
+        """, (status, current_turn, game_id))
+
+    elif status is not None:
+        conn.execute("""
+            UPDATE games
+            SET status = ?
+            WHERE id = ?
+        """, (status, game_id))
+
+    elif current_turn is not None:
+        conn.execute("""
+            UPDATE games
+            SET current_turn = ?
+            WHERE id = ?
+        """, (current_turn, game_id))
 
     conn.commit()
     conn.close()
 
 
 def end_game(game_id):
-    conn = connect()
-    cur = conn.cursor()
+    conn = get_db()
 
-    cur.execute("""
+    conn.execute("""
         UPDATE games
-        SET status = 'finished',
-            phase = 'finished'
-        WHERE game_id = ?
+        SET status = 'ended',
+            ended_at = ?
+        WHERE id = ?
+    """, (now(), game_id))
+
+    conn.commit()
+    conn.close()
+
+
+def add_game_player(game_id, user_id, position):
+    conn = get_db()
+
+    conn.execute("""
+        INSERT OR IGNORE INTO game_players
+        (game_id, user_id, position, joined_at)
+        VALUES (?, ?, ?, ?)
     """, (
         game_id,
+        user_id,
+        position,
+        now()
     ))
 
     conn.commit()
     conn.close()
+
+
+def remove_game_player(game_id, user_id):
+    conn = get_db()
+
+    conn.execute("""
+        DELETE FROM game_players
+        WHERE game_id = ?
+        AND user_id = ?
+    """, (game_id, user_id))
+
+    conn.commit()
+    conn.close()
+
+
+def get_game_players(game_id):
+    conn = get_db()
+
+    rows = conn.execute("""
+        SELECT gp.*, u.username, u.first_name
+        FROM game_players gp
+        JOIN users u ON gp.user_id = u.user_id
+        WHERE gp.game_id = ?
+        ORDER BY gp.position ASC
+    """, (game_id,)).fetchall()
+
+    conn.close()
+
+    return rows
+
+
+def get_game_player(game_id, user_id):
+    conn = get_db()
+
+    row = conn.execute("""
+        SELECT gp.*, u.username, u.first_name
+        FROM game_players gp
+        JOIN users u ON gp.user_id = u.user_id
+        WHERE gp.game_id = ?
+        AND gp.user_id = ?
+    """, (game_id, user_id)).fetchone()
+
+    conn.close()
+
+    return row
