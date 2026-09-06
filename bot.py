@@ -83,8 +83,8 @@ def remember_user(user):
 
 def player_name(player):
     return (
-        player["first_name"]
-        or player["username"]
+        player.get("first_name")
+        or player.get("username")
         or "Player"
     )
 
@@ -131,8 +131,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/bal — Check coins\n"
         "/leaderboard — Top players\n\n"
 
-        "🚀 <b>Free Fly</b>\n"
-        "/fly — Start free arcade Fly\n"
+        "🚀 <b>Fly Mode</b>\n"
+        "/fly — Start a Fly betting round (60s lobby)\n"
+        "/f <amount> — Bet custom coin amount during lobby\n"
         "/stopfly — Owner-only emergency stop\n\n"
 
         "👑 <b>Owner</b>\n"
@@ -897,8 +898,41 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# FREE FLY
+# FLY GAME LOBBY & ENGINE
 # =========================================================
+
+def build_fly_bet_keyboard(chat_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("100", callback_data=f"flybet:{chat_id}:100"),
+            InlineKeyboardButton("200", callback_data=f"flybet:{chat_id}:200"),
+            InlineKeyboardButton("500", callback_data=f"flybet:{chat_id}:500"),
+        ],
+        [
+            InlineKeyboardButton("1000", callback_data=f"flybet:{chat_id}:1000"),
+            InlineKeyboardButton("2500", callback_data=f"flybet:{chat_id}:2500"),
+            InlineKeyboardButton("5000", callback_data=f"flybet:{chat_id}:5000"),
+        ]
+    ])
+
+
+def build_fly_lobby_text(time_left, bets):
+    text = (
+        "🚀 <b>FLY ROUND STARTING SOON!</b>\n\n"
+        f"⏳ Time remaining to place wagers: <b>{time_left}s</b>\n\n"
+        "Select an amount below or use <code>/f &lt;amount&gt;</code> to set a custom wager.\n\n"
+        "👥 <b>Current Bets:</b>\n"
+    )
+
+    if not bets:
+        text += "<i>No wagers placed yet.</i>\n"
+    else:
+        for user_id, info in bets.items():
+            name = info["first_name"] or info["username"] or "Player"
+            text += f"• {name}: 💰 <b>{info['amount']:,} coins</b>\n"
+
+    return text
+
 
 async def fly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remember_user(update.effective_user)
@@ -907,49 +941,208 @@ async def fly(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if chat_id in fly_games:
         await update.message.reply_text(
-            "🚀 A Fly round is already running."
+            "🚀 A Fly round is already active in this group."
         )
         return
 
     fly_games[chat_id] = {
-        "started_at": time.monotonic(),
+        "status": "lobby",
         "message_id": None,
         "owner_user_id": update.effective_user.id,
-        "cashed_out": False,
+        "bets": {},  # user_id -> {amount, name, first_name, username, cashed_out, cashout_mult, win_amount}
+        "started_at": None,
         "stopped": False
     }
 
-    keyboard = [[
-        InlineKeyboardButton(
-            "💰 CASH OUT",
-            callback_data=f"flycash:{chat_id}"
-        )
-    ]]
+    keyboard = build_fly_bet_keyboard(chat_id)
+    text = build_fly_lobby_text(60, {})
 
     sent = await update.message.reply_text(
-        "🚀 <b>FLY STARTED</b>\n\n"
-        "📈 Multiplier: <b>1.10x</b>\n\n"
-        "This is free arcade mode.\n"
-        "No coins are wagered.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        text,
+        reply_markup=keyboard,
         parse_mode="HTML"
     )
 
     fly_games[chat_id]["message_id"] = sent.message_id
 
     asyncio.create_task(
-        fly_loop(
-            context,
-            chat_id
-        )
+        fly_lobby_timer(context, chat_id)
     )
 
 
-# =========================================================
-# ONE-MESSAGE FLY LOOP
-# =========================================================
+async def fly_custom_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remember_user(update.effective_user)
 
-async def fly_loop(context, chat_id):
+    chat_id = update.effective_chat.id
+
+    state = fly_games.get(chat_id)
+
+    if not state or state["status"] != "lobby":
+        await update.message.reply_text(
+            "❌ No Fly betting lobby is active right now."
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Please enter an amount. Example: <code>/f 1500</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        amount = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Amount must be a valid number."
+        )
+        return
+
+    if amount <= 0:
+        await update.message.reply_text(
+            "❌ Amount must be greater than 0."
+        )
+        return
+
+    user = update.effective_user
+    user_id = user.id
+
+    current_balance = get_balance(user_id)
+
+    # Adjust for any current bet placed in this lobby
+    existing_bet = state["bets"].get(user_id, {}).get("amount", 0)
+
+    if current_balance + existing_bet < amount:
+        await update.message.reply_text(
+            f"❌ Insufficient balance! Your total balance is {current_balance:,} coins."
+        )
+        return
+
+    # Refund previous bet if overwriting
+    if existing_bet > 0:
+        change_coins(user_id, existing_bet, "Fly bet update refund")
+
+    change_coins(user_id, -amount, "Fly bet placed")
+
+    state["bets"][user_id] = {
+        "amount": amount,
+        "first_name": user.first_name,
+        "username": user.username,
+        "cashed_out": False,
+        "cashout_mult": 0.0,
+        "win_amount": 0
+    }
+
+    await update.message.reply_text(
+        f"✅ <b>Wager set!</b> {user.first_name} bet 💰 <b>{amount:,} coins</b>.",
+        parse_mode="HTML"
+    )
+
+
+async def fly_bet_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    parts = query.data.split(":")
+    chat_id = int(parts[1])
+    amount = int(parts[2])
+
+    state = fly_games.get(chat_id)
+
+    if not state or state["status"] != "lobby":
+        await query.answer(
+            "Lobby timer finished or round ended.",
+            show_alert=True
+        )
+        return
+
+    user = query.from_user
+    remember_user(user)
+
+    user_id = user.id
+    current_balance = get_balance(user_id)
+
+    existing_bet = state["bets"].get(user_id, {}).get("amount", 0)
+
+    if current_balance + existing_bet < amount:
+        await query.answer(
+            f"Insufficient balance! You have {current_balance:,} coins.",
+            show_alert=True
+        )
+        return
+
+    if existing_bet > 0:
+        change_coins(user_id, existing_bet, "Fly bet update refund")
+
+    change_coins(user_id, -amount, "Fly bet placed")
+
+    state["bets"][user_id] = {
+        "amount": amount,
+        "first_name": user.first_name,
+        "username": user.username,
+        "cashed_out": False,
+        "cashout_mult": 0.0,
+        "win_amount": 0
+    }
+
+    await query.answer(
+        f"Wager set to {amount:,} coins!",
+        show_alert=False
+    )
+
+
+async def fly_lobby_timer(context, chat_id):
+    for time_left in range(60, 0, -5):
+        await asyncio.sleep(5)
+
+        state = fly_games.get(chat_id)
+
+        if not state or state["stopped"]:
+            return
+
+        keyboard = build_fly_bet_keyboard(chat_id)
+        text = build_fly_lobby_text(time_left, state["bets"])
+
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=state["message_id"],
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    # Start round
+    state = fly_games.get(chat_id)
+
+    if not state or state["stopped"]:
+        return
+
+    if not state["bets"]:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=state["message_id"],
+                text="🚀 <b>FLY CANCELLED</b>\n\nNo wagers were placed.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+        fly_games.pop(chat_id, None)
+
+        return
+
+    state["status"] = "flying"
+    state["started_at"] = time.monotonic()
+
+    asyncio.create_task(
+        fly_flight_loop(context, chat_id)
+    )
+
+
+async def fly_flight_loop(context, chat_id):
     state = fly_games.get(chat_id)
 
     if not state:
@@ -957,7 +1150,6 @@ async def fly_loop(context, chat_id):
 
     started_at = state["started_at"]
 
-    # Random crash point.
     crash = round(
         min(
             100.0,
@@ -976,81 +1168,91 @@ async def fly_loop(context, chat_id):
 
         state = fly_games.get(chat_id)
 
-        if not state:
+        if not state or state["stopped"]:
             return
 
-        if state["stopped"]:
-            return
+        elapsed = time.monotonic() - started_at
 
-        if state["cashed_out"]:
-            return
+        multiplier = arcade_multiplier(elapsed)
 
-        elapsed = (
-            time.monotonic()
-            - started_at
+        # Check if all players cashed out
+        all_cashed_out = all(
+            b["cashed_out"] for b in state["bets"].values()
         )
 
-        multiplier = arcade_multiplier(
-            elapsed
-        )
+        if multiplier >= crash or all_cashed_out:
+            text = (
+                "💥 <b>FLY CRASHED!</b>\n\n"
+                f"📉 Final Multiplier: <b>{crash if multiplier >= crash else multiplier:.2f}x</b>\n\n"
+                "📊 <b>Results:</b>\n"
+            )
 
-        # Crash.
-        if multiplier >= crash:
+            for user_id, b in state["bets"].items():
+                name = b["first_name"] or b["username"] or "Player"
+
+                if b["cashed_out"]:
+                    text += (
+                        f"• {name}: Cashed out @ <b>{b['cashout_mult']:.2f}x</b> "
+                        f"(+<b>{b['win_amount']:,}</b> coins)\n"
+                    )
+                else:
+                    text += (
+                        f"• {name}: Crashed! (-<b>{b['amount']:,}</b> coins)\n"
+                    )
+
             try:
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=state["message_id"],
-                    text=(
-                        "💥 <b>FLY CRASHED!</b>\n\n"
-                        f"📉 Final multiplier: "
-                        f"<b>{crash:.2f}x</b>\n\n"
-                        "No coins were wagered."
-                    ),
+                    text=text,
                     parse_mode="HTML"
                 )
             except Exception:
                 pass
 
-            fly_games.pop(
-                chat_id,
-                None
-            )
+            fly_games.pop(chat_id, None)
 
             return
 
-        # Update the SAME message.
+        # Update message
         if multiplier > last_multiplier:
-            try:
-                keyboard = [[
-                    InlineKeyboardButton(
-                        "💰 CASH OUT",
-                        callback_data=f"flycash:{chat_id}"
-                    )
-                ]]
+            keyboard = [[
+                InlineKeyboardButton(
+                    "💰 CASH OUT",
+                    callback_data=f"flycash:{chat_id}"
+                )
+            ]]
 
+            text = (
+                "🚀 <b>FLYING...</b>\n\n"
+                f"📈 Multiplier: <b>{multiplier:.2f}x</b>\n\n"
+                "👥 <b>Players:</b>\n"
+            )
+
+            for user_id, b in state["bets"].items():
+                name = b["first_name"] or b["username"] or "Player"
+
+                if b["cashed_out"]:
+                    text += (
+                        f"• {name}: Cashed out @ <b>{b['cashout_mult']:.2f}x</b> "
+                        f"(<b>{b['win_amount']:,}</b> coins)\n"
+                    )
+                else:
+                    text += f"• {name}: 💰 <b>{b['amount']:,} coins</b> in play\n"
+
+            try:
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=state["message_id"],
-                    text=(
-                        "🚀 <b>FLY</b>\n\n"
-                        f"📈 Current multiplier: "
-                        f"<b>{multiplier:.2f}x</b>\n\n"
-                        "Press CASH OUT to finish this "
-                        "free arcade round."
-                    ),
+                    text=text,
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode="HTML"
                 )
-
             except Exception:
                 pass
 
             last_multiplier = multiplier
 
-
-# =========================================================
-# FLY CASH OUT
-# =========================================================
 
 async def fly_cashout(
     update: Update,
@@ -1058,59 +1260,49 @@ async def fly_cashout(
 ):
     query = update.callback_query
 
-    await query.answer()
-
-    chat_id = int(
-        query.data.split(":")[1]
-    )
+    chat_id = int(query.data.split(":")[1])
 
     state = fly_games.get(chat_id)
 
-    if not state:
+    if not state or state["status"] != "flying" or state["stopped"]:
         await query.answer(
-            "Fly round is already finished.",
+            "Fly round is not active.",
             show_alert=True
         )
         return
 
-    if state["cashed_out"]:
-        return
+    user_id = query.from_user.id
 
-    if state["stopped"]:
-        return
-
-    elapsed = (
-        time.monotonic()
-        - state["started_at"]
-    )
-
-    multiplier = arcade_multiplier(
-        elapsed
-    )
-
-    state["cashed_out"] = True
-
-    # Free arcade score.
-    arcade_points = max(
-        1,
-        int(multiplier * 100)
-    )
-
-    try:
-        await query.edit_message_text(
-            "💰 <b>CASHED OUT!</b>\n\n"
-            f"📈 Multiplier: <b>{multiplier:.2f}x</b>\n"
-            f"🎮 Arcade points: <b>{arcade_points:,}</b>\n\n"
-            "This was a free arcade round — "
-            "no coins were wagered.",
-            parse_mode="HTML"
+    if user_id not in state["bets"]:
+        await query.answer(
+            "You are not in this Fly round!",
+            show_alert=True
         )
-    except Exception:
-        pass
+        return
 
-    fly_games.pop(
-        chat_id,
-        None
+    b = state["bets"][user_id]
+
+    if b["cashed_out"]:
+        await query.answer(
+            "You already cashed out!",
+            show_alert=True
+        )
+        return
+
+    elapsed = time.monotonic() - state["started_at"]
+    multiplier = arcade_multiplier(elapsed)
+
+    winnings = int(b["amount"] * multiplier)
+
+    b["cashed_out"] = True
+    b["cashout_mult"] = multiplier
+    b["win_amount"] = winnings
+
+    change_coins(user_id, winnings, f"Fly win @ {multiplier}x")
+
+    await query.answer(
+        f"Cashed out at {multiplier:.2f}x! (+{winnings:,} coins)",
+        show_alert=True
     )
 
 
@@ -1139,6 +1331,11 @@ async def stopfly(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state["stopped"] = True
 
+    # Refund bets if in lobby/flight mode
+    for user_id, b in state["bets"].items():
+        if not b["cashed_out"]:
+            change_coins(user_id, b["amount"], "Fly round stopped refund")
+
     message_id = state["message_id"]
 
     try:
@@ -1147,8 +1344,7 @@ async def stopfly(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_id=message_id,
             text=(
                 "🛑 <b>FLY STOPPED BY OWNER</b>\n\n"
-                "The free arcade round has been stopped.\n"
-                "No coins were wagered."
+                "The round was cancelled and non-cashed out wagers were refunded."
             ),
             parse_mode="HTML"
         )
@@ -1376,6 +1572,12 @@ async def callbacks(
             context
         )
 
+    elif query.data.startswith("flybet:"):
+        await fly_bet_button(
+            update,
+            context
+        )
+
     elif query.data.startswith("flycash:"):
         await fly_cashout(
             update,
@@ -1436,9 +1638,13 @@ def main():
         CommandHandler("endgame", endgame)
     )
 
-    # Free Fly
+    # Fly Game
     application.add_handler(
         CommandHandler("fly", fly)
+    )
+
+    application.add_handler(
+        CommandHandler("f", fly_custom_bet)
     )
 
     application.add_handler(
