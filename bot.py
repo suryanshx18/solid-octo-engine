@@ -1,5 +1,6 @@
-import logging
 import os
+import asyncio
+import random
 
 from telegram import (
     Update,
@@ -14,1710 +15,1524 @@ from telegram.ext import (
     ContextTypes
 )
 
-import database
-import game
+from database import (
+    init_db,
+    add_user,
+    get_balance,
+    change_coins,
+    is_admin,
+    add_admin,
+    remove_admin,
+    leaderboard,
+    create_game,
+    get_game,
+    get_active_game,
+    update_game,
+    end_game,
+    add_game_player,
+    remove_game_player,
+    get_game_players,
+    get_game_player
+)
 
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+from game import (
+    PARCHI_VALUES,
+    deal_cards,
+    check_winner,
+    format_cards,
+    generate_crash_point,
+    multiplier_at_time,
+    calculate_payout,
+    MIN_MULTIPLIER,
+    MAX_MULTIPLIER
 )
 
 
-TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(
-    os.getenv("OWNER_ID", "0")
-)
-
-database.init_db()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 
-def mention_user(user):
+# =========================================================
+# GLOBAL GAME MEMORY
+# =========================================================
 
-    if user.username:
-        return f"@{user.username}"
+parchi_games = {}
 
-    return (
-        user.first_name
-        or str(user.id)
-    )
+fly_games = {}
 
 
-def mention_row(row):
+# =========================================================
+# HELPERS
+# =========================================================
 
-    if row["username"]:
-        return f"@{row['username']}"
+def mention(user):
+    name = user.first_name or "Player"
 
-    return (
-        row["first_name"]
-        or str(row["user_id"])
-    )
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
 
 
 def is_owner(user_id):
     return user_id == OWNER_ID
 
 
-def is_admin_or_owner(user_id):
+def is_privileged(user_id):
     return (
         is_owner(user_id)
-        or database.is_admin(user_id)
+        or is_admin(user_id)
     )
 
 
-# =========================
-# START
-# =========================
+def get_parchi_game(game_id):
+    return parchi_games.get(game_id)
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
 
-    database.ensure_user(
-        update.effective_user
+def game_is_active(game_id):
+    game = get_game(game_id)
+
+    if not game:
+        return False
+
+    return game["status"] in ("lobby", "active")
+
+
+# =========================================================
+# /START
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    add_user(
+        user.id,
+        user.username,
+        user.first_name
     )
+
+    await update.message.reply_text(
+        "🏏 <b>16 Parchi Game</b>\n\n"
+        "You are registered successfully.\n\n"
+        "Commands:\n"
+        "/startgame - Start a Parchi game\n"
+        "/bal - Check coins\n"
+        "/leaderboard - Leaderboard\n"
+        "/fly - Play Rocket Fly\n"
+        "/endgame - End current game\n",
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# BALANCE
+# =========================================================
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    add_user(
+        user.id,
+        user.username,
+        user.first_name
+    )
+
+    coins = get_balance(user.id)
+
+    await update.message.reply_text(
+        f"💰 <b>Your Coins:</b> {coins:,}",
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# LEADERBOARD
+# =========================================================
+
+async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    rows = leaderboard(10)
+
+    if not rows:
+        await update.message.reply_text(
+            "No players yet."
+        )
+        return
+
+    text = "🏆 <b>Leaderboard</b>\n\n"
+
+    for index, row in enumerate(rows, start=1):
+
+        name = row["first_name"] or row["username"] or "Player"
+
+        text += (
+            f"{index}. {name} — "
+            f"💰 {row['coins']:,}\n"
+        )
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# /STARTGAME
+# =========================================================
+
+async def startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.effective_chat.type == "private":
+        await update.message.reply_text(
+            "❌ Start the game inside a group."
+        )
+        return
 
-        balance = database.get_balance(
-            update.effective_user.id
+    user = update.effective_user
+
+    add_user(
+        user.id,
+        user.username,
+        user.first_name
+    )
+
+    existing = get_active_game(update.effective_chat.id)
+
+    if existing:
+        await update.message.reply_text(
+            "❌ A game is already running in this group."
+        )
+        return
+
+    game_id = create_game(
+        update.effective_chat.id,
+        user.id,
+        "parchi"
+    )
+
+    parchi_games[game_id] = {
+        "hands": {},
+        "turn": 0,
+        "started": False,
+        "removed": set(),
+        "winner": None
+    }
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🎟 Join Parchi Game",
+                callback_data=f"join:{game_id}"
+            )
+        ]
+    ]
+
+    await update.message.reply_text(
+        "🏏 <b>16 PARCHI GAME</b>\n\n"
+        "🎴 16 total parchis\n"
+        "👥 Exactly 4 players\n\n"
+        "Cards:\n"
+        "• Virat Kohli — 5,000 coins\n"
+        "• MS Dhoni — 4,500 coins\n"
+        "• Rohit Sharma — 4,000 coins\n"
+        "• KL Rahul — 3,500 coins\n\n"
+        "Each player gets 4 random cards.\n\n"
+        "⚠️ After joining, you have <b>60 seconds</b> "
+        "to open the bot privately and press /start.\n\n"
+        "Press the button to join.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# JOIN
+# =========================================================
+
+async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    game_id = int(query.data.split(":")[1])
+
+    game = get_game(game_id)
+
+    if not game:
+        await query.answer(
+            "Game no longer exists.",
+            show_alert=True
+        )
+        return
+
+    if game["status"] != "lobby":
+        await query.answer(
+            "Game already started.",
+            show_alert=True
+        )
+        return
+
+    user = query.from_user
+
+    add_user(
+        user.id,
+        user.username,
+        user.first_name
+    )
+
+    players = get_game_players(game_id)
+
+    already = get_game_player(
+        game_id,
+        user.id
+    )
+
+    if already:
+        await query.answer(
+            "You already joined!",
+            show_alert=True
+        )
+        return
+
+    if len(players) >= 4:
+        await query.answer(
+            "Game is full!",
+            show_alert=True
+        )
+        return
+
+    position = len(players)
+
+    add_game_player(
+        game_id,
+        user.id,
+        position
+    )
+
+    players = get_game_players(game_id)
+
+    text = (
+        "🏏 <b>16 PARCHI GAME</b>\n\n"
+        f"Game ID: <code>{game_id}</code>\n\n"
+        "Players:\n"
+    )
+
+    for p in players:
+        text += f"• {p['first_name'] or 'Player'}\n"
+
+    text += (
+        f"\n👥 {len(players)}/4 players\n\n"
+    )
+
+    if len(players) == 4:
+
+        text += (
+            "✅ <b>4 players joined!</b>\n\n"
+            "The bot will now check private access.\n"
+            "Every player must have opened the bot with /start.\n\n"
+            "⏳ You have 60 seconds."
         )
 
         keyboard = [
             [
                 InlineKeyboardButton(
-                    "📖 How To Play",
-                    callback_data="help"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "💰 Balance",
-                    callback_data="balance"
-                ),
-                InlineKeyboardButton(
-                    "🏆 Leaderboard",
-                    callback_data="leaderboard"
+                    "▶️ Begin Game",
+                    callback_data=f"begin:{game_id}"
                 )
             ]
         ]
 
-        if is_admin_or_owner(
-            update.effective_user.id
-        ):
-            keyboard.append([
-                InlineKeyboardButton(
-                    "⚙️ Admin Panel",
-                    callback_data="adminpanel"
-                )
-            ])
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
 
-        await update.message.reply_text(
-            "🕵️ MAFIA: HIDDEN CITY\n\n"
-
-            f"Welcome, "
-            f"{mention_user(update.effective_user)}!\n\n"
-
-            "🔫 Mafia\n"
-            "🔎 Detective\n"
-            "💊 Doctor\n"
-            "👥 Citizens\n\n"
-
-            f"💰 Balance: "
-            f"{balance:,} CHAOS\n\n"
-
-            "Add me to a Telegram group "
-            "to play multiplayer.",
-            reply_markup=InlineKeyboardMarkup(
-                keyboard
+        asyncio.create_task(
+            private_access_check(
+                context,
+                game_id,
+                update.effective_chat.id
             )
         )
 
     else:
 
-        await update.message.reply_text(
-            "🕵️ MAFIA: HIDDEN CITY\n\n"
-            "Use /startgame to create a game."
+        text += (
+            "\nWaiting for more players..."
+        )
+
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML"
         )
 
 
-# =========================
-# BALANCE
-# =========================
+# =========================================================
+# PRIVATE ACCESS CHECK
+# =========================================================
 
-async def bal(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def private_access_check(context, game_id, chat_id):
 
-    database.ensure_user(
-        update.effective_user
-    )
+    await asyncio.sleep(60)
 
-    balance = database.get_balance(
-        update.effective_user.id
-    )
+    game = get_game(game_id)
 
-    await update.message.reply_text(
-        "💰 YOUR BALANCE\n\n"
-
-        f"👤 {mention_user(update.effective_user)}\n"
-
-        f"🪙 {balance:,} CHAOS"
-    )
-
-
-# =========================
-# LEADERBOARD
-# =========================
-
-async def leaderboard_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    rows = database.leaderboard(20)
-
-    if not rows:
-
-        await update.message.reply_text(
-            "🏆 Leaderboard is empty."
-        )
-
+    if not game:
         return
 
-    text = "🏆 TOP 20 PLAYERS\n\n"
+    if game["status"] != "lobby":
+        return
 
-    medals = [
-        "🥇",
-        "🥈",
-        "🥉"
+    players = get_game_players(game_id)
+
+    kicked = []
+
+    for player in players:
+
+        user_id = player["user_id"]
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "🏏 Your Parchi game is ready!\n\n"
+                    "You passed the private bot check."
+                )
+            )
+
+        except Exception:
+
+            remove_game_player(
+                game_id,
+                user_id
+            )
+
+            kicked.append(
+                player["first_name"] or "Player"
+            )
+
+    remaining = get_game_players(game_id)
+
+    if kicked:
+
+        names = ", ".join(kicked)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏰ <b>60 seconds finished.</b>\n\n"
+                f"❌ Removed: {names}\n\n"
+                f"👥 Remaining players: {len(remaining)}/4\n\n"
+                "A new player can join."
+            ),
+            parse_mode="HTML"
+        )
+
+    if len(remaining) == 4:
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✅ All 4 players passed the private check.\n\n"
+                "The host can now press /begin."
+            )
+        )
+
+    elif len(remaining) < 4:
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚠️ The game needs exactly 4 players.\n"
+                "Use the Join button for replacement players."
+            )
+        )
+
+
+# =========================================================
+# /BEGIN
+# =========================================================
+
+async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(
+            "Use /begin inside the group."
+        )
+        return
+
+    game = get_active_game(
+        update.effective_chat.id
+    )
+
+    if not game:
+        await update.message.reply_text(
+            "❌ No active Parchi lobby."
+        )
+        return
+
+    user_id = update.effective_user.id
+
+    if (
+        user_id != game["host_id"]
+        and not is_privileged(user_id)
+    ):
+        await update.message.reply_text(
+            "❌ Only the host/admin can begin the game."
+        )
+        return
+
+    players = get_game_players(game["id"])
+
+    if len(players) != 4:
+
+        await update.message.reply_text(
+            f"❌ Exactly 4 players are required.\n"
+            f"Current players: {len(players)}"
+        )
+        return
+
+    game_id = game["id"]
+
+    player_ids = [
+        p["user_id"]
+        for p in players
     ]
 
-    for index, row in enumerate(
-        rows,
-        start=1
-    ):
+    hands = deal_cards(player_ids)
 
-        name = (
-            f"@{row['username']}"
-            if row["username"]
-            else row["first_name"]
-        )
+    parchi_games[game_id]["hands"] = hands
+    parchi_games[game_id]["turn"] = 0
+    parchi_games[game_id]["started"] = True
 
-        prefix = (
-            medals[index - 1]
-            if index <= 3
-            else f"{index}."
-        )
+    update_game(
+        game_id,
+        status="active",
+        current_turn=0
+    )
 
-        text += (
-            f"{prefix} {name} — "
-            f"{row['coins']:,} 🪙\n"
-        )
+    # Send secret cards.
+    for player in players:
+
+        user_id = player["user_id"]
+        cards = hands[user_id]
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "🎴 <b>YOUR SECRET PARCHIS</b>\n\n"
+                    f"{format_cards(cards)}\n\n"
+                    "Keep these cards private!"
+                ),
+                parse_mode="HTML"
+            )
+
+        except Exception:
+
+            remove_game_player(
+                game_id,
+                user_id
+            )
 
     await update.message.reply_text(
-        text
+        "🎴 <b>Cards have been distributed!</b>\n\n"
+        "Each player has 4 secret parchis.\n\n"
+        "The card passing round is starting.",
+        parse_mode="HTML"
+    )
+
+    await show_turn(
+        context,
+        update.effective_chat.id,
+        game_id
     )
 
 
-# =========================
-# ADD COINS
-# =========================
+# =========================================================
+# SHOW TURN
+# =========================================================
 
-async def add_coins(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def show_turn(context, chat_id, game_id):
 
-    if not is_owner(
-        update.effective_user.id
-    ):
+    game = get_game(game_id)
 
-        await update.message.reply_text(
-            "❌ Owner only."
-        )
-
+    if not game or game["status"] != "active":
         return
 
-    if not update.message.reply_to_message:
+    players = get_game_players(game_id)
 
-        await update.message.reply_text(
-            "Reply to a player's message.\n\n"
-            "/addc 500"
-        )
-
+    if len(players) != 4:
         return
 
-    if len(context.args) != 1:
+    state = parchi_games.get(game_id)
 
-        await update.message.reply_text(
-            "Usage: /addc amount"
-        )
-
+    if not state:
         return
 
-    try:
+    turn = state["turn"] % 4
 
-        amount = int(
-            context.args[0]
-        )
-
-        if amount <= 0:
-            raise ValueError
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "❌ Enter a valid positive amount."
-        )
-
-        return
-
-    target = (
-        update.message.reply_to_message.from_user
-    )
-
-    database.ensure_user(target)
-
-    new_balance = database.change_coins(
-        update.effective_user.id,
-        target.id,
-        amount,
-        "add"
-    )
-
-    await update.message.reply_text(
-        "💰 COINS ADDED\n\n"
-
-        f"👤 Player: "
-        f"{mention_user(target)}\n"
-
-        f"➕ Added: "
-        f"{amount:,}\n"
-
-        f"💵 New Balance: "
-        f"{new_balance:,}"
-    )
-
-
-# =========================
-# REMOVE COINS
-# =========================
-
-async def remove_coins(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_owner(
-        update.effective_user.id
-    ):
-
-        await update.message.reply_text(
-            "❌ Owner only."
-        )
-
-        return
-
-    if not update.message.reply_to_message:
-
-        await update.message.reply_text(
-            "Reply to a player's message.\n\n"
-            "/removec 500"
-        )
-
-        return
-
-    if len(context.args) != 1:
-
-        await update.message.reply_text(
-            "Usage: /removec amount"
-        )
-
-        return
-
-    try:
-
-        amount = int(
-            context.args[0]
-        )
-
-        if amount <= 0:
-            raise ValueError
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "❌ Enter a valid positive amount."
-        )
-
-        return
-
-    target = (
-        update.message.reply_to_message.from_user
-    )
-
-    database.ensure_user(target)
-
-    old_balance = database.get_balance(
-        target.id
-    )
-
-    new_balance = database.change_coins(
-        update.effective_user.id,
-        target.id,
-        amount,
-        "remove"
-    )
-
-    removed = (
-        old_balance - new_balance
-    )
-
-    await update.message.reply_text(
-        "💸 COINS REMOVED\n\n"
-
-        f"👤 Player: "
-        f"{mention_user(target)}\n"
-
-        f"➖ Removed: "
-        f"{removed:,}\n"
-
-        f"💵 New Balance: "
-        f"{new_balance:,}"
-    )
-
-
-# =========================
-# ADMIN
-# =========================
-
-async def add_admin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_owner(
-        update.effective_user.id
-    ):
-
-        await update.message.reply_text(
-            "❌ Owner only."
-        )
-
-        return
-
-    if not update.message.reply_to_message:
-
-        await update.message.reply_text(
-            "Reply to a user's message with /admin."
-        )
-
-        return
-
-    target = (
-        update.message.reply_to_message.from_user
-    )
-
-    if target.id == OWNER_ID:
-
-        await update.message.reply_text(
-            "👑 Owner is already above admin."
-        )
-
-        return
-
-    database.ensure_user(target)
-
-    database.add_admin(
-        target.id,
-        update.effective_user.id
-    )
-
-    await update.message.reply_text(
-        "🛡️ ADMIN ADDED\n\n"
-
-        f"👤 {mention_user(target)} "
-        "is now an admin."
-    )
-
-
-async def remove_admin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_owner(
-        update.effective_user.id
-    ):
-
-        await update.message.reply_text(
-            "❌ Owner only."
-        )
-
-        return
-
-    if not update.message.reply_to_message:
-
-        await update.message.reply_text(
-            "Reply to a user's message with /unadmin."
-        )
-
-        return
-
-    target = (
-        update.message.reply_to_message.from_user
-    )
-
-    database.remove_admin(
-        target.id
-    )
-
-    await update.message.reply_text(
-        "🛡️ ADMIN REMOVED\n\n"
-
-        f"👤 {mention_user(target)} "
-        "is no longer an admin."
-    )
-
-
-# =========================
-# ADMIN PANEL
-# =========================
-
-async def adminpanel(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_admin_or_owner(
-        update.effective_user.id
-    ):
-
-        await update.message.reply_text(
-            "❌ You don't have permission."
-        )
-
-        return
-
-    stats = database.get_stats()
+    current = players[turn]
 
     keyboard = [
         [
             InlineKeyboardButton(
-                "👥 Players",
-                callback_data="admin_players"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💰 Economy",
-                callback_data="admin_economy"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🎮 Active Games",
-                callback_data="admin_games"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📊 Statistics",
-                callback_data="admin_stats"
+                "🎴 Give 1 Card",
+                callback_data=f"give:{game_id}"
             )
         ]
     ]
 
-    if is_owner(
-        update.effective_user.id
-    ):
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"🎴 <b>{current['first_name'] or 'Player'}</b>'s turn\n\n"
+            "Choose one card to give to the next player.\n\n"
+            "Cards are transferred clockwise."
+        ),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# GIVE CARD
+# =========================================================
+
+async def give_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    game_id = int(
+        query.data.split(":")[1]
+    )
+
+    game = get_game(game_id)
+
+    if not game or game["status"] != "active":
+
+        await query.answer(
+            "Game is not active.",
+            show_alert=True
+        )
+        return
+
+    players = get_game_players(game_id)
+
+    if len(players) != 4:
+
+        await query.answer(
+            "Game no longer has 4 players.",
+            show_alert=True
+        )
+        return
+
+    state = parchi_games[game_id]
+
+    turn = state["turn"] % 4
+
+    current_player = players[turn]
+
+    if query.from_user.id != current_player["user_id"]:
+
+        await query.answer(
+            "It is not your turn.",
+            show_alert=True
+        )
+        return
+
+    cards = state["hands"][current_player["user_id"]]
+
+    if not cards:
+
+        await query.answer(
+            "You have no cards.",
+            show_alert=True
+        )
+        return
+
+    keyboard = []
+
+    for index, card in enumerate(cards):
 
         keyboard.append([
             InlineKeyboardButton(
-                "🛡️ Admin Management",
-                callback_data="admin_management"
+                f"{index + 1}. {card}",
+                callback_data=f"card:{game_id}:{index}"
             )
         ])
 
-    await update.message.reply_text(
-        "⚙️ MAFIA ADMIN PANEL\n\n"
-
-        f"👥 Players: "
-        f"{stats['users']}\n"
-
-        f"🛡️ Admins: "
-        f"{stats['admins']}\n"
-
-        f"🎮 Active games: "
-        f"{stats['games']}\n"
-
-        f"🪙 Total coins: "
-        f"{stats['coins']:,}",
-
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        )
+    await query.edit_message_text(
+        "🎴 <b>Choose the card to give</b>\n\n"
+        "The card will go to the next player.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML"
     )
 
 
-# =========================
-# START GAME
-# =========================
+# =========================================================
+# CARD SELECTED
+# =========================================================
 
-async def startgame(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def card_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if update.effective_chat.type == "private":
+    query = update.callback_query
 
-        await update.message.reply_text(
-            "⚠️ Start games inside a group."
+    await query.answer()
+
+    parts = query.data.split(":")
+
+    game_id = int(parts[1])
+    card_index = int(parts[2])
+
+    game = get_game(game_id)
+
+    if not game or game["status"] != "active":
+        return
+
+    players = get_game_players(game_id)
+
+    if len(players) != 4:
+        return
+
+    state = parchi_games[game_id]
+
+    turn = state["turn"] % 4
+
+    sender = players[turn]
+
+    if query.from_user.id != sender["user_id"]:
+
+        await query.answer(
+            "It is not your turn.",
+            show_alert=True
+        )
+        return
+
+    sender_cards = state["hands"][sender["user_id"]]
+
+    if card_index >= len(sender_cards):
+        return
+
+    card = sender_cards.pop(card_index)
+
+    next_index = (turn + 1) % 4
+
+    receiver = players[next_index]
+
+    state["hands"][receiver["user_id"]].append(card)
+
+    # Send updated private cards.
+    try:
+
+        await context.bot.send_message(
+            chat_id=receiver["user_id"],
+            text=(
+                "🎴 <b>You received a card!</b>\n\n"
+                f"Card: <b>{card}</b>\n\n"
+                "Your current cards:\n"
+                f"{format_cards(state['hands'][receiver['user_id']])}"
+            ),
+            parse_mode="HTML"
+        )
+
+    except Exception:
+        pass
+
+    # Check winner.
+    winner = check_winner(
+        state["hands"][receiver["user_id"]]
+    )
+
+    if winner:
+
+        state["winner"] = receiver["user_id"]
+
+        amount = winner["amount"]
+        winner_name = receiver["first_name"] or "Player"
+
+        change_coins(
+            receiver["user_id"],
+            amount,
+            f"Parchi win - {winner['player']}"
+        )
+
+        update_game(
+            game_id,
+            status="ended"
+        )
+
+        await context.bot.send_message(
+            chat_id=game["chat_id"],
+            text=(
+                "🎉 <b>PARCHI WINNER!</b>\n\n"
+                f"🏆 {winner_name}\n"
+                f"🎴 {winner['player']} × 4\n\n"
+                f"💰 Prize: <b>{amount:,} coins</b>\n\n"
+                "🏏 Game finished!"
+            ),
+            parse_mode="HTML"
         )
 
         return
 
-    database.ensure_user(
-        update.effective_user
+    # Next player's turn.
+    state["turn"] += 1
+
+    update_game(
+        game_id,
+        current_turn=state["turn"]
     )
 
-    existing = database.get_active_game(
+    await context.bot.send_message(
+        chat_id=game["chat_id"],
+        text=(
+            f"🎴 {sender['first_name'] or 'Player'} "
+            f"gave <b>{card}</b> to "
+            f"{receiver['first_name'] or 'Player'}."
+        ),
+        parse_mode="HTML"
+    )
+
+    await show_turn(
+        context,
+        game["chat_id"],
+        game_id
+    )
+
+
+# =========================================================
+# /ENDGAME
+# =========================================================
+
+async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(
+            "❌ Use /endgame inside the group."
+        )
+        return
+
+    game = get_active_game(
         update.effective_chat.id
     )
 
-    if existing:
+    if not game:
 
         await update.message.reply_text(
-            "⚠️ A game is already running."
+            "❌ There is no active game."
         )
-
         return
 
-    game_id = database.create_game(
+    user_id = update.effective_user.id
+
+    if (
+        user_id != game["host_id"]
+        and not is_privileged(user_id)
+    ):
+
+        await update.message.reply_text(
+            "❌ Only the game host, owner or admin can use /endgame."
+        )
+        return
+
+    end_game(game["id"])
+
+    parchi_games.pop(
+        game["id"],
+        None
+    )
+
+    fly_games.pop(
         update.effective_chat.id,
-        update.effective_user.id
+        None
     )
 
-    database.add_game_player(
-        game_id,
-        update.effective_user.id
+    await update.message.reply_text(
+        "🛑 <b>GAME ENDED</b>\n\n"
+        "The current game has been cancelled by the host/admin.\n"
+        "No further cards or Fly actions are allowed.",
+        parse_mode="HTML"
     )
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "🎮 JOIN",
-                callback_data=f"join:{game_id}"
+
+# =========================================================
+# /FLY
+# =========================================================
+
+async def fly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    add_user(
+        user.id,
+        user.username,
+        user.first_name
+    )
+
+    chat_id = update.effective_chat.id
+
+    if chat_id in fly_games:
+
+        await update.message.reply_text(
+            "🚀 A Fly round is already running."
+        )
+        return
+
+    # Syntax:
+    # /fly 100
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "🚀 <b>Fly</b>\n\n"
+            "Use:\n"
+            "<code>/fly 100</code>\n\n"
+            "Minimum bet: 1 coin.",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+
+        bet = int(context.args[0])
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ Enter a valid number."
+        )
+        return
+
+    if bet <= 0:
+
+        await update.message.reply_text(
+            "❌ Bet must be greater than 0."
+        )
+        return
+
+    balance = get_balance(user.id)
+
+    if balance < bet:
+
+        await update.message.reply_text(
+            f"❌ You only have {balance:,} coins."
+        )
+        return
+
+    change_coins(
+        user.id,
+        -bet,
+        "Fly bet"
+    )
+
+    fly_games[chat_id] = {
+        "crash": generate_crash_point(),
+        "players": {
+            user.id: {
+                "bet": bet,
+                "cashed_out": False,
+                "cashout_multiplier": None,
+                "payout": 0
+            }
+        },
+        "started": True
+    }
+
+    game = fly_games[chat_id]
+
+    await update.message.reply_text(
+        "🚀 <b>ROCKET FLY STARTED!</b>\n\n"
+        f"💰 Bet: {bet:,}\n"
+        f"📈 Starting multiplier: {MIN_MULTIPLIER}x\n"
+        f"📉 Maximum multiplier: {MAX_MULTIPLIER}x\n\n"
+        "Press CASH OUT before the rocket crashes!",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "💰 CASH OUT",
+                    callback_data=f"cashout:{chat_id}"
+                )
+            ]
+        ]),
+        parse_mode="HTML"
+    )
+
+    asyncio.create_task(
+        run_fly(
+            context,
+            chat_id
+        )
+    )
+
+
+# =========================================================
+# FLY ENGINE
+# =========================================================
+
+async def run_fly(context, chat_id):
+
+    game = fly_games.get(chat_id)
+
+    if not game:
+        return
+
+    crash = game["crash"]
+
+    elapsed = 0
+
+    while True:
+
+        await asyncio.sleep(1)
+
+        elapsed += 1
+
+        multiplier = multiplier_at_time(
+            elapsed
+        )
+
+        # Crash.
+        if multiplier >= crash:
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "💥 <b>ROCKET CRASHED!</b>\n\n"
+                    f"📉 Crash: <b>{crash:.2f}x</b>"
+                ),
+                parse_mode="HTML"
             )
-        ],
-        [
-            InlineKeyboardButton(
-                "📖 RULES",
-                callback_data="help"
+
+            # Players who did not cash out lose their bet.
+            results = []
+
+            for user_id, player in game["players"].items():
+
+                if player["cashed_out"]:
+
+                    results.append(
+                        f"💰 {user_id}: "
+                        f"+{player['payout']:,} coins"
+                    )
+
+                else:
+
+                    results.append(
+                        f"❌ {user_id}: "
+                        f"Lost {player['bet']:,} coins"
+                    )
+
+            if results:
+
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "📊 <b>Fly Results</b>\n\n"
+                        + "\n".join(results)
+                    ),
+                    parse_mode="HTML"
+                )
+
+            fly_games.pop(
+                chat_id,
+                None
             )
-        ]
+
+            return
+
+        # Maximum reached.
+        if multiplier >= MAX_MULTIPLIER:
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "🚀 <b>100x MAXIMUM REACHED!</b>\n\n"
+                    "The rocket has reached the maximum multiplier."
+                ),
+                parse_mode="HTML"
+            )
+
+            fly_games.pop(
+                chat_id,
+                None
+            )
+
+            return
+
+        # Update public multiplier.
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🚀 <b>{multiplier:.2f}x</b>",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        f"💰 CASH OUT @ {multiplier:.2f}x",
+                        callback_data=f"cashout:{chat_id}"
+                    )
+                ]
+            ]),
+            parse_mode="HTML"
+        )
+
+
+# =========================================================
+# CASH OUT
+# =========================================================
+
+async def cashout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    chat_id = int(
+        query.data.split(":")[1]
+    )
+
+    game = fly_games.get(chat_id)
+
+    if not game:
+
+        await query.answer(
+            "Rocket has already crashed.",
+            show_alert=True
+        )
+        return
+
+    user_id = query.from_user.id
+
+    player = game["players"].get(user_id)
+
+    if not player:
+
+        await query.answer(
+            "You don't have a bet in this round.",
+            show_alert=True
+        )
+        return
+
+    if player["cashed_out"]:
+
+        await query.answer(
+            "You already cashed out.",
+            show_alert=True
+        )
+        return
+
+    # Approximate current multiplier from elapsed time
+    # based on game start timestamp stored by task.
+    # We calculate using task start marker.
+    if "start_time" not in game:
+        game["start_time"] = asyncio.get_running_loop().time()
+
+    elapsed = (
+        asyncio.get_running_loop().time()
+        - game["start_time"]
+    )
+
+    multiplier = multiplier_at_time(
+        elapsed
+    )
+
+    if multiplier < MIN_MULTIPLIER:
+        multiplier = MIN_MULTIPLIER
+
+    multiplier = min(
+        multiplier,
+        MAX_MULTIPLIER
+    )
+
+    # If multiplier has already crossed crash point,
+    # cashout is invalid.
+    if multiplier >= game["crash"]:
+
+        await query.answer(
+            "💥 Too late! Rocket crashed.",
+            show_alert=True
+        )
+        return
+
+    payout = calculate_payout(
+        player["bet"],
+        multiplier
+    )
+
+    player["cashed_out"] = True
+    player["cashout_multiplier"] = multiplier
+    player["payout"] = payout
+
+    change_coins(
+        user_id,
+        payout,
+        f"Fly cashout at {multiplier:.2f}x"
+    )
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"💰 <b>{query.from_user.first_name}</b> "
+            f"cashed out!\n\n"
+            f"📈 Multiplier: <b>{multiplier:.2f}x</b>\n"
+            f"💵 Bet: {player['bet']:,}\n"
+            f"🏆 Won: <b>{payout:,} coins</b>"
+        ),
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# ADMIN COMMANDS
+# =========================================================
+
+async def add_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not is_owner(update.effective_user.id):
+
+        await update.message.reply_text(
+            "❌ Owner only."
+        )
+        return
+
+    if not update.message.reply_to_message:
+
+        await update.message.reply_text(
+            "Reply to a user's message:\n"
+            "/addc 1000"
+        )
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "Usage: /addc 1000"
+        )
+        return
+
+    try:
+        amount = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "Invalid amount."
+        )
+        return
+
+    target = update.message.reply_to_message.from_user
+
+    add_user(
+        target.id,
+        target.username,
+        target.first_name
+    )
+
+    change_coins(
+        target.id,
+        amount,
+        "Owner added coins"
+    )
+
+    await update.message.reply_text(
+        f"✅ Added {amount:,} coins to "
+        f"{target.first_name}."
+    )
+
+
+async def remove_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not is_owner(update.effective_user.id):
+
+        await update.message.reply_text(
+            "❌ Owner only."
+        )
+        return
+
+    if not update.message.reply_to_message:
+
+        await update.message.reply_text(
+            "Reply to a user's message:\n"
+            "/removec 1000"
+        )
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "Usage: /removec 1000"
+        )
+        return
+
+    try:
+        amount = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "Invalid amount."
+        )
+        return
+
+    target = update.message.reply_to_message.from_user
+
+    add_user(
+        target.id,
+        target.username,
+        target.first_name
+    )
+
+    change_coins(
+        target.id,
+        -abs(amount),
+        "Owner removed coins"
+    )
+
+    await update.message.reply_text(
+        f"✅ Removed {amount:,} coins from "
+        f"{target.first_name}."
+    )
+
+
+async def make_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not is_owner(update.effective_user.id):
+
+        await update.message.reply_text(
+            "❌ Owner only."
+        )
+        return
+
+    if not update.message.reply_to_message:
+
+        await update.message.reply_text(
+            "Reply to a user with /admin"
+        )
+        return
+
+    target = update.message.reply_to_message.from_user
+
+    add_admin(target.id)
+
+    await update.message.reply_text(
+        f"✅ {target.first_name} is now an admin."
+    )
+
+
+async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not is_owner(update.effective_user.id):
+
+        await update.message.reply_text(
+            "❌ Owner only."
+        )
+        return
+
+    if not update.message.reply_to_message:
+
+        await update.message.reply_text(
+            "Reply to a user with /unadmin"
+        )
+        return
+
+    target = update.message.reply_to_message.from_user
+
+    remove_admin(target.id)
+
+    await update.message.reply_text(
+        f"✅ {target.first_name} removed from admins."
+    )
+
+
+# =========================================================
+# CALLBACK ROUTER
+# =========================================================
+
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    query = update.callback_query
+
+    data = query.data
+
+    if data.startswith("join:"):
+        await join_game(
+            update,
+            context
+        )
+
+    elif data.startswith("begin:"):
+        await query.answer()
+
+        await begin_from_callback(
+            update,
+            context
+        )
+
+    elif data.startswith("give:"):
+        await give_card(
+            update,
+            context
+        )
+
+    elif data.startswith("card:"):
+        await card_selected(
+            update,
+            context
+        )
+
+    elif data.startswith("cashout:"):
+        await cashout(
+            update,
+            context
+        )
+
+
+# =========================================================
+# BEGIN BUTTON
+# =========================================================
+
+async def begin_from_callback(update, context):
+
+    query = update.callback_query
+
+    game_id = int(
+        query.data.split(":")[1]
+    )
+
+    game = get_game(game_id)
+
+    if not game:
+        return
+
+    if game["status"] != "lobby":
+
+        await query.answer(
+            "Game already started.",
+            show_alert=True
+        )
+        return
+
+    user_id = query.from_user.id
+
+    if (
+        user_id != game["host_id"]
+        and not is_privileged(user_id)
+    ):
+
+        await query.answer(
+            "Only the host/admin can begin.",
+            show_alert=True
+        )
+        return
+
+    players = get_game_players(game_id)
+
+    if len(players) != 4:
+
+        await query.answer(
+            "Exactly 4 players are required.",
+            show_alert=True
+        )
+        return
+
+    # Reuse begin logic.
+    update.message = None
+
+    await start_game_direct(
+        update,
+        context,
+        game_id
+    )
+
+
+async def start_game_direct(update, context, game_id):
+
+    game = get_game(game_id)
+
+    players = get_game_players(game_id)
+
+    if len(players) != 4:
+        return
+
+    player_ids = [
+        p["user_id"]
+        for p in players
     ]
 
-    await update.message.reply_text(
-        "🕵️ MAFIA: HIDDEN CITY\n\n"
-
-        "A new game lobby has opened!\n\n"
-
-        "👥 Players: 1/12\n\n"
-
-        "Press JOIN to enter.\n\n"
-
-        "Host uses /begin when "
-        "at least 4 players have joined.",
-
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        )
+    hands = deal_cards(
+        player_ids
     )
 
+    parchi_games[game_id] = {
+        "hands": hands,
+        "turn": 0,
+        "started": True,
+        "removed": set(),
+        "winner": None
+    }
 
-# =========================
-# BEGIN GAME
-# =========================
-
-async def begin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if update.effective_chat.type == "private":
-        return
-
-    active = database.get_active_game(
-        update.effective_chat.id
+    update_game(
+        game_id,
+        status="active",
+        current_turn=0
     )
 
-    if not active:
-
-        await update.message.reply_text(
-            "❌ No game lobby exists."
-        )
-
-        return
-
-    if active["host_id"] != update.effective_user.id:
-
-        await update.message.reply_text(
-            "❌ Only the host can begin."
-        )
-
-        return
-
-    players = database.get_game_players(
-        active["game_id"]
-    )
-
-    if len(players) < 4:
-
-        await update.message.reply_text(
-            f"❌ Need at least 4 players.\n"
-            f"Current: {len(players)}"
-        )
-
-        return
-
-    game.start_game(
-        active["game_id"]
-    )
-
-    # Secret role DM
     for player in players:
 
         try:
 
-            role_player = database.get_player(
-                active["game_id"],
-                player["user_id"]
-            )
-
             await context.bot.send_message(
                 chat_id=player["user_id"],
                 text=(
-                    "🔐 YOUR SECRET ROLE\n\n"
-
-                    f"🎭 Role: "
-                    f"{role_player['role']}\n\n"
-
-                    f"🎯 Mission:\n"
-                    f"{role_player['secret_mission']}\n\n"
-
-                    "Keep your role secret."
-                )
+                    "🎴 <b>YOUR SECRET PARCHIS</b>\n\n"
+                    f"{format_cards(hands[player['user_id']])}\n\n"
+                    "Don't show your cards to other players."
+                ),
+                parse_mode="HTML"
             )
 
         except Exception:
             pass
 
-    await update.message.reply_text(
-        "🌙 NIGHT 1 BEGINS!\n\n"
-
-        "Secret roles have been assigned.\n"
-        "Check your DM with the bot.\n\n"
-
-        "Mafia, Doctor and Detective "
-        "can make their choices."
-    )
-
-    await send_night_panel(
-        update.effective_chat.id,
-        active["game_id"],
-        context
-    )
-
-
-# =========================
-# NIGHT PANEL
-# =========================
-
-async def send_night_panel(
-    chat_id,
-    game_id,
-    context
-):
-
-    players = database.get_game_players(
-        game_id,
-        alive_only=True
-    )
-
-    keyboard = []
-
-    for player in players:
-
-        keyboard.append([
-            InlineKeyboardButton(
-                mention_row(player),
-                callback_data=(
-                    f"night:"
-                    f"{game_id}:"
-                    f"{player['user_id']}"
-                )
-            )
-        ])
-
     await context.bot.send_message(
-        chat_id=chat_id,
-
+        chat_id=game["chat_id"],
         text=(
-            "🌙 NIGHT PHASE\n\n"
-
-            "Choose a player according "
-            "to your role.\n\n"
-
-            "🔫 Mafia → eliminate a target\n"
-            "💊 Doctor → protect someone\n"
-            "🔎 Detective → investigate someone"
+            "🔥 <b>GAME STARTED!</b>\n\n"
+            "All 16 parchis have been distributed.\n"
+            "Each player has 4 cards.\n\n"
+            "Pass one card clockwise each turn.\n\n"
+            "First player to collect 4 identical cards wins!"
         ),
-
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        )
+        parse_mode="HTML"
     )
 
-
-# =========================
-# DAY PANEL
-# =========================
-
-async def send_day_panel(
-    chat_id,
-    game_id,
-    context
-):
-
-    players = database.get_game_players(
-        game_id,
-        alive_only=True
-    )
-
-    keyboard = []
-
-    for player in players:
-
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🗳️ {mention_row(player)}",
-                callback_data=(
-                    f"vote:"
-                    f"{game_id}:"
-                    f"{player['user_id']}"
-                )
-            )
-        ])
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-
-        text=(
-            "☀️ DAY PHASE\n\n"
-
-            "Discuss in the group.\n\n"
-
-            "Then vote for the player "
-            "you believe is Mafia.\n\n"
-
-            "Each player gets one vote."
-        ),
-
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        )
-    )
-
-
-# =========================
-# WIN CHECK
-# =========================
-
-async def check_winner(
-    chat_id,
-    game_id,
-    context
-):
-
-    winner, players = game.get_winner(
+    await show_turn(
+        context,
+        game["chat_id"],
         game_id
     )
 
-    if winner is None:
-        return False
 
-    if winner == "mafia":
-
-        text = (
-            "🔫 MAFIA WINS!\n\n"
-            "The Mafia controls the city.\n\n"
-        )
-
-    else:
-
-        text = (
-            "👥 CITIZENS WIN!\n\n"
-            "The Mafia has been eliminated.\n\n"
-        )
-
-    text += "🎭 FINAL ROLES\n\n"
-
-    for player in database.get_game_players(
-        game_id
-    ):
-
-        status = (
-            "❤️"
-            if player["alive"]
-            else "💀"
-        )
-
-        text += (
-            f"{status} "
-            f"{mention_row(player)} — "
-            f"{player['role']}\n"
-        )
-
-    winners = [
-        p["user_id"]
-        for p in players
-    ]
-
-    database.increment_game_stats(
-        game_id,
-        winners
-    )
-
-    database.reward_players(
-        game_id,
-        winners
-    )
-
-    database.end_game(
-        game_id
-    )
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-
-        text=(
-            text
-            + "\n🏆 Winners received "
-            "+250 CHAOS."
-        )
-    )
-
-    return True
-
-
-# =========================
-# END GAME
-# =========================
-
-async def endgame(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if update.effective_chat.type == "private":
-
-        await update.message.reply_text(
-            "⚠️ /endgame can only be used "
-            "inside a group."
-        )
-
-        return
-
-    active = database.get_active_game(
-        update.effective_chat.id
-    )
-
-    if not active:
-
-        await update.message.reply_text(
-            "❌ There is no active game."
-        )
-
-        return
-
-    # Host OR owner can end the game.
-    allowed = (
-        active["host_id"]
-        == update.effective_user.id
-        or is_owner(
-            update.effective_user.id
-        )
-    )
-
-    if not allowed:
-
-        await update.message.reply_text(
-            "❌ Only the game host or bot owner "
-            "can use /endgame."
-        )
-
-        return
-
-    game_id = active["game_id"]
-
-    players = database.get_game_players(
-        game_id
-    )
-
-    # Reveal roles.
-    text = (
-        "🛑 GAME ENDED\n\n"
-        "The game was manually ended.\n\n"
-        "🎭 SECRET ROLES REVEALED\n\n"
-    )
-
-    for player in players:
-
-        status = (
-            "❤️"
-            if player["alive"]
-            else "💀"
-        )
-
-        role = (
-            player["role"]
-            or "Unassigned"
-        )
-
-        text += (
-            f"{status} "
-            f"{mention_row(player)} — "
-            f"{role}\n"
-        )
-
-    database.end_game(
-        game_id
-    )
-
-    await update.message.reply_text(
-        text
-    )
-
-
-# =========================
-# CALLBACKS
-# =========================
-
-async def callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    user = query.from_user
-
-    database.ensure_user(user)
-
-    data = query.data
-
-    # -------------------------
-    # BALANCE
-    # -------------------------
-
-    if data == "balance":
-
-        balance = database.get_balance(
-            user.id
-        )
-
-        await query.answer(
-            f"Balance: {balance:,} CHAOS",
-            show_alert=True
-        )
-
-        return
-
-    # -------------------------
-    # LEADERBOARD
-    # -------------------------
-
-    if data == "leaderboard":
-
-        rows = database.leaderboard(20)
-
-        text = "🏆 TOP PLAYERS\n\n"
-
-        for i, row in enumerate(
-            rows,
-            1
-        ):
-
-            name = (
-                f"@{row['username']}"
-                if row["username"]
-                else row["first_name"]
-            )
-
-            text += (
-                f"{i}. {name} — "
-                f"{row['coins']:,} 🪙\n"
-            )
-
-        await query.message.reply_text(
-            text
-        )
-
-        await query.answer()
-
-        return
-
-    # -------------------------
-    # HELP
-    # -------------------------
-
-    if data == "help":
-
-        await query.answer()
-
-        await query.message.reply_text(
-            "📖 MAFIA: HIDDEN CITY\n\n"
-
-            "👥 4–12 players\n\n"
-
-            "🌙 NIGHT\n"
-            "🔫 Mafia chooses a target.\n"
-            "💊 Doctor protects someone.\n"
-            "🔎 Detective investigates someone.\n\n"
-
-            "☀️ DAY\n"
-            "Players discuss and vote.\n\n"
-
-            "🔫 Mafia wins when "
-            "Mafia >= Citizens.\n\n"
-
-            "👥 Citizens win when "
-            "all Mafia are eliminated.\n\n"
-
-            "Commands:\n"
-            "/startgame\n"
-            "/begin\n"
-            "/endgame\n"
-            "/bal\n"
-            "/leaderboard"
-        )
-
-        return
-
-    # -------------------------
-    # ADMIN PANEL
-    # -------------------------
-
-    if data == "adminpanel":
-
-        if not is_admin_or_owner(user.id):
-
-            await query.answer(
-                "❌ Permission denied.",
-                show_alert=True
-            )
-
-            return
-
-        stats = database.get_stats()
-
-        await query.message.reply_text(
-            "⚙️ ADMIN PANEL\n\n"
-
-            f"👥 Players: "
-            f"{stats['users']}\n"
-
-            f"🛡️ Admins: "
-            f"{stats['admins']}\n"
-
-            f"🎮 Games: "
-            f"{stats['games']}\n"
-
-            f"🪙 Coins: "
-            f"{stats['coins']:,}"
-        )
-
-        await query.answer()
-
-        return
-
-    # -------------------------
-    # JOIN
-    # -------------------------
-
-    if data.startswith("join:"):
-
-        game_id = int(
-            data.split(":")[1]
-        )
-
-        active = database.get_active_game(
-            query.message.chat.id
-        )
-
-        if (
-            not active
-            or active["game_id"] != game_id
-            or active["status"] != "lobby"
-        ):
-
-            await query.answer(
-                "❌ Game unavailable.",
-                show_alert=True
-            )
-
-            return
-
-        players = database.get_game_players(
-            game_id
-        )
-
-        if len(players) >= 12:
-
-            await query.answer(
-                "❌ Game is full.",
-                show_alert=True
-            )
-
-            return
-
-        if any(
-            p["user_id"] == user.id
-            for p in players
-        ):
-
-            await query.answer(
-                "You're already in.",
-                show_alert=True
-            )
-
-            return
-
-        database.add_game_player(
-            game_id,
-            user.id
-        )
-
-        players = database.get_game_players(
-            game_id
-        )
-
-        await query.answer(
-            "🎮 You joined!",
-            show_alert=True
-        )
-
-        await query.message.reply_text(
-            f"🎮 {mention_user(user)} joined!\n\n"
-            f"👥 Players: {len(players)}/12"
-        )
-
-        return
-
-    # -------------------------
-    # NIGHT
-    # -------------------------
-
-    if data.startswith("night:"):
-
-        parts = data.split(":")
-
-        game_id = int(parts[1])
-        target_id = int(parts[2])
-
-        current_game = database.get_game(
-            game_id
-        )
-
-        if not current_game:
-            await query.answer()
-            return
-
-        if (
-            current_game["status"] != "active"
-            or current_game["phase"] != "night"
-        ):
-
-            await query.answer(
-                "❌ Night is over.",
-                show_alert=True
-            )
-
-            return
-
-        player = database.get_player(
-            game_id,
-            user.id
-        )
-
-        target = database.get_player(
-            game_id,
-            target_id
-        )
-
-        if not player or not player["alive"]:
-
-            await query.answer(
-                "❌ You are not alive.",
-                show_alert=True
-            )
-
-            return
-
-        if not target or not target["alive"]:
-
-            await query.answer(
-                "❌ Invalid target.",
-                show_alert=True
-            )
-
-            return
-
-        role = player["role"]
-
-        if role == "Mafia":
-
-            if target_id == user.id:
-
-                await query.answer(
-                    "❌ You cannot target yourself.",
-                    show_alert=True
-                )
-
-                return
-
-            database.update_game(
-                game_id,
-                night_target=target_id
-            )
-
-            await query.answer(
-                "🔫 Target selected.",
-                show_alert=True
-            )
-
-        elif role == "Doctor":
-
-            database.update_game(
-                game_id,
-                doctor_target=target_id
-            )
-
-            await query.answer(
-                "💊 Protection selected.",
-                show_alert=True
-            )
-
-        elif role == "Detective":
-
-            database.update_game(
-                game_id,
-                detective_target=target_id
-            )
-
-            await context.bot.send_message(
-                chat_id=user.id,
-
-                text=(
-                    "🔎 INVESTIGATION RESULT\n\n"
-
-                    f"Player: "
-                    f"{mention_row(target)}\n"
-
-                    f"Role: "
-                    f"{target['role']}"
-                )
-            )
-
-            await query.answer(
-                "🔎 Check your DM.",
-                show_alert=True
-            )
-
-        else:
-
-            await query.answer(
-                "❌ Citizens have no night action.",
-                show_alert=True
-            )
-
-            return
-
-        # -------------------------
-        # CHECK NIGHT READY
-        # -------------------------
-
-        players = database.get_game_players(
-            game_id,
-            alive_only=True
-        )
-
-        mafia = [
-            p for p in players
-            if p["role"] == "Mafia"
-        ]
-
-        doctors = [
-            p for p in players
-            if p["role"] == "Doctor"
-        ]
-
-        detectives = [
-            p for p in players
-            if p["role"] == "Detective"
-        ]
-
-        latest = database.get_game(
-            game_id
-        )
-
-        mafia_ready = (
-            len(mafia) == 0
-            or latest["night_target"]
-            is not None
-        )
-
-        doctor_ready = (
-            len(doctors) == 0
-            or latest["doctor_target"]
-            is not None
-        )
-
-        detective_ready = (
-            len(detectives) == 0
-            or latest["detective_target"]
-            is not None
-        )
-
-        if (
-            mafia_ready
-            and doctor_ready
-            and detective_ready
-        ):
-
-            killed = game.resolve_night(
-                game_id
-            )
-
-            if killed:
-
-                await query.message.reply_text(
-                    "🌅 MORNING\n\n"
-
-                    f"💀 "
-                    f"{mention_row(killed)} "
-                    "was eliminated during "
-                    "the night."
-                )
-
-            else:
-
-                await query.message.reply_text(
-                    "🌅 MORNING\n\n"
-                    "✨ Nobody was eliminated."
-                )
-
-            if await check_winner(
-                query.message.chat.id,
-                game_id,
-                context
-            ):
-                return
-
-            database.update_game(
-                game_id,
-                phase="day"
-            )
-
-            await send_day_panel(
-                query.message.chat.id,
-                game_id,
-                context
-            )
-
-        return
-
-    # -------------------------
-    # VOTE
-    # -------------------------
-
-    if data.startswith("vote:"):
-
-        parts = data.split(":")
-
-        game_id = int(parts[1])
-        target_id = int(parts[2])
-
-        current_game = database.get_game(
-            game_id
-        )
-
-        if not current_game:
-            await query.answer()
-            return
-
-        if (
-            current_game["status"] != "active"
-            or current_game["phase"] != "day"
-        ):
-
-            await query.answer(
-                "❌ Voting isn't active.",
-                show_alert=True
-            )
-
-            return
-
-        voter = database.get_player(
-            game_id,
-            user.id
-        )
-
-        target = database.get_player(
-            game_id,
-            target_id
-        )
-
-        if not voter or not voter["alive"]:
-
-            await query.answer(
-                "❌ Dead players cannot vote.",
-                show_alert=True
-            )
-
-            return
-
-        if not target or not target["alive"]:
-
-            await query.answer(
-                "❌ Invalid target.",
-                show_alert=True
-            )
-
-            return
-
-        if target_id == user.id:
-
-            await query.answer(
-                "❌ You cannot vote yourself.",
-                show_alert=True
-            )
-
-            return
-
-        if database.has_voted(
-            game_id,
-            user.id,
-            "day"
-        ):
-
-            await query.answer(
-                "❌ You already voted.",
-                show_alert=True
-            )
-
-            return
-
-        database.add_vote(
-            game_id,
-            user.id,
-            target_id,
-            "day"
-        )
-
-        await query.answer(
-            "🗳️ Vote recorded.",
-            show_alert=True
-        )
-
-        alive_players = database.get_game_players(
-            game_id,
-            alive_only=True
-        )
-
-        votes = database.get_votes(
-            game_id,
-            "day"
-        )
-
-        # Everyone alive has voted.
-        if len(votes) >= len(alive_players):
-
-            eliminated, vote_count = (
-                game.resolve_day(game_id)
-            )
-
-            if eliminated:
-
-                await query.message.reply_text(
-                    "⚖️ VOTE RESULT\n\n"
-
-                    f"💀 "
-                    f"{mention_row(eliminated)} "
-                    f"was eliminated with "
-                    f"{vote_count} vote(s).\n\n"
-
-                    f"🎭 Role: "
-                    f"{eliminated['role']}"
-                )
-
-            else:
-
-                await query.message.reply_text(
-                    "⚖️ VOTE RESULT\n\n"
-
-                    "🤝 The vote ended in a tie.\n"
-                    "Nobody was eliminated."
-                )
-
-            if await check_winner(
-                query.message.chat.id,
-                game_id,
-                context
-            ):
-                return
-
-            current = database.get_game(
-                game_id
-            )
-
-            next_round = (
-                current["round"] + 1
-            )
-
-            database.update_game(
-                game_id,
-                phase="night",
-                round=next_round
-            )
-
-            await query.message.reply_text(
-                f"🌙 NIGHT {next_round} BEGINS!"
-            )
-
-            await send_night_panel(
-                query.message.chat.id,
-                game_id,
-                context
-            )
-
-        return
-
-    # -------------------------
-    # ADMIN
-    # -------------------------
-
-    if data.startswith("admin_"):
-
-        if not is_admin_or_owner(user.id):
-
-            await query.answer(
-                "❌ Permission denied.",
-                show_alert=True
-            )
-
-            return
-
-        await query.answer()
-
-        stats = database.get_stats()
-
-        if data == "admin_stats":
-
-            await query.message.reply_text(
-                "📊 STATISTICS\n\n"
-
-                f"👥 Players: "
-                f"{stats['users']}\n"
-
-                f"🛡️ Admins: "
-                f"{stats['admins']}\n"
-
-                f"🎮 Active games: "
-                f"{stats['games']}\n"
-
-                f"🪙 Total coins: "
-                f"{stats['coins']:,}"
-            )
-
-        elif data == "admin_economy":
-
-            await query.message.reply_text(
-                "💰 ECONOMY\n\n"
-
-                "Reply to a player's message:\n\n"
-
-                "/addc amount\n"
-                "/removec amount"
-            )
-
-        elif data == "admin_players":
-
-            await query.message.reply_text(
-                f"👥 Registered players: "
-                f"{stats['users']}"
-            )
-
-        elif data == "admin_games":
-
-            await query.message.reply_text(
-                f"🎮 Active games: "
-                f"{stats['games']}"
-            )
-
-        elif data == "admin_management":
-
-            if not is_owner(user.id):
-
-                await query.answer(
-                    "❌ Owner only.",
-                    show_alert=True
-                )
-
-                return
-
-            await query.message.reply_text(
-                "🛡️ ADMIN MANAGEMENT\n\n"
-
-                "Reply to a user's message:\n\n"
-
-                "/admin\n"
-                "/unadmin"
-            )
-
-        return
-
-
-# =========================
+# =========================================================
 # MAIN
-# =========================
+# =========================================================
 
 def main():
 
-    if not TOKEN:
+    if not BOT_TOKEN:
 
         raise RuntimeError(
-            "BOT_TOKEN environment variable "
-            "is missing."
+            "BOT_TOKEN environment variable is missing."
         )
 
-    if OWNER_ID == 0:
-
-        raise RuntimeError(
-            "OWNER_ID environment variable "
-            "is missing."
-        )
+    init_db()
 
     application = (
         Application.builder()
-        .token(TOKEN)
+        .token(BOT_TOKEN)
         .build()
     )
 
+    # General commands.
     application.add_handler(
         CommandHandler(
             "start",
@@ -1728,52 +1543,18 @@ def main():
     application.add_handler(
         CommandHandler(
             "bal",
-            bal
+            balance
         )
     )
 
     application.add_handler(
         CommandHandler(
             "leaderboard",
-            leaderboard_cmd
+            show_leaderboard
         )
     )
 
-    application.add_handler(
-        CommandHandler(
-            "addc",
-            add_coins
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "removec",
-            remove_coins
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "admin",
-            add_admin
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "unadmin",
-            remove_admin
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "adminpanel",
-            adminpanel
-        )
-    )
-
+    # Parchi.
     application.add_handler(
         CommandHandler(
             "startgame",
@@ -1795,19 +1576,53 @@ def main():
         )
     )
 
+    # Fly.
     application.add_handler(
-        CallbackQueryHandler(
-            callback
+        CommandHandler(
+            "fly",
+            fly
         )
     )
 
-    print(
-        "🕵️ MAFIA HIDDEN CITY BOT STARTED"
+    # Owner/admin.
+    application.add_handler(
+        CommandHandler(
+            "addc",
+            add_coins
+        )
     )
 
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
+    application.add_handler(
+        CommandHandler(
+            "removec",
+            remove_coins
+        )
     )
+
+    application.add_handler(
+        CommandHandler(
+            "admin",
+            make_admin
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "unadmin",
+            remove_admin_command
+        )
+
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            callbacks
+        )
+    )
+
+    print("🏏 16 Parchi Bot started...")
+
+    application.run_polling()
 
 
 if __name__ == "__main__":
