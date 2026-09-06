@@ -1,6 +1,6 @@
 import os
 import asyncio
-import random
+import time
 
 from telegram import (
     Update,
@@ -40,36 +40,21 @@ from game import (
     deal_cards,
     check_winner,
     format_cards,
-    generate_crash_point,
-    multiplier_at_time,
-    calculate_payout,
-    MIN_MULTIPLIER,
-    MAX_MULTIPLIER
+    arcade_multiplier
 )
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-
-# =========================================================
-# GLOBAL GAME MEMORY
-# =========================================================
-
+# In-memory state for currently running games.
 parchi_games = {}
-
 fly_games = {}
 
 
 # =========================================================
 # HELPERS
 # =========================================================
-
-def mention(user):
-    name = user.first_name or "Player"
-
-    return f'<a href="tg://user?id={user.id}">{name}</a>'
-
 
 def is_owner(user_id):
     return user_id == OWNER_ID
@@ -82,17 +67,20 @@ def is_privileged(user_id):
     )
 
 
-def get_parchi_game(game_id):
-    return parchi_games.get(game_id)
+def player_name(row):
+    return (
+        row["first_name"]
+        or row["username"]
+        or "Player"
+    )
 
 
-def game_is_active(game_id):
-    game = get_game(game_id)
-
-    if not game:
-        return False
-
-    return game["status"] in ("lobby", "active")
+def remember_user(user):
+    add_user(
+        user.id,
+        user.username,
+        user.first_name
+    )
 
 
 # =========================================================
@@ -100,55 +88,86 @@ def game_is_active(game_id):
 # =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user = update.effective_user
-
-    add_user(
-        user.id,
-        user.username,
-        user.first_name
-    )
+    remember_user(update.effective_user)
 
     await update.message.reply_text(
-        "🏏 <b>16 Parchi Game</b>\n\n"
-        "You are registered successfully.\n\n"
-        "Commands:\n"
-        "/startgame - Start a Parchi game\n"
-        "/bal - Check coins\n"
-        "/leaderboard - Leaderboard\n"
-        "/fly - Play Rocket Fly\n"
-        "/endgame - End current game\n",
+        "🏏 <b>Welcome to 16 Parchi!</b>\n\n"
+        "Your account is ready.\n\n"
+        "Use /help to see all commands.",
         parse_mode="HTML"
     )
 
 
 # =========================================================
-# BALANCE
+# /HELP
+# =========================================================
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remember_user(update.effective_user)
+
+    text = (
+        "📖 <b>16 PARCHI BOT — HELP</b>\n\n"
+
+        "🏏 <b>Parchi Game</b>\n"
+        "/startgame — Create a new game\n"
+        "/begin — Begin the 4-player game\n"
+        "/endgame — End the current game\n\n"
+
+        "💰 <b>Coins</b>\n"
+        "/bal — Check your balance\n"
+        "/leaderboard — Top 10 players\n\n"
+
+        "🚀 <b>Free Fly</b>\n"
+        "/fly — Start the free arcade multiplier\n\n"
+
+        "👑 <b>Owner Commands</b>\n"
+        "/give 1000 — Give coins by replying to a user\n"
+        "/add 1000 — Same as /give\n"
+        "/removec 1000 — Remove coins by reply\n"
+        "/admin — Make a replied user admin\n"
+        "/unadmin — Remove admin from a replied user\n\n"
+
+        "🎴 <b>Parchi Values</b>\n"
+        "Virat Kohli — 5,000 coins\n"
+        "MS Dhoni — 4,500 coins\n"
+        "Rohit Sharma — 4,000 coins\n"
+        "KL Rahul — 3,500 coins\n\n"
+
+        "ℹ️ The Parchi game requires exactly 4 players."
+    )
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# /BAL
 # =========================================================
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remember_user(update.effective_user)
 
-    user = update.effective_user
-
-    add_user(
-        user.id,
-        user.username,
-        user.first_name
+    coins = get_balance(
+        update.effective_user.id
     )
 
-    coins = get_balance(user.id)
-
     await update.message.reply_text(
-        f"💰 <b>Your Coins:</b> {coins:,}",
+        f"💰 <b>Your balance:</b> {coins:,} coins",
         parse_mode="HTML"
     )
 
 
 # =========================================================
-# LEADERBOARD
+# /LEADERBOARD
 # =========================================================
 
-async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_leaderboard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    remember_user(update.effective_user)
 
     rows = leaderboard(10)
 
@@ -158,11 +177,14 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    text = "🏆 <b>Leaderboard</b>\n\n"
+    text = "🏆 <b>LEADERBOARD</b>\n\n"
 
     for index, row in enumerate(rows, start=1):
-
-        name = row["first_name"] or row["username"] or "Player"
+        name = (
+            row["first_name"]
+            or row["username"]
+            or "Player"
+        )
 
         text += (
             f"{index}. {name} — "
@@ -183,29 +205,25 @@ async def startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.effective_chat.type == "private":
         await update.message.reply_text(
-            "❌ Start the game inside a group."
+            "❌ Start the Parchi game in a group."
         )
         return
 
-    user = update.effective_user
+    remember_user(update.effective_user)
 
-    add_user(
-        user.id,
-        user.username,
-        user.first_name
-    )
+    chat_id = update.effective_chat.id
 
-    existing = get_active_game(update.effective_chat.id)
+    existing = get_active_game(chat_id)
 
     if existing:
         await update.message.reply_text(
-            "❌ A game is already running in this group."
+            "❌ A game is already running here."
         )
         return
 
     game_id = create_game(
-        update.effective_chat.id,
-        user.id,
+        chat_id,
+        update.effective_user.id,
         "parchi"
     )
 
@@ -213,101 +231,51 @@ async def startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "hands": {},
         "turn": 0,
         "started": False,
-        "removed": set(),
         "winner": None
     }
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "🎟 Join Parchi Game",
-                callback_data=f"join:{game_id}"
-            )
-        ]
-    ]
+    keyboard = [[
+        InlineKeyboardButton(
+            "🎟 Join Parchi Game",
+            callback_data=f"join:{game_id}"
+        )
+    ]]
 
     await update.message.reply_text(
         "🏏 <b>16 PARCHI GAME</b>\n\n"
-        "🎴 16 total parchis\n"
+        f"Game ID: <code>{game_id}</code>\n\n"
+
+        "🎴 16 total cards\n"
         "👥 Exactly 4 players\n\n"
-        "Cards:\n"
+
+        "Card values:\n"
         "• Virat Kohli — 5,000 coins\n"
         "• MS Dhoni — 4,500 coins\n"
         "• Rohit Sharma — 4,000 coins\n"
         "• KL Rahul — 3,500 coins\n\n"
-        "Each player gets 4 random cards.\n\n"
-        "⚠️ After joining, you have <b>60 seconds</b> "
-        "to open the bot privately and press /start.\n\n"
-        "Press the button to join.",
+
+        "Each player gets 4 random cards.\n"
+        "Players pass one card clockwise.\n"
+        "Four identical cards wins the corresponding prize.\n\n"
+
+        "⚠️ After joining, each player must open "
+        "the bot privately and send /start.\n"
+        "You have 60 seconds for the private check.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML"
     )
 
 
 # =========================================================
-# JOIN
+# UPDATE LOBBY
 # =========================================================
 
-async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    game_id = int(query.data.split(":")[1])
+async def update_lobby_message(query, game_id):
 
     game = get_game(game_id)
 
-    if not game:
-        await query.answer(
-            "Game no longer exists.",
-            show_alert=True
-        )
+    if not game or game["status"] != "lobby":
         return
-
-    if game["status"] != "lobby":
-        await query.answer(
-            "Game already started.",
-            show_alert=True
-        )
-        return
-
-    user = query.from_user
-
-    add_user(
-        user.id,
-        user.username,
-        user.first_name
-    )
-
-    players = get_game_players(game_id)
-
-    already = get_game_player(
-        game_id,
-        user.id
-    )
-
-    if already:
-        await query.answer(
-            "You already joined!",
-            show_alert=True
-        )
-        return
-
-    if len(players) >= 4:
-        await query.answer(
-            "Game is full!",
-            show_alert=True
-        )
-        return
-
-    position = len(players)
-
-    add_game_player(
-        game_id,
-        user.id,
-        position
-    )
 
     players = get_game_players(game_id)
 
@@ -317,115 +285,208 @@ async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Players:\n"
     )
 
-    for p in players:
-        text += f"• {p['first_name'] or 'Player'}\n"
+    for index, player in enumerate(players, start=1):
+        text += (
+            f"{index}. {player_name(player)}\n"
+        )
 
     text += (
-        f"\n👥 {len(players)}/4 players\n\n"
+        f"\n👥 <b>{len(players)}/4 players</b>\n"
     )
 
-    if len(players) == 4:
+    if len(players) < 4:
 
         text += (
-            "✅ <b>4 players joined!</b>\n\n"
-            "The bot will now check private access.\n"
-            "Every player must have opened the bot with /start.\n\n"
-            "⏳ You have 60 seconds."
+            "\n⏳ Waiting for more players...\n\n"
+            "Anyone can press the button below."
         )
 
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "▶️ Begin Game",
-                    callback_data=f"begin:{game_id}"
-                )
-            ]
-        ]
+        keyboard = [[
+            InlineKeyboardButton(
+                "🎟 Join Parchi Game",
+                callback_data=f"join:{game_id}"
+            )
+        ]]
 
-        await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="HTML"
+    else:
+
+        text += (
+            "\n\n✅ <b>4/4 PLAYERS JOINED!</b>\n\n"
+            "⚠️ All players must have opened the bot "
+            "privately using /start.\n\n"
+            "⏳ 60-second private check is running."
         )
+
+        keyboard = [[
+            InlineKeyboardButton(
+                "▶️ Begin Game",
+                callback_data=f"begin:{game_id}"
+            )
+        ]]
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# JOIN GAME
+# =========================================================
+
+async def join_game(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    await query.answer()
+
+    game_id = int(
+        query.data.split(":")[1]
+    )
+
+    game = get_game(game_id)
+
+    if not game:
+        await query.answer(
+            "Game does not exist.",
+            show_alert=True
+        )
+        return
+
+    if game["status"] != "lobby":
+        await query.answer(
+            "Game has already started.",
+            show_alert=True
+        )
+        return
+
+    user = query.from_user
+
+    remember_user(user)
+
+    if get_game_player(game_id, user.id):
+        await query.answer(
+            "You already joined!",
+            show_alert=True
+        )
+        return
+
+    players = get_game_players(game_id)
+
+    if len(players) >= 4:
+        await query.answer(
+            "Game is full!",
+            show_alert=True
+        )
+        return
+
+    add_game_player(
+        game_id,
+        user.id,
+        len(players)
+    )
+
+    players = get_game_players(game_id)
+
+    await update_lobby_message(
+        query,
+        game_id
+    )
+
+    # Start private access check exactly when 4 players join.
+    if len(players) == 4:
 
         asyncio.create_task(
             private_access_check(
                 context,
                 game_id,
-                update.effective_chat.id
+                game["chat_id"]
             )
         )
 
-    else:
-
-        text += (
-            "\nWaiting for more players..."
-        )
-
-        await query.edit_message_text(
-            text,
-            parse_mode="HTML"
-        )
-
 
 # =========================================================
-# PRIVATE ACCESS CHECK
+# 60 SECOND PRIVATE CHECK
 # =========================================================
 
-async def private_access_check(context, game_id, chat_id):
+async def private_access_check(
+    context,
+    game_id,
+    chat_id
+):
 
-    await asyncio.sleep(60)
+    # Warning after 30 seconds.
+    await asyncio.sleep(30)
 
     game = get_game(game_id)
 
-    if not game:
+    if not game or game["status"] != "lobby":
         return
 
-    if game["status"] != "lobby":
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "⚠️ <b>30 seconds remaining!</b>\n\n"
+            "All 4 players must open the bot privately "
+            "and send /start."
+        ),
+        parse_mode="HTML"
+    )
+
+    # Finish the 60-second period.
+    await asyncio.sleep(30)
+
+    game = get_game(game_id)
+
+    if not game or game["status"] != "lobby":
         return
 
     players = get_game_players(game_id)
 
-    kicked = []
+    removed_names = []
 
     for player in players:
 
         user_id = player["user_id"]
 
         try:
-
+            # If this succeeds, the bot can DM them.
             await context.bot.send_message(
                 chat_id=user_id,
                 text=(
-                    "🏏 Your Parchi game is ready!\n\n"
-                    "You passed the private bot check."
+                    "✅ Private connection confirmed.\n\n"
+                    "You can receive your secret Parchi cards."
                 )
             )
 
         except Exception:
-
             remove_game_player(
                 game_id,
                 user_id
             )
 
-            kicked.append(
-                player["first_name"] or "Player"
+            removed_names.append(
+                player_name(player)
             )
 
     remaining = get_game_players(game_id)
 
-    if kicked:
-
-        names = ", ".join(kicked)
+    if removed_names:
 
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "⏰ <b>60 seconds finished.</b>\n\n"
-                f"❌ Removed: {names}\n\n"
-                f"👥 Remaining players: {len(remaining)}/4\n\n"
-                "A new player can join."
+                "⏰ <b>60-second check finished.</b>\n\n"
+                "❌ Removed:\n"
+                + "\n".join(
+                    f"• {name}"
+                    for name in removed_names
+                )
+                + f"\n\n👥 Remaining: {len(remaining)}/4\n\n"
+                "New players can join using the Join button."
             ),
             parse_mode="HTML"
         )
@@ -435,9 +496,10 @@ async def private_access_check(context, game_id, chat_id):
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "✅ All 4 players passed the private check.\n\n"
+                "✅ <b>All 4 players passed!</b>\n\n"
                 "The host can now press /begin."
-            )
+            ),
+            parse_mode="HTML"
         )
 
     elif len(remaining) < 4:
@@ -445,8 +507,8 @@ async def private_access_check(context, game_id, chat_id):
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "⚠️ The game needs exactly 4 players.\n"
-                "Use the Join button for replacement players."
+                "👥 The game needs 4 players again.\n\n"
+                "Use the Join button to add replacement players."
             )
         )
 
@@ -455,13 +517,18 @@ async def private_access_check(context, game_id, chat_id):
 # /BEGIN
 # =========================================================
 
-async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def begin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if update.effective_chat.type == "private":
         await update.message.reply_text(
-            "Use /begin inside the group."
+            "❌ Use /begin inside the group."
         )
         return
+
+    remember_user(update.effective_user)
 
     game = get_active_game(
         update.effective_chat.id
@@ -469,43 +536,64 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not game:
         await update.message.reply_text(
-            "❌ No active Parchi lobby."
+            "❌ No active game."
         )
         return
-
-    user_id = update.effective_user.id
 
     if (
-        user_id != game["host_id"]
-        and not is_privileged(user_id)
+        update.effective_user.id != game["host_id"]
+        and not is_privileged(update.effective_user.id)
     ):
         await update.message.reply_text(
-            "❌ Only the host/admin can begin the game."
+            "❌ Only the host, owner or admin can begin."
         )
         return
 
-    players = get_game_players(game["id"])
+    await start_parchi_game(
+        context,
+        game["id"]
+    )
+
+
+# =========================================================
+# START PARCHI GAME
+# =========================================================
+
+async def start_parchi_game(
+    context,
+    game_id
+):
+
+    game = get_game(game_id)
+
+    if not game or game["status"] != "lobby":
+        return
+
+    players = get_game_players(game_id)
 
     if len(players) != 4:
-
-        await update.message.reply_text(
-            f"❌ Exactly 4 players are required.\n"
-            f"Current players: {len(players)}"
+        await context.bot.send_message(
+            chat_id=game["chat_id"],
+            text=(
+                f"❌ Exactly 4 players are required.\n"
+                f"Current players: {len(players)}"
+            )
         )
         return
 
-    game_id = game["id"]
-
     player_ids = [
-        p["user_id"]
-        for p in players
+        player["user_id"]
+        for player in players
     ]
 
     hands = deal_cards(player_ids)
 
-    parchi_games[game_id]["hands"] = hands
-    parchi_games[game_id]["turn"] = 0
-    parchi_games[game_id]["started"] = True
+    parchi_games[game_id] = {
+        "hands": hands,
+        "turn": 0,
+        "started": True,
+        "winner": None
+    }
 
     update_game(
         game_id,
@@ -516,38 +604,35 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Send secret cards.
     for player in players:
 
-        user_id = player["user_id"]
-        cards = hands[user_id]
-
         try:
 
             await context.bot.send_message(
-                chat_id=user_id,
+                chat_id=player["user_id"],
                 text=(
                     "🎴 <b>YOUR SECRET PARCHIS</b>\n\n"
-                    f"{format_cards(cards)}\n\n"
-                    "Keep these cards private!"
+                    f"{format_cards(hands[player['user_id']])}\n\n"
+                    "🔒 Keep your cards secret!"
                 ),
                 parse_mode="HTML"
             )
 
         except Exception:
+            pass
 
-            remove_game_player(
-                game_id,
-                user_id
-            )
-
-    await update.message.reply_text(
-        "🎴 <b>Cards have been distributed!</b>\n\n"
-        "Each player has 4 secret parchis.\n\n"
-        "The card passing round is starting.",
+    await context.bot.send_message(
+        chat_id=game["chat_id"],
+        text=(
+            "🔥 <b>PARCHI GAME STARTED!</b>\n\n"
+            "🎴 All 16 cards have been distributed.\n\n"
+            "➡️ Pass exactly one card clockwise.\n"
+            "🏆 Get 4 identical cards to win!"
+        ),
         parse_mode="HTML"
     )
 
     await show_turn(
         context,
-        update.effective_chat.id,
+        game["chat_id"],
         game_id
     )
 
@@ -556,7 +641,11 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SHOW TURN
 # =========================================================
 
-async def show_turn(context, chat_id, game_id):
+async def show_turn(
+    context,
+    chat_id,
+    game_id
+):
 
     game = get_game(game_id)
 
@@ -577,21 +666,19 @@ async def show_turn(context, chat_id, game_id):
 
     current = players[turn]
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "🎴 Give 1 Card",
-                callback_data=f"give:{game_id}"
-            )
-        ]
-    ]
+    keyboard = [[
+        InlineKeyboardButton(
+            "🎴 Give 1 Card",
+            callback_data=f"give:{game_id}"
+        )
+    ]]
 
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"🎴 <b>{current['first_name'] or 'Player'}</b>'s turn\n\n"
-            "Choose one card to give to the next player.\n\n"
-            "Cards are transferred clockwise."
+            f"🎴 <b>{player_name(current)}</b>'s turn\n\n"
+            "Press the button and choose one card "
+            "to pass to the next player."
         ),
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML"
@@ -599,13 +686,15 @@ async def show_turn(context, chat_id, game_id):
 
 
 # =========================================================
-# GIVE CARD
+# GIVE CARD BUTTON
 # =========================================================
 
-async def give_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def give_card(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     query = update.callback_query
-
     await query.answer()
 
     game_id = int(
@@ -615,7 +704,6 @@ async def give_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game = get_game(game_id)
 
     if not game or game["status"] != "active":
-
         await query.answer(
             "Game is not active.",
             show_alert=True
@@ -625,41 +713,28 @@ async def give_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     players = get_game_players(game_id)
 
     if len(players) != 4:
-
-        await query.answer(
-            "Game no longer has 4 players.",
-            show_alert=True
-        )
         return
 
-    state = parchi_games[game_id]
+    state = parchi_games.get(game_id)
+
+    if not state:
+        return
 
     turn = state["turn"] % 4
+    current = players[turn]
 
-    current_player = players[turn]
-
-    if query.from_user.id != current_player["user_id"]:
-
+    if query.from_user.id != current["user_id"]:
         await query.answer(
             "It is not your turn.",
             show_alert=True
         )
         return
 
-    cards = state["hands"][current_player["user_id"]]
-
-    if not cards:
-
-        await query.answer(
-            "You have no cards.",
-            show_alert=True
-        )
-        return
+    cards = state["hands"][current["user_id"]]
 
     keyboard = []
 
     for index, card in enumerate(cards):
-
         keyboard.append([
             InlineKeyboardButton(
                 f"{index + 1}. {card}",
@@ -668,8 +743,8 @@ async def give_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
     await query.edit_message_text(
-        "🎴 <b>Choose the card to give</b>\n\n"
-        "The card will go to the next player.",
+        "🎴 <b>Choose one card</b>\n\n"
+        "That card will be passed to the next player.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML"
     )
@@ -679,10 +754,12 @@ async def give_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # CARD SELECTED
 # =========================================================
 
-async def card_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def card_selected(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     query = update.callback_query
-
     await query.answer()
 
     parts = query.data.split(":")
@@ -700,14 +777,16 @@ async def card_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(players) != 4:
         return
 
-    state = parchi_games[game_id]
+    state = parchi_games.get(game_id)
+
+    if not state:
+        return
 
     turn = state["turn"] % 4
 
     sender = players[turn]
 
     if query.from_user.id != sender["user_id"]:
-
         await query.answer(
             "It is not your turn.",
             show_alert=True
@@ -716,35 +795,32 @@ async def card_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sender_cards = state["hands"][sender["user_id"]]
 
-    if card_index >= len(sender_cards):
+    if card_index < 0 or card_index >= len(sender_cards):
         return
 
     card = sender_cards.pop(card_index)
 
-    next_index = (turn + 1) % 4
-
-    receiver = players[next_index]
+    receiver_index = (turn + 1) % 4
+    receiver = players[receiver_index]
 
     state["hands"][receiver["user_id"]].append(card)
 
-    # Send updated private cards.
+    # Secret notification.
     try:
-
         await context.bot.send_message(
             chat_id=receiver["user_id"],
             text=(
                 "🎴 <b>You received a card!</b>\n\n"
-                f"Card: <b>{card}</b>\n\n"
-                "Your current cards:\n"
+                f"Received: <b>{card}</b>\n\n"
+                "Your cards:\n"
                 f"{format_cards(state['hands'][receiver['user_id']])}"
             ),
             parse_mode="HTML"
         )
-
     except Exception:
         pass
 
-    # Check winner.
+    # Check four-of-a-kind.
     winner = check_winner(
         state["hands"][receiver["user_id"]]
     )
@@ -754,7 +830,6 @@ async def card_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["winner"] = receiver["user_id"]
 
         amount = winner["amount"]
-        winner_name = receiver["first_name"] or "Player"
 
         change_coins(
             receiver["user_id"],
@@ -771,7 +846,7 @@ async def card_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=game["chat_id"],
             text=(
                 "🎉 <b>PARCHI WINNER!</b>\n\n"
-                f"🏆 {winner_name}\n"
+                f"🏆 {player_name(receiver)}\n"
                 f"🎴 {winner['player']} × 4\n\n"
                 f"💰 Prize: <b>{amount:,} coins</b>\n\n"
                 "🏏 Game finished!"
@@ -779,9 +854,13 @@ async def card_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
+        parchi_games.pop(
+            game_id,
+            None
+        )
+
         return
 
-    # Next player's turn.
     state["turn"] += 1
 
     update_game(
@@ -792,9 +871,9 @@ async def card_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(
         chat_id=game["chat_id"],
         text=(
-            f"🎴 {sender['first_name'] or 'Player'} "
-            f"gave <b>{card}</b> to "
-            f"{receiver['first_name'] or 'Player'}."
+            f"🎴 {player_name(sender)} passed "
+            f"<b>{card}</b> to "
+            f"{player_name(receiver)}."
         ),
         parse_mode="HTML"
     )
@@ -810,11 +889,14 @@ async def card_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /ENDGAME
 # =========================================================
 
-async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def endgame(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if update.effective_chat.type == "private":
         await update.message.reply_text(
-            "❌ Use /endgame inside the group."
+            "❌ Use /endgame in the group."
         )
         return
 
@@ -823,7 +905,6 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if not game:
-
         await update.message.reply_text(
             "❌ There is no active game."
         )
@@ -835,9 +916,8 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id != game["host_id"]
         and not is_privileged(user_id)
     ):
-
         await update.message.reply_text(
-            "❌ Only the game host, owner or admin can use /endgame."
+            "❌ Only the host, owner or admin can end the game."
         )
         return
 
@@ -855,8 +935,8 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🛑 <b>GAME ENDED</b>\n\n"
-        "The current game has been cancelled by the host/admin.\n"
-        "No further cards or Fly actions are allowed.",
+        "The current game has been ended.\n"
+        "No further moves are allowed.",
         parse_mode="HTML"
     )
 
@@ -865,101 +945,31 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /FLY
 # =========================================================
 
-async def fly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def fly(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    user = update.effective_user
-
-    add_user(
-        user.id,
-        user.username,
-        user.first_name
-    )
+    remember_user(update.effective_user)
 
     chat_id = update.effective_chat.id
 
     if chat_id in fly_games:
-
         await update.message.reply_text(
             "🚀 A Fly round is already running."
         )
         return
 
-    # Syntax:
-    # /fly 100
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "🚀 <b>Fly</b>\n\n"
-            "Use:\n"
-            "<code>/fly 100</code>\n\n"
-            "Minimum bet: 1 coin.",
-            parse_mode="HTML"
-        )
-        return
-
-    try:
-
-        bet = int(context.args[0])
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "❌ Enter a valid number."
-        )
-        return
-
-    if bet <= 0:
-
-        await update.message.reply_text(
-            "❌ Bet must be greater than 0."
-        )
-        return
-
-    balance = get_balance(user.id)
-
-    if balance < bet:
-
-        await update.message.reply_text(
-            f"❌ You only have {balance:,} coins."
-        )
-        return
-
-    change_coins(
-        user.id,
-        -bet,
-        "Fly bet"
-    )
-
     fly_games[chat_id] = {
-        "crash": generate_crash_point(),
-        "players": {
-            user.id: {
-                "bet": bet,
-                "cashed_out": False,
-                "cashout_multiplier": None,
-                "payout": 0
-            }
-        },
-        "started": True
+        "started_at": time.monotonic(),
+        "active": True
     }
 
-    game = fly_games[chat_id]
-
     await update.message.reply_text(
-        "🚀 <b>ROCKET FLY STARTED!</b>\n\n"
-        f"💰 Bet: {bet:,}\n"
-        f"📈 Starting multiplier: {MIN_MULTIPLIER}x\n"
-        f"📉 Maximum multiplier: {MAX_MULTIPLIER}x\n\n"
-        "Press CASH OUT before the rocket crashes!",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "💰 CASH OUT",
-                    callback_data=f"cashout:{chat_id}"
-                )
-            ]
-        ]),
+        "🚀 <b>FREE FLY STARTED!</b>\n\n"
+        "Multiplier starts at <b>1.10x</b>.\n"
+        "Maximum: <b>100x</b>.\n\n"
+        "This is an arcade mode — no coins are wagered.",
         parse_mode="HTML"
     )
 
@@ -972,71 +982,61 @@ async def fly(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# FLY ENGINE
+# FREE FLY ENGINE
 # =========================================================
 
-async def run_fly(context, chat_id):
+async def run_fly(
+    context,
+    chat_id
+):
 
     game = fly_games.get(chat_id)
 
     if not game:
         return
 
-    crash = game["crash"]
+    started_at = game["started_at"]
 
-    elapsed = 0
+    # Random arcade ending between 1.10x and 100x.
+    import random
+
+    crash = round(
+        min(
+            100.0,
+            max(
+                1.10,
+                1.10 / random.random()
+            )
+        ),
+        2
+    )
+
+    last_multiplier = 1.10
 
     while True:
 
         await asyncio.sleep(1)
 
-        elapsed += 1
+        if chat_id not in fly_games:
+            return
 
-        multiplier = multiplier_at_time(
+        elapsed = time.monotonic() - started_at
+
+        multiplier = arcade_multiplier(
             elapsed
         )
 
-        # Crash.
         if multiplier >= crash:
 
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     "💥 <b>ROCKET CRASHED!</b>\n\n"
-                    f"📉 Crash: <b>{crash:.2f}x</b>"
+                    f"📉 Crash point: <b>{crash:.2f}x</b>\n\n"
+                    "🚀 Start another free round with /fly."
                 ),
                 parse_mode="HTML"
             )
-
-            # Players who did not cash out lose their bet.
-            results = []
-
-            for user_id, player in game["players"].items():
-
-                if player["cashed_out"]:
-
-                    results.append(
-                        f"💰 {user_id}: "
-                        f"+{player['payout']:,} coins"
-                    )
-
-                else:
-
-                    results.append(
-                        f"❌ {user_id}: "
-                        f"Lost {player['bet']:,} coins"
-                    )
-
-            if results:
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "📊 <b>Fly Results</b>\n\n"
-                        + "\n".join(results)
-                    ),
-                    parse_mode="HTML"
-                )
 
             fly_games.pop(
                 chat_id,
@@ -1045,223 +1045,109 @@ async def run_fly(context, chat_id):
 
             return
 
-        # Maximum reached.
-        if multiplier >= MAX_MULTIPLIER:
+        if multiplier > last_multiplier:
 
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=(
-                    "🚀 <b>100x MAXIMUM REACHED!</b>\n\n"
-                    "The rocket has reached the maximum multiplier."
-                ),
+                text=f"🚀 <b>{multiplier:.2f}x</b>",
                 parse_mode="HTML"
             )
 
-            fly_games.pop(
-                chat_id,
-                None
-            )
-
-            return
-
-        # Update public multiplier.
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"🚀 <b>{multiplier:.2f}x</b>",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        f"💰 CASH OUT @ {multiplier:.2f}x",
-                        callback_data=f"cashout:{chat_id}"
-                    )
-                ]
-            ]),
-            parse_mode="HTML"
-        )
+            last_multiplier = multiplier
 
 
 # =========================================================
-# CASH OUT
+# OWNER / GIVE COINS
 # =========================================================
 
-async def cashout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def give_coins(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    query = update.callback_query
-
-    await query.answer()
-
-    chat_id = int(
-        query.data.split(":")[1]
-    )
-
-    game = fly_games.get(chat_id)
-
-    if not game:
-
-        await query.answer(
-            "Rocket has already crashed.",
-            show_alert=True
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text(
+            "❌ Owner only."
         )
         return
 
-    user_id = query.from_user.id
-
-    player = game["players"].get(user_id)
-
-    if not player:
-
-        await query.answer(
-            "You don't have a bet in this round.",
-            show_alert=True
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "❌ Reply to a user's message.\n\n"
+            "Example:\n"
+            "/give 5000"
         )
         return
 
-    if player["cashed_out"]:
-
-        await query.answer(
-            "You already cashed out.",
-            show_alert=True
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Enter an amount.\n\n"
+            "Example:\n"
+            "/give 5000"
         )
         return
 
-    # Approximate current multiplier from elapsed time
-    # based on game start timestamp stored by task.
-    # We calculate using task start marker.
-    if "start_time" not in game:
-        game["start_time"] = asyncio.get_running_loop().time()
-
-    elapsed = (
-        asyncio.get_running_loop().time()
-        - game["start_time"]
-    )
-
-    multiplier = multiplier_at_time(
-        elapsed
-    )
-
-    if multiplier < MIN_MULTIPLIER:
-        multiplier = MIN_MULTIPLIER
-
-    multiplier = min(
-        multiplier,
-        MAX_MULTIPLIER
-    )
-
-    # If multiplier has already crossed crash point,
-    # cashout is invalid.
-    if multiplier >= game["crash"]:
-
-        await query.answer(
-            "💥 Too late! Rocket crashed.",
-            show_alert=True
+    try:
+        amount = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Amount must be a number."
         )
         return
 
-    payout = calculate_payout(
-        player["bet"],
-        multiplier
-    )
+    if amount <= 0:
+        await update.message.reply_text(
+            "❌ Amount must be greater than 0."
+        )
+        return
 
-    player["cashed_out"] = True
-    player["cashout_multiplier"] = multiplier
-    player["payout"] = payout
+    target = update.message.reply_to_message.from_user
+
+    remember_user(target)
 
     change_coins(
-        user_id,
-        payout,
-        f"Fly cashout at {multiplier:.2f}x"
+        target.id,
+        amount,
+        f"Owner gave {amount} coins"
     )
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"💰 <b>{query.from_user.first_name}</b> "
-            f"cashed out!\n\n"
-            f"📈 Multiplier: <b>{multiplier:.2f}x</b>\n"
-            f"💵 Bet: {player['bet']:,}\n"
-            f"🏆 Won: <b>{payout:,} coins</b>"
-        ),
+    new_balance = get_balance(target.id)
+
+    await update.message.reply_text(
+        "✅ <b>COINS ADDED</b>\n\n"
+        f"👤 {target.first_name}\n"
+        f"💰 Added: {amount:,}\n"
+        f"💳 Balance: {new_balance:,}",
         parse_mode="HTML"
     )
 
 
 # =========================================================
-# ADMIN COMMANDS
+# OWNER / REMOVE COINS
 # =========================================================
 
-async def add_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def remove_coins(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if not is_owner(update.effective_user.id):
-
         await update.message.reply_text(
             "❌ Owner only."
         )
         return
 
     if not update.message.reply_to_message:
-
         await update.message.reply_text(
-            "Reply to a user's message:\n"
-            "/addc 1000"
-        )
-        return
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Usage: /addc 1000"
-        )
-        return
-
-    try:
-        amount = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text(
-            "Invalid amount."
-        )
-        return
-
-    target = update.message.reply_to_message.from_user
-
-    add_user(
-        target.id,
-        target.username,
-        target.first_name
-    )
-
-    change_coins(
-        target.id,
-        amount,
-        "Owner added coins"
-    )
-
-    await update.message.reply_text(
-        f"✅ Added {amount:,} coins to "
-        f"{target.first_name}."
-    )
-
-
-async def remove_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not is_owner(update.effective_user.id):
-
-        await update.message.reply_text(
-            "❌ Owner only."
-        )
-        return
-
-    if not update.message.reply_to_message:
-
-        await update.message.reply_text(
-            "Reply to a user's message:\n"
+            "❌ Reply to a user's message.\n\n"
+            "Example:\n"
             "/removec 1000"
         )
         return
 
     if not context.args:
-
         await update.message.reply_text(
-            "Usage: /removec 1000"
+            "❌ Enter an amount."
         )
         return
 
@@ -1269,22 +1155,24 @@ async def remove_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = int(context.args[0])
     except ValueError:
         await update.message.reply_text(
-            "Invalid amount."
+            "❌ Amount must be a number."
+        )
+        return
+
+    if amount <= 0:
+        await update.message.reply_text(
+            "❌ Amount must be greater than 0."
         )
         return
 
     target = update.message.reply_to_message.from_user
 
-    add_user(
-        target.id,
-        target.username,
-        target.first_name
-    )
+    remember_user(target)
 
     change_coins(
         target.id,
-        -abs(amount),
-        "Owner removed coins"
+        -amount,
+        f"Owner removed {amount} coins"
     )
 
     await update.message.reply_text(
@@ -1293,24 +1181,30 @@ async def remove_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def make_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# /ADMIN
+# =========================================================
+
+async def make_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if not is_owner(update.effective_user.id):
-
         await update.message.reply_text(
             "❌ Owner only."
         )
         return
 
     if not update.message.reply_to_message:
-
         await update.message.reply_text(
-            "Reply to a user with /admin"
+            "❌ Reply to the user with /admin."
         )
         return
 
     target = update.message.reply_to_message.from_user
 
+    remember_user(target)
     add_admin(target.id)
 
     await update.message.reply_text(
@@ -1318,19 +1212,24 @@ async def make_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# /UNADMIN
+# =========================================================
+
+async def remove_admin_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if not is_owner(update.effective_user.id):
-
         await update.message.reply_text(
             "❌ Owner only."
         )
         return
 
     if not update.message.reply_to_message:
-
         await update.message.reply_text(
-            "Reply to a user with /unadmin"
+            "❌ Reply to the user with /unadmin."
         )
         return
 
@@ -1339,7 +1238,7 @@ async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYP
     remove_admin(target.id)
 
     await update.message.reply_text(
-        f"✅ {target.first_name} removed from admins."
+        f"✅ {target.first_name} is no longer an admin."
     )
 
 
@@ -1347,169 +1246,57 @@ async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYP
 # CALLBACK ROUTER
 # =========================================================
 
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callbacks(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     query = update.callback_query
 
-    data = query.data
-
-    if data.startswith("join:"):
+    if query.data.startswith("join:"):
         await join_game(
             update,
             context
         )
 
-    elif data.startswith("begin:"):
+    elif query.data.startswith("begin:"):
         await query.answer()
 
-        await begin_from_callback(
-            update,
-            context
+        game_id = int(
+            query.data.split(":")[1]
         )
 
-    elif data.startswith("give:"):
+        game = get_game(game_id)
+
+        if not game:
+            return
+
+        if (
+            query.from_user.id != game["host_id"]
+            and not is_privileged(query.from_user.id)
+        ):
+            await query.answer(
+                "Only the host/admin can begin.",
+                show_alert=True
+            )
+            return
+
+        await start_parchi_game(
+            context,
+            game_id
+        )
+
+    elif query.data.startswith("give:"):
         await give_card(
             update,
             context
         )
 
-    elif data.startswith("card:"):
+    elif query.data.startswith("card:"):
         await card_selected(
             update,
             context
         )
-
-    elif data.startswith("cashout:"):
-        await cashout(
-            update,
-            context
-        )
-
-
-# =========================================================
-# BEGIN BUTTON
-# =========================================================
-
-async def begin_from_callback(update, context):
-
-    query = update.callback_query
-
-    game_id = int(
-        query.data.split(":")[1]
-    )
-
-    game = get_game(game_id)
-
-    if not game:
-        return
-
-    if game["status"] != "lobby":
-
-        await query.answer(
-            "Game already started.",
-            show_alert=True
-        )
-        return
-
-    user_id = query.from_user.id
-
-    if (
-        user_id != game["host_id"]
-        and not is_privileged(user_id)
-    ):
-
-        await query.answer(
-            "Only the host/admin can begin.",
-            show_alert=True
-        )
-        return
-
-    players = get_game_players(game_id)
-
-    if len(players) != 4:
-
-        await query.answer(
-            "Exactly 4 players are required.",
-            show_alert=True
-        )
-        return
-
-    # Reuse begin logic.
-    update.message = None
-
-    await start_game_direct(
-        update,
-        context,
-        game_id
-    )
-
-
-async def start_game_direct(update, context, game_id):
-
-    game = get_game(game_id)
-
-    players = get_game_players(game_id)
-
-    if len(players) != 4:
-        return
-
-    player_ids = [
-        p["user_id"]
-        for p in players
-    ]
-
-    hands = deal_cards(
-        player_ids
-    )
-
-    parchi_games[game_id] = {
-        "hands": hands,
-        "turn": 0,
-        "started": True,
-        "removed": set(),
-        "winner": None
-    }
-
-    update_game(
-        game_id,
-        status="active",
-        current_turn=0
-    )
-
-    for player in players:
-
-        try:
-
-            await context.bot.send_message(
-                chat_id=player["user_id"],
-                text=(
-                    "🎴 <b>YOUR SECRET PARCHIS</b>\n\n"
-                    f"{format_cards(hands[player['user_id']])}\n\n"
-                    "Don't show your cards to other players."
-                ),
-                parse_mode="HTML"
-            )
-
-        except Exception:
-            pass
-
-    await context.bot.send_message(
-        chat_id=game["chat_id"],
-        text=(
-            "🔥 <b>GAME STARTED!</b>\n\n"
-            "All 16 parchis have been distributed.\n"
-            "Each player has 4 cards.\n\n"
-            "Pass one card clockwise each turn.\n\n"
-            "First player to collect 4 identical cards wins!"
-        ),
-        parse_mode="HTML"
-    )
-
-    await show_turn(
-        context,
-        game["chat_id"],
-        game_id
-    )
 
 
 # =========================================================
@@ -1519,7 +1306,6 @@ async def start_game_direct(update, context, game_id):
 def main():
 
     if not BOT_TOKEN:
-
         raise RuntimeError(
             "BOT_TOKEN environment variable is missing."
         )
@@ -1532,19 +1318,17 @@ def main():
         .build()
     )
 
-    # General commands.
+    # Basic
     application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
+        CommandHandler("start", start)
     )
 
     application.add_handler(
-        CommandHandler(
-            "bal",
-            balance
-        )
+        CommandHandler("help", help_command)
+    )
+
+    application.add_handler(
+        CommandHandler("bal", balance)
     )
 
     application.add_handler(
@@ -1554,7 +1338,7 @@ def main():
         )
     )
 
-    # Parchi.
+    # Parchi
     application.add_handler(
         CommandHandler(
             "startgame",
@@ -1576,7 +1360,7 @@ def main():
         )
     )
 
-    # Fly.
+    # Free Fly
     application.add_handler(
         CommandHandler(
             "fly",
@@ -1584,11 +1368,18 @@ def main():
         )
     )
 
-    # Owner/admin.
+    # Owner
     application.add_handler(
         CommandHandler(
-            "addc",
-            add_coins
+            "give",
+            give_coins
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "add",
+            give_coins
         )
     )
 
@@ -1611,16 +1402,16 @@ def main():
             "unadmin",
             remove_admin_command
         )
-
     )
 
+    # Buttons
     application.add_handler(
         CallbackQueryHandler(
             callbacks
         )
     )
 
-    print("🏏 16 Parchi Bot started...")
+    print("🏏 16 Parchi Bot started!")
 
     application.run_polling()
 
