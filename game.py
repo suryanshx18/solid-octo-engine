@@ -1,209 +1,152 @@
 import random
+import asyncio
+import math
 
-import database
+# -----------------------------------------
+# PARCHI
+# -----------------------------------------
 
-
-ROLE_INFO = {
-    "Mafia": (
-        "Eliminate the Citizens without getting voted out.",
-        "Mafia"
-    ),
-
-    "Detective": (
-        "Investigate players and identify the Mafia.",
-        "Citizen"
-    ),
-
-    "Doctor": (
-        "Protect one player each night.",
-        "Citizen"
-    ),
-
-    "Citizen": (
-        "Find and eliminate the Mafia through discussion and voting.",
-        "Citizen"
-    )
+PARCHI_VALUES = {
+    "Virat Kohli": 5000,
+    "MS Dhoni": 4500,
+    "Rohit Sharma": 4000,
+    "KL Rahul": 3500
 }
 
 
-def create_roles(player_count):
+def create_deck():
+    deck = []
 
-    roles = []
+    for player in PARCHI_VALUES:
+        for _ in range(4):
+            deck.append(player)
 
-    mafia_count = max(
-        1,
-        player_count // 4
-    )
+    random.shuffle(deck)
 
-    roles.extend(
-        ["Mafia"] * mafia_count
-    )
-
-    if player_count >= 5:
-        roles.append("Detective")
-
-    if player_count >= 6:
-        roles.append("Doctor")
-
-    while len(roles) < player_count:
-        roles.append("Citizen")
-
-    random.shuffle(roles)
-
-    return roles
+    return deck
 
 
-def assign_roles(game_id):
+def deal_cards(players):
+    """
+    players = list of user IDs
 
-    players = database.get_game_players(game_id)
+    Returns:
+        {
+            user_id: [card, card, card, card]
+        }
+    """
 
-    roles = create_roles(
-        len(players)
-    )
+    deck = create_deck()
 
-    for player, role in zip(players, roles):
+    hands = {}
 
-        mission, _ = ROLE_INFO[role]
+    for index, user_id in enumerate(players):
+        start = index * 4
+        end = start + 4
 
-        database.assign_player_role(
-            game_id,
-            player["user_id"],
-            role,
-            mission
-        )
+        hands[user_id] = deck[start:end]
 
-
-def start_game(game_id):
-
-    assign_roles(game_id)
-
-    database.update_game(
-        game_id,
-        status="active",
-        phase="night",
-        round=1
-    )
+    return hands
 
 
-def get_winner(game_id):
+def has_four_same(cards):
+    if len(cards) != 4:
+        return None
 
-    players = database.get_game_players(
-        game_id,
-        alive_only=True
-    )
+    if cards[0] == cards[1] == cards[2] == cards[3]:
+        return cards[0]
 
-    mafia = [
-        p for p in players
-        if p["role"] == "Mafia"
-    ]
-
-    citizens = [
-        p for p in players
-        if p["role"] != "Mafia"
-    ]
-
-    if len(mafia) == 0:
-        return "citizens", citizens
-
-    if len(mafia) >= len(citizens):
-        return "mafia", mafia
-
-    return None, []
+    return None
 
 
-def resolve_night(game_id):
+def check_winner(cards):
+    winner = has_four_same(cards)
 
-    current_game = database.get_game(
-        game_id
-    )
+    if winner:
+        return {
+            "player": winner,
+            "amount": PARCHI_VALUES[winner]
+        }
 
-    mafia_target = current_game["night_target"]
-    doctor_target = current_game["doctor_target"]
-
-    killed = None
-
-    if (
-        mafia_target
-        and mafia_target != doctor_target
-    ):
-
-        target = database.get_player(
-            game_id,
-            mafia_target
-        )
-
-        if target and target["alive"]:
-
-            database.kill_player(
-                game_id,
-                mafia_target
-            )
-
-            killed = target
-
-    database.clear_night_actions(
-        game_id
-    )
-
-    return killed
+    return None
 
 
-def count_votes(game_id):
+# -----------------------------------------
+# CARD DISPLAY
+# -----------------------------------------
 
-    votes = database.get_votes(
-        game_id,
-        "day"
-    )
+def format_cards(cards):
+    result = []
 
-    counts = {}
+    for index, card in enumerate(cards, start=1):
+        result.append(f"{index}. {card}")
 
-    for vote in votes:
-
-        target = vote["target_id"]
-
-        counts[target] = (
-            counts.get(target, 0) + 1
-        )
-
-    if not counts:
-        return None, 0
-
-    highest = max(
-        counts.values()
-    )
-
-    leaders = [
-        user_id
-        for user_id, count in counts.items()
-        if count == highest
-    ]
-
-    if len(leaders) != 1:
-        return None, highest
-
-    return leaders[0], highest
+    return "\n".join(result)
 
 
-def resolve_day(game_id):
+# -----------------------------------------
+# FLY / ROCKET
+# -----------------------------------------
 
-    target_id, votes = count_votes(
-        game_id
-    )
+MIN_MULTIPLIER = 1.1
+MAX_MULTIPLIER = 100.0
 
-    if target_id is None:
-        return None, votes
 
-    target = database.get_player(
-        game_id,
-        target_id
-    )
+def generate_crash_point():
+    """
+    Generates a crash point between 1.1x and 100x.
 
-    if not target or not target["alive"]:
-        return None, votes
+    The distribution makes small crashes more common
+    while still allowing large multipliers.
+    """
 
-    database.kill_player(
-        game_id,
-        target_id
-    )
+    value = 1.0 / random.random()
 
-    return target, votes
+    value = max(MIN_MULTIPLIER, value)
+
+    return min(round(value, 2), MAX_MULTIPLIER)
+
+
+def multiplier_at_time(seconds):
+    """
+    Slowly increases multiplier.
+
+    Starts at 1.1x and gradually increases.
+    """
+
+    multiplier = 1.1 + (seconds * 0.08)
+
+    # Slight acceleration as time passes.
+    if seconds > 10:
+        multiplier += ((seconds - 10) ** 1.15) * 0.025
+
+    multiplier = min(multiplier, MAX_MULTIPLIER)
+
+    return round(multiplier, 2)
+
+
+def calculate_payout(bet, multiplier):
+    return math.floor(bet * multiplier)
+
+
+async def fly_multiplier_generator():
+    """
+    Yields:
+        elapsed_seconds, multiplier
+
+    until 100x.
+    """
+
+    elapsed = 0
+
+    while True:
+        multiplier = multiplier_at_time(elapsed)
+
+        yield elapsed, multiplier
+
+        if multiplier >= MAX_MULTIPLIER:
+            break
+
+        await asyncio.sleep(1)
+
+        elapsed += 1
