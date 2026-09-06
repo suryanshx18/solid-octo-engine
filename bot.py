@@ -136,7 +136,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         "🚀 <b>Fly Mode Commands</b>\n"  
         "• /fly — Start a Fly betting round (60s lobby)\n"  
-        "• /f &lt;amount&gt; — Bet custom coin amount\n"  
+        "• /fly &lt;amount&gt; or /f &lt;amount&gt; — Bet custom coin amount\n"  
         "• /stopfly — Emergency stop (Owner only)\n\n"  
 
         "👑 <b>Owner Commands</b>\n"  
@@ -738,7 +738,7 @@ def build_fly_lobby_text(time_left, bets):
     text = (
         "🚀 <b>FLY ROUND STARTING SOON!</b>\n\n"
         f"⏳ Time remaining to place wagers: <b>{time_left}s</b>\n\n"
-        "Select an amount below or use <code>/f <amount></code> to set a custom wager.\n\n"
+        "Select an amount below or use <code>/f <amount></code> or <code>/fly <amount></code> to set a custom wager.\n\n"
         "👥 <b>Current Bets:</b>\n"
     )
 
@@ -752,6 +752,11 @@ def build_fly_lobby_text(time_left, bets):
     return text
 
 async def fly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Route custom bet if arguments are supplied with /fly (e.g. /fly 89)
+    if context.args:
+        await fly_custom_bet(update, context)
+        return
+
     remember_user(update.effective_user)
     chat_id = update.effective_chat.id  
 
