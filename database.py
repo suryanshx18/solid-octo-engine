@@ -1,13 +1,17 @@
 import sqlite3
 from datetime import datetime
 
-DB_NAME = "chaoscore.db"
+DB_NAME = "mafia.db"
 
 
 def connect():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def now():
+    return datetime.utcnow().isoformat()
 
 
 def init_db():
@@ -49,10 +53,14 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS games (
             game_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            host_id INTEGER,
-            status TEXT,
+            chat_id INTEGER NOT NULL,
+            host_id INTEGER NOT NULL,
+            status TEXT DEFAULT 'lobby',
+            phase TEXT DEFAULT 'lobby',
             round INTEGER DEFAULT 0,
+            night_target INTEGER,
+            doctor_target INTEGER,
+            detective_target INTEGER,
             created_at TEXT
         )
     """)
@@ -62,10 +70,20 @@ def init_db():
             game_id INTEGER,
             user_id INTEGER,
             role TEXT,
-            score INTEGER DEFAULT 0,
             alive INTEGER DEFAULT 1,
+            score INTEGER DEFAULT 0,
             secret_mission TEXT,
             PRIMARY KEY(game_id, user_id)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS game_votes (
+            game_id INTEGER,
+            voter_id INTEGER,
+            target_id INTEGER,
+            phase TEXT,
+            PRIMARY KEY(game_id, voter_id, phase)
         )
     """)
 
@@ -92,7 +110,7 @@ def ensure_user(user):
             user.username,
             user.first_name,
             1000,
-            datetime.utcnow().isoformat()
+            now()
         ))
     else:
         cur.execute("""
@@ -143,7 +161,6 @@ def change_coins(admin_id, target_user_id, amount, action):
 
     if action == "add":
         new_balance = old_balance + amount
-
     else:
         new_balance = max(0, old_balance - amount)
 
@@ -167,7 +184,7 @@ def change_coins(admin_id, target_user_id, amount, action):
         target_user_id,
         actual_change,
         action,
-        datetime.utcnow().isoformat()
+        now()
     ))
 
     conn.commit()
@@ -187,7 +204,7 @@ def add_admin(user_id, added_by):
     """, (
         user_id,
         added_by,
-        datetime.utcnow().isoformat()
+        now()
     ))
 
     conn.commit()
@@ -273,18 +290,22 @@ def get_stats():
     }
 
 
+# =========================
+# GAME DATABASE
+# =========================
+
 def create_game(chat_id, host_id):
     conn = connect()
     cur = conn.cursor()
 
     cur.execute("""
         INSERT INTO games
-        (chat_id, host_id, status, round, created_at)
-        VALUES (?, ?, 'lobby', 0, ?)
+        (chat_id, host_id, status, phase, round, created_at)
+        VALUES (?, ?, 'lobby', 'lobby', 0, ?)
     """, (
         chat_id,
         host_id,
-        datetime.utcnow().isoformat()
+        now()
     ))
 
     game_id = cur.lastrowid
@@ -309,6 +330,24 @@ def get_active_game(chat_id):
     """, (chat_id,))
 
     row = cur.fetchone()
+
+    conn.close()
+
+    return row
+
+
+def get_game(game_id):
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT *
+        FROM games
+        WHERE game_id = ?
+    """, (game_id,))
+
+    row = cur.fetchone()
+
     conn.close()
 
     return row
@@ -331,7 +370,34 @@ def add_game_player(game_id, user_id):
     conn.close()
 
 
-def get_game_players(game_id):
+def get_game_players(game_id, alive_only=False):
+    conn = connect()
+    cur = conn.cursor()
+
+    if alive_only:
+        cur.execute("""
+            SELECT gp.*, u.username, u.first_name
+            FROM game_players gp
+            JOIN users u ON u.user_id = gp.user_id
+            WHERE gp.game_id = ?
+            AND gp.alive = 1
+        """, (game_id,))
+    else:
+        cur.execute("""
+            SELECT gp.*, u.username, u.first_name
+            FROM game_players gp
+            JOIN users u ON u.user_id = gp.user_id
+            WHERE gp.game_id = ?
+        """, (game_id,))
+
+    rows = cur.fetchall()
+
+    conn.close()
+
+    return rows
+
+
+def get_player(game_id, user_id):
     conn = connect()
     cur = conn.cursor()
 
@@ -340,31 +406,272 @@ def get_game_players(game_id):
         FROM game_players gp
         JOIN users u ON u.user_id = gp.user_id
         WHERE gp.game_id = ?
-    """, (game_id,))
+        AND gp.user_id = ?
+    """, (
+        game_id,
+        user_id
+    ))
+
+    row = cur.fetchone()
+
+    conn.close()
+
+    return row
+
+
+def update_game(game_id, **fields):
+    allowed = {
+        "status",
+        "phase",
+        "round",
+        "night_target",
+        "doctor_target",
+        "detective_target"
+    }
+
+    fields = {
+        key: value
+        for key, value in fields.items()
+        if key in allowed
+    }
+
+    if not fields:
+        return
+
+    conn = connect()
+    cur = conn.cursor()
+
+    assignments = ", ".join(
+        f"{key} = ?" for key in fields
+    )
+
+    values = list(fields.values())
+    values.append(game_id)
+
+    cur.execute(
+        f"""
+        UPDATE games
+        SET {assignments}
+        WHERE game_id = ?
+        """,
+        values
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def assign_player_role(
+    game_id,
+    user_id,
+    role,
+    mission
+):
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE game_players
+        SET role = ?, secret_mission = ?
+        WHERE game_id = ?
+        AND user_id = ?
+    """, (
+        role,
+        mission,
+        game_id,
+        user_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def kill_player(game_id, user_id):
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE game_players
+        SET alive = 0
+        WHERE game_id = ?
+        AND user_id = ?
+    """, (
+        game_id,
+        user_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def add_score(game_id, user_id, points):
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE game_players
+        SET score = score + ?
+        WHERE game_id = ?
+        AND user_id = ?
+    """, (
+        points,
+        game_id,
+        user_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def has_voted(game_id, voter_id, phase):
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT 1
+        FROM game_votes
+        WHERE game_id = ?
+        AND voter_id = ?
+        AND phase = ?
+    """, (
+        game_id,
+        voter_id,
+        phase
+    ))
+
+    result = cur.fetchone()
+
+    conn.close()
+
+    return result is not None
+
+
+def add_vote(
+    game_id,
+    voter_id,
+    target_id,
+    phase
+):
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT OR IGNORE INTO game_votes
+        (game_id, voter_id, target_id, phase)
+        VALUES (?, ?, ?, ?)
+    """, (
+        game_id,
+        voter_id,
+        target_id,
+        phase
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_votes(game_id, phase):
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT voter_id, target_id
+        FROM game_votes
+        WHERE game_id = ?
+        AND phase = ?
+    """, (
+        game_id,
+        phase
+    ))
 
     rows = cur.fetchall()
+
     conn.close()
 
     return rows
 
 
-def update_game(game_id, status=None, round_number=None):
+def clear_night_actions(game_id):
+    update_game(
+        game_id,
+        night_target=None,
+        doctor_target=None,
+        detective_target=None
+    )
+
+
+def increment_game_stats(game_id, winners):
     conn = connect()
     cur = conn.cursor()
 
-    if status is not None:
-        cur.execute("""
-            UPDATE games
-            SET status = ?
-            WHERE game_id = ?
-        """, (status, game_id))
+    players = get_game_players(game_id)
 
-    if round_number is not None:
+    for player in players:
+
         cur.execute("""
-            UPDATE games
-            SET round = ?
-            WHERE game_id = ?
-        """, (round_number, game_id))
+            UPDATE users
+            SET games_played = games_played + 1
+            WHERE user_id = ?
+        """, (
+            player["user_id"],
+        ))
+
+        if player["user_id"] in winners:
+
+            cur.execute("""
+                UPDATE users
+                SET wins = wins + 1
+                WHERE user_id = ?
+            """, (
+                player["user_id"],
+            ))
+
+    conn.commit()
+    conn.close()
+
+
+def reward_players(game_id, winners):
+    conn = connect()
+    cur = conn.cursor()
+
+    for user_id in winners:
+
+        cur.execute("""
+            UPDATE users
+            SET coins = coins + 250
+            WHERE user_id = ?
+        """, (
+            user_id,
+        ))
+
+        cur.execute("""
+            INSERT INTO coin_transactions
+            (admin_id, target_user_id, amount, action, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            0,
+            user_id,
+            250,
+            "game_win",
+            now()
+        ))
+
+    conn.commit()
+    conn.close()
+
+
+def end_game(game_id):
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE games
+        SET status = 'finished',
+            phase = 'finished'
+        WHERE game_id = ?
+    """, (
+        game_id,
+    ))
 
     conn.commit()
     conn.close()
