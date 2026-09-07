@@ -247,6 +247,7 @@ class CardsGame(BaseGame):
         uid = self.order[self.idx]
         self.hands[uid] = [self.deck.pop(), self.deck.pop()]
         self.dealer_hand = [self.deck.pop(), self.deck.pop()]
+        await self.bot.send_message(self.chat_id, f"🎯 {display_name(uid, self.players)}, it's your turn! 🎴")
         await self._send_blackjack_state(uid)
 
     async def _send_blackjack_state(self, uid: int) -> None:
@@ -494,6 +495,9 @@ class MakeTheBoxGame(BaseGame):
 
         if not completed_any:
             self.turn_index = (self.turn_index + 1) % len(self.turn_order)
+            await self.bot.send_message(self.chat_id, f"🎯 {display_name(self.turn_order[self.turn_index], self.players)}, it's your turn! 📦")
+        else:
+            await self.bot.send_message(self.chat_id, f"🎯 {display_name(uid, self.players)}, you completed a box — it's still your turn! 📦")
         await self._send_board(new=False)
 
     async def _finish(self) -> None:
