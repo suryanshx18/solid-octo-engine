@@ -165,7 +165,7 @@ def register_user(user_id: int, username: Optional[str], first_name: Optional[st
                                     wins, losses, banned, created_at, updated_at)
                 VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?)
                 """,
-                (user_id, username or "", first_name or "Player", STARTING_COINS, now, now),
+                (user_id, username or "", first_name or "Player", STARTING_COINS if starting_coins is None else max(0, int(starting_coins)), now, now),
             )
         else:
             conn.execute(
@@ -417,7 +417,6 @@ def get_bot_stats() -> dict:
         "total_coins_in_circulation": total_coins,
         "total_games_played": total_games,
         "active_last_24h": active_24h,
-        "active_last_7d": active_7d,
         "active_24h": active_24h,
         "active_7d": active_7d,
         "groups": total_groups,
@@ -425,31 +424,43 @@ def get_bot_stats() -> dict:
     }
 
 
-# Compatibility aliases for older bot/game modules.
+# --------------------------------------------------------------------------
+# Backwards-compatible aliases used by bot.py / older game modules
+# --------------------------------------------------------------------------
+
 def get_coins(user_id: int) -> int:
     return get_balance(user_id)
 
-def touch_user(user_id: int) -> None:
-    touch_activity(user_id)
 
 def update_stats(user_id: int, won: bool) -> None:
     record_game_stat(user_id, won)
 
+
 def is_admin_db(user_id: int) -> bool:
     return is_admin(user_id)
+
 
 def ban_user(user_id: int) -> bool:
     return set_banned(user_id, True)
 
+
 def unban_user(user_id: int) -> bool:
     return set_banned(user_id, False)
+
 
 def get_all_user_ids() -> list[int]:
     with get_conn() as conn:
         cur = conn.execute("SELECT user_id FROM users")
         return [int(r["user_id"]) for r in cur.fetchall()]
 
+
 def get_all_group_chat_ids() -> list[int]:
     with get_conn() as conn:
-        cur = conn.execute("SELECT chat_id FROM known_chats WHERE chat_type IN ('group','supergroup')")
+        cur = conn.execute(
+            "SELECT chat_id FROM known_chats WHERE chat_type IN ('group','supergroup')"
+        )
         return [int(r["chat_id"]) for r in cur.fetchall()]
+
+
+def touch_user(user_id: int) -> None:
+    touch_activity(user_id)
