@@ -41,8 +41,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 import database as db
-from game1 import BaseGame, RajaMantriGame, ImpostorGame, FourCardMatchGame
-from game2 import AntakshariGame, CardsGame, MakeTheBoxGame
+from game1 import BaseGame, RajaMantriGame, ImpostorGame, FourCardMatchGame, RULES_TEXT_G1
+from game2 import AntakshariGame, CardsGame, MakeTheBoxGame, RULES_TEXT_G2
 from game3 import LudoGame, PowerRangersGame, BusinessTycoonGame
 
 # --------------------------------------------------------------------------
@@ -181,7 +181,11 @@ async def launch_lobby(chat_id: int, creator_id: int, creator_name: str, key: st
     if hasattr(game, "on_finish"):
         game.on_finish = on_game_finish
     active_games[chat_id] = game
-    ok, _ = await game.add_player(creator_id, creator_name)
+    if creator_id not in getattr(game, "players", {}):
+        ok, msg = await game.add_player(creator_id, creator_name)
+        if not ok:
+            active_games.pop(chat_id, None)
+            return msg
     await game.send_lobby()
     return ""
 
@@ -376,7 +380,10 @@ def make_game_commands(key: str):
         await message.reply(msg)
 
     async def _rules(message: Message, args: List[str]) -> None:
-        await message.reply(getattr(entry["cls"], "RULES_TEXT", "Rules unavailable."))
+        rules = getattr(entry["cls"], "RULES_TEXT", None)
+        if rules is None:
+            rules = RULES_TEXT_G1.get(key) or RULES_TEXT_G2.get(key) or "Rules unavailable."
+        await message.reply(rules)
 
     return _create, _join, _start, _rules
 
@@ -428,7 +435,10 @@ async def cmd_take(message: Message, args: List[str]) -> None:
     if not db.user_exists(target):
         await message.reply("❌ That user hasn't started the bot yet.")
         return
-    new_balance = db.take_coins(target, amount)
+    if not db.take_coins(target, amount):
+        await message.reply("❌ User does not have enough coins.")
+        return
+    new_balance = db.get_balance(target)
     await message.reply(f"✅ Took {amount} coins from user {target}. New balance: {new_balance}")
 
 
@@ -544,7 +554,6 @@ async def cmd_broadcast(message: Message, args: List[str]) -> None:
         return
 
     targets = set(db.get_all_user_ids()) | set(db.get_all_group_chat_ids())
-    targets.discard(message.chat.id) if False else None  # keep sending to source chat too is fine
     sent, failed = 0, 0
     status = await message.reply(f"📡 Broadcasting to {len(targets)} chats...")
     for chat_id in targets:
