@@ -41,7 +41,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 import database as db
-from game1 import RajaMantriGame, ImpostorGame, FourCardMatchGame
+from game1 import BaseGame, RajaMantriGame, ImpostorGame, FourCardMatchGame
 from game2 import AntakshariGame, CardsGame, MakeTheBoxGame
 from game3 import LudoGame, PowerRangersGame, BusinessTycoonGame
 
@@ -153,8 +153,8 @@ def ensure_user(message: Message) -> None:
     u = message.from_user
     if u is None:
         return
-    db.register_user(u.id, u.username, u.first_name, STARTING_COINS)
-    db.touch_user(u.id)
+    db.register_user(u.id, u.username, u.first_name)
+    db.touch_activity(u.id)
     if message.chat:
         db.register_chat(message.chat.id, message.chat.type, message.chat.title)
 
@@ -170,7 +170,9 @@ async def launch_lobby(chat_id: int, creator_id: int, creator_name: str, key: st
     if chat_id in active_games:
         return "❌ A game is already running in this chat."
     entry = CATALOG_BY_KEY[key]
-    game = entry["cls"](bot, chat_id, creator_id, on_game_finish)
+    game = entry["cls"](bot, chat_id, creator_id, creator_name)
+    if hasattr(game, "on_finish"):
+        game.on_finish = on_game_finish
     active_games[chat_id] = game
     ok, _ = await game.add_player(creator_id, creator_name)
     await game.send_lobby()
@@ -202,9 +204,10 @@ async def start_lobby(chat_id: int, key: str, user_id: int) -> str:
 # --------------------------------------------------------------------------
 
 async def cmd_start(message: Message, args: List[str]) -> None:
-    ensure_user(message)
     u = message.from_user
-    created = db.register_user(u.id, u.username, u.first_name, STARTING_COINS)
+    before = db.get_user(u.id)
+    ensure_user(message)
+    created = before is None
     text = (
         f"🎮 <b>Welcome to the Ultimate Games Bot, {u.first_name}!</b>\n\n"
         f"All coins here are 100% virtual and just for fun - no real money involved.\n\n"
@@ -262,7 +265,7 @@ async def cmd_games(message: Message, args: List[str]) -> None:
 
 async def cmd_balance(message: Message, args: List[str]) -> None:
     ensure_user(message)
-    coins = db.get_coins(message.from_user.id)
+    coins = db.get_balance(message.from_user.id)
     await message.reply(f"💰 Your balance: <b>{coins}</b> coins")
 
 
@@ -366,7 +369,7 @@ def make_game_commands(key: str):
         await message.reply(msg)
 
     async def _rules(message: Message, args: List[str]) -> None:
-        await message.reply(entry["cls"].RULES_TEXT)
+        await message.reply(getattr(entry["cls"], "RULES_TEXT", "Rules unavailable."))
 
     return _create, _join, _start, _rules
 
@@ -418,7 +421,7 @@ async def cmd_take(message: Message, args: List[str]) -> None:
     if not db.user_exists(target):
         await message.reply("❌ That user hasn't started the bot yet.")
         return
-    new_balance = db.add_coins(target, -amount)
+    new_balance = db.take_coins(target, amount)
     await message.reply(f"✅ Took {amount} coins from user {target}. New balance: {new_balance}")
 
 
@@ -511,8 +514,8 @@ async def cmd_give(message: Message, args: List[str]) -> None:
     if recipient.is_bot:
         await message.reply("❌ You can't give coins to a bot.")
         return
-    db.register_user(recipient.id, recipient.username, recipient.first_name, STARTING_COINS)
-    if db.get_coins(sender.id) < amount:
+    db.register_user(recipient.id, recipient.username, recipient.first_name)
+    if db.get_balance(sender.id) < amount:
         await message.reply("❌ You don't have enough coins.")
         return
     if db.transfer_coins(sender.id, recipient.id, amount):
@@ -666,10 +669,10 @@ async def start_aviator_round(chat_id: int, user_id: int, name: str, bet: int) -
     if bet < AVIATOR_MIN_BET:
         await bot.send_message(chat_id, f"❌ Minimum bet is {AVIATOR_MIN_BET} coins.")
         return
-    if db.get_coins(user_id) < bet:
+    if db.get_balance(user_id) < bet:
         await bot.send_message(chat_id, "❌ You don't have enough coins for that bet.")
         return
-    db.add_coins(user_id, -bet)
+    db.take_coins(user_id, bet)
 
     global _aviator_counter
     _aviator_counter += 1
@@ -767,8 +770,8 @@ async def handle_aviator_callback(callback: CallbackQuery) -> None:
 
 def ensure_user_from_callback(callback: CallbackQuery) -> None:
     u = callback.from_user
-    db.register_user(u.id, u.username, u.first_name, STARTING_COINS)
-    db.touch_user(u.id)
+    db.register_user(u.id, u.username, u.first_name)
+    db.touch_activity(u.id)
 
 
 # --------------------------------------------------------------------------
@@ -796,11 +799,11 @@ async def cmd_flip(message: Message, args: List[str]) -> None:
         await message.reply(f"❌ Minimum bet is {FLIP_MIN_BET} coins.")
         return
     uid = message.from_user.id
-    if db.get_coins(uid) < amount:
+    if db.get_balance(uid) < amount:
         await message.reply("❌ You don't have enough coins.")
         return
 
-    db.add_coins(uid, -amount)
+    db.take_coins(uid, amount)
     result = random.choice(["heads", "tails"])
     won = result == choice
 
@@ -924,7 +927,10 @@ async def on_callback(callback: CallbackQuery) -> None:
 
         game = active_games.get(chat_id) if chat_id is not None else None
         if game is not None and data.startswith(f"{game.PREFIX}:"):
-            await game.handle_callback(callback)
+            if isinstance(game, BaseGame):
+                await game.handle_callback(callback, data.split(":")[1:])
+            else:
+                await game.handle_callback(callback)
             return
 
         await callback.answer()  # stale/unknown callback - no-op
