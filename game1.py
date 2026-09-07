@@ -55,11 +55,10 @@ class BaseGame:
     display_name_: str = "Game"
     emoji: str = "🎮"
 
-    def __init__(self, bot: Bot, chat_id: int, host_id: int, host_name: str, manager: Optional["GameManager"] = None):
+    def __init__(self, bot: Bot, chat_id: int, host_id: int, host_name: str, manager: "GameManager" = None):
         self.bot = bot
         self.chat_id = chat_id
         self.host_id = host_id
-        self.creator_id = host_id
         self.manager = manager
         self.on_finish = None
         self.players: dict[int, str] = {host_id: host_name}
@@ -92,14 +91,14 @@ class BaseGame:
             ]
         )
 
-    async def send_lobby(self, message: Optional[Message] = None) -> None:
+    async def send_lobby(self, message: Message = None) -> None:
         if message is not None:
             sent = await message.answer(self.lobby_text(), reply_markup=self.lobby_keyboard())
         else:
             sent = await self.bot.send_message(self.chat_id, self.lobby_text(), reply_markup=self.lobby_keyboard())
         self.lobby_message_id = sent.message_id
 
-    async def refresh_lobby(self) -> None:
+    async def _refresh_lobby(self) -> None:
         if self.lobby_message_id is None:
             return
         try:
@@ -112,30 +111,32 @@ class BaseGame:
         except Exception as exc:  # message not modified, deleted, etc.
             logger.debug("refresh_lobby: %s", exc)
 
-    async def _refresh_lobby(self) -> None:
-        await self.refresh_lobby()
+    refresh_lobby = _refresh_lobby
 
-    async def add_player(self, user_id: int, name: str) -> tuple[bool, str]:
+    async def add_player(self, user_id: int, name: str) -> str:
         if self.status != "lobby":
-            return False, "❌ This game has already started."
+            return False, "❌ Game has already started."
         if user_id in self.players:
-            return False, "❌ You already joined this game."
+            return False, "You already joined!"
         if len(self.players) >= self.max_players:
             return False, "❌ Lobby is full."
-        self.players[user_id] = name or "Player"
-        await self.refresh_lobby()
-        return True, f"✅ {self.players[user_id]} joined ({len(self.players)}/{self.max_players})."
+        self.players[user_id] = name
+        await self._refresh_lobby()
+        return True, f"✅ {name} joined ({len(self.players)}/{self.max_players})"
+
+    async def try_start(self, requester_id: int) -> tuple[bool, str]:
+        if requester_id != self.host_id:
+            return False, "❌ Only the lobby creator can start the game."
+        result = await self.begin()
+        messages = {
+            "ok": "🚀 Game starting!",
+            "already_running": "❌ Game already started.",
+            "not_enough": f"❌ Need at least {self.min_players} players.",
+        }
+        return result == "ok", messages.get(result, "❌ Could not start game.")
 
     def can_start(self) -> bool:
         return len(self.players) >= self.min_players
-
-    async def try_start(self, requester_id: int) -> tuple[bool, str]:
-        if self.status != "lobby":
-            return False, "❌ Game already started."
-        if not self.can_start():
-            return False, f"❌ Need at least {self.min_players} players (have {len(self.players)})."
-        await self.begin()
-        return True, "🚀 Game starting!"
 
     async def begin(self) -> str:
         if self.status != "lobby":
@@ -146,14 +147,6 @@ class BaseGame:
         self.cancel_tasks()
         await self.on_start()
         return "ok"
-
-    async def announce_turn(self, user_id: int, label: str = "🎯") -> None:
-        """Send a fresh turn notification in the group chat."""
-        try:
-            name = display_name(user_id, self.players)
-            await self.bot.send_message(self.chat_id, f"{label} {name}, it\'s your turn! 🎮")
-        except Exception as exc:
-            logger.debug("announce_turn failed: %s", exc)
 
     # -- lifecycle -----------------------------------------------------
 
@@ -172,12 +165,15 @@ class BaseGame:
         self.cancel_tasks()
         self.status = "ended"
         if self.manager is not None:
-            self.manager.remove(self.chat_id)
-        if callable(self.on_finish):
+            try:
+                self.manager.remove(self.chat_id)
+            except Exception:
+                pass
+        if self.on_finish is not None:
             try:
                 self.on_finish(self.chat_id)
             except Exception:
-                logger.exception("Game finish callback failed")
+                pass
 
     async def force_end(self, reason_text: str) -> None:
         try:
@@ -559,7 +555,6 @@ class FourCardMatchGame(BaseGame):
         random.shuffle(self.turn_order)
         self.scores = {uid: 0 for uid in self.players}
         await self._send_board(new=True)
-        await self.announce_turn(self.turn_order[self.turn_index])
 
     def _cell_text(self, i: int) -> str:
         if self.matched[i]:
@@ -641,6 +636,10 @@ class FourCardMatchGame(BaseGame):
                 await self._finish()
                 return
             # matching player goes again
+            await self.bot.send_message(
+                self.chat_id,
+                f"🎯 {display_name(uid, self.players)}, you matched! It's your turn again! 🃏"
+            )
         else:
             await self._send_board(new=False)
             await asyncio.sleep(1.2)
@@ -648,7 +647,11 @@ class FourCardMatchGame(BaseGame):
             self.revealed[idx] = False
             self.turn_index = (self.turn_index + 1) % len(self.turn_order)
             await self._send_board(new=False)
-            await self.announce_turn(self.turn_order[self.turn_index])
+            next_uid = self.turn_order[self.turn_index]
+            await self.bot.send_message(
+                self.chat_id,
+                f"🎯 {display_name(next_uid, self.players)}, it's your turn! 🃏"
+            )
 
     async def _finish(self) -> None:
         top_score = max(self.scores.values())
@@ -705,8 +708,3 @@ RULES_TEXT_G1 = {
         "Most pairs when the board clears wins."
     ),
 }
-
-
-RajaMantriGame.RULES_TEXT = RULES_TEXT_G1["raja"]
-ImpostorGame.RULES_TEXT = RULES_TEXT_G1["impostor"]
-FourCardMatchGame.RULES_TEXT = RULES_TEXT_G1["4card"]
