@@ -69,7 +69,7 @@ RICHLIST_SIZE = 30
 # Aviator / Flip config
 AVIATOR_MIN_BET = 10
 AVIATOR_PRESETS = [50, 100, 250, 500, 1000]
-AVIATOR_TICK_SECONDS = 0.8
+AVIATOR_TICK_SECONDS = 0.9
 AVIATOR_MAX_MULTIPLIER = 50.0
 AVIATOR_MAX_TICKS = 120
 
@@ -642,10 +642,9 @@ _aviator_counter = 0
 
 
 def _generate_crash_point() -> float:
+    # Keep the game visibly moving before a crash; never crash at 1.00x.
     r = random.random()
-    if r < 0.02:
-        return 1.00
-    val = 0.99 / max(1e-6, (1 - r))
+    val = 1.20 + (r ** 2) * 8.80
     return round(min(val, AVIATOR_MAX_MULTIPLIER), 2)
 
 
@@ -710,34 +709,57 @@ async def _aviator_tick(round_id: int) -> None:
             await asyncio.sleep(AVIATOR_TICK_SECONDS)
             if rnd.finished:
                 return
-            rnd.multiplier = round(rnd.multiplier + 0.05 + rnd.multiplier * 0.06, 2)
-            if rnd.multiplier >= rnd.crash_point:
+
+            # Increase every tick, then immediately edit the SAME Telegram message.
+            next_multiplier = round(
+                rnd.multiplier + 0.05 + rnd.multiplier * 0.06, 2
+            )
+            if next_multiplier >= rnd.crash_point:
                 rnd.multiplier = rnd.crash_point
                 await _aviator_crash(rnd)
                 return
-            try:
-                await bot.edit_message_text(
-                    f"✈️ <b>Aviator</b> - {rnd.name}\n💵 Bet: {rnd.bet}\n"
-                    f"📈 Multiplier: <b>{rnd.multiplier:.2f}x</b>\n\nCash out before it crashes!",
-                    rnd.chat_id, rnd.message_id, reply_markup=_aviator_keyboard(round_id),
-                )
-            except Exception:
-                pass
+
+            rnd.multiplier = next_multiplier
+            if rnd.message_id is not None:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=rnd.chat_id,
+                        message_id=rnd.message_id,
+                        text=(
+                            f"✈️ <b>Aviator</b> - {rnd.name}\n"
+                            f"💵 Bet: {rnd.bet}\n"
+                            f"📈 Multiplier: <b>{rnd.multiplier:.2f}x</b>\n\n"
+                            "Cash out before it crashes!"
+                        ),
+                        reply_markup=_aviator_keyboard(round_id),
+                    )
+                except Exception as exc:
+                    # Do not kill the background task if Telegram temporarily rejects an edit.
+                    logger.warning("Aviator message edit failed (round %s): %s", round_id, exc)
+
         if not rnd.finished:
             await _aviator_crash(rnd)
     except asyncio.CancelledError:
         pass
+    except Exception:
+        logger.exception("Aviator tick task failed for round %s", round_id)
+        if not rnd.finished:
+            await _aviator_crash(rnd)
 
 
 async def _aviator_crash(rnd: AviatorRound) -> None:
     rnd.finished = True
     try:
-        await bot.edit_message_text(
-            f"✈️ <b>Aviator</b> - {rnd.name}\n💵 Bet: {rnd.bet}\n"
-            f"💥 <b>CRASHED AT {rnd.crash_point:.2f}x</b>\n"
-            f"❌ {rnd.name} lost {rnd.bet} coins.",
-            rnd.chat_id, rnd.message_id,
-        )
+        if rnd.message_id is not None:
+            await bot.edit_message_text(
+                chat_id=rnd.chat_id,
+                message_id=rnd.message_id,
+                text=(
+                    f"✈️ <b>Aviator</b> - {rnd.name}\n💵 Bet: {rnd.bet}\n"
+                    f"💥 <b>CRASHED AT {rnd.crash_point:.2f}x</b>\n"
+                    f"❌ {rnd.name} lost {rnd.bet} coins."
+                ),
+            )
     except Exception:
         pass
     db.update_stats(rnd.user_id, won=False)
