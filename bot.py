@@ -1,1289 +1,986 @@
-import os
+"""
+bot.py
+------
+Main entry point for the Telegram Games Bot.
+
+Responsibilities:
+    - Bot / Dispatcher initialization
+    - Command routing (general, game, admin, owner)
+    - Callback-query routing
+    - Global single-active-game-per-chat management
+    - Aviator & Flip mini-games (self-contained, no lobby needed)
+    - Error handling, startup/shutdown
+
+Run with:
+    BOT_TOKEN=xxx OWNER_ID=123456789 python bot.py
+
+All "coins" in this bot are virtual, in-game currency only. They carry no
+real-world monetary value and cannot be bought, sold, deposited, or withdrawn.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import logging
+import os
 import random
-import time
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    Message,
 )
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes
+import database as db
+from game1 import RajaMantriGame, ImpostorGame, FourCardMatchGame
+from game2 import AntakshariGame, CardsGame, MakeTheBoxGame
+from game3 import LudoGame, PowerRangersGame, BusinessTycoonGame
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+_OWNER_ID_RAW = os.environ.get("OWNER_ID", "").strip()
+
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN environment variable is not set.", file=sys.stderr)
+    sys.exit(1)
+
+if not _OWNER_ID_RAW or not _OWNER_ID_RAW.lstrip("-").isdigit():
+    print("ERROR: OWNER_ID environment variable is not set to a valid integer.", file=sys.stderr)
+    sys.exit(1)
+
+OWNER_ID = int(_OWNER_ID_RAW)
+
+STARTING_COINS = 1000          # coins a brand-new player starts with
+LEADERBOARD_SIZE = 10
+RICHLIST_SIZE = 30
+
+# Aviator / Flip config
+AVIATOR_MIN_BET = 10
+AVIATOR_PRESETS = [50, 100, 250, 500, 1000]
+AVIATOR_TICK_SECONDS = 1.2
+AVIATOR_MAX_MULTIPLIER = 50.0
+AVIATOR_MAX_TICKS = 120
+
+FLIP_MIN_BET = 10
+FLIP_WIN_MULTIPLIER = 2.0
+FLIP_LOSE_MULTIPLIER = 0.2
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logger = logging.getLogger("games_bot")
 
-from database import (
-    init_db,
-    add_user,
-    get_balance,
-    claim_free_coins,
-    change_coins,
-    is_admin,
-    add_admin,
-    remove_admin,
-    leaderboard,
-    create_game,
-    get_game,
-    get_active_game,
-    update_game,
-    end_game,
-    add_game_player,
-    remove_game_player,
-    get_game_players,
-    get_game_player
-)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
-from game import (
-    PARCHI_VALUES,
-    deal_cards,
-    check_winner,
-    arcade_multiplier
-)
+START_TIME = datetime.utcnow()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+# --------------------------------------------------------------------------
+# Global active-game registry: one active multiplayer game per chat
+# --------------------------------------------------------------------------
 
-# =========================================================
-# IN-MEMORY GAME STATE
-# =========================================================
+active_games: Dict[int, Any] = {}
 
-parchi_games = {}
-fly_games = {}
 
-# =========================================================
-# HELPERS
-# =========================================================
+def on_game_finish(chat_id: int) -> None:
+    """Called by a game instance once it's fully done - clears the slot."""
+    active_games.pop(chat_id, None)
 
-def is_owner(user_id):
+
+# --------------------------------------------------------------------------
+# Permission helpers
+# --------------------------------------------------------------------------
+
+def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
-def is_privileged(user_id):
-    return (
-        is_owner(user_id)
-        or is_admin(user_id)
+
+def is_admin(user_id: int) -> bool:
+    """True only for explicitly appointed bot admins (not the owner)."""
+    return db.is_admin_db(user_id)
+
+
+def is_owner_or_admin(user_id: int) -> bool:
+    return is_owner(user_id) or is_admin(user_id)
+
+
+# --------------------------------------------------------------------------
+# Game catalog (drives /games, /help, and command routing)
+# --------------------------------------------------------------------------
+
+GAME_CATALOG: List[Dict[str, Any]] = [
+    {"key": "raja", "cls": RajaMantriGame, "cmd": "/raja", "join": "/raja_join",
+     "start": "/raja_start", "rules": "/raja_rules", "label": "👑 Raja Mantri", "section": "👑 RAJA MANTRI"},
+    {"key": "impostor", "cls": ImpostorGame, "cmd": "/impostor", "join": "/impostor_join",
+     "start": "/impostor_start", "rules": "/impostor_rules", "vote": "/impostor_vote",
+     "label": "🕵️ Impostor", "section": "🕵️ IMPOSTOR"},
+    {"key": "4card", "cls": FourCardMatchGame, "cmd": "/4card", "join": "/4card_join",
+     "start": "/4card_start", "rules": "/4card_rules", "label": "🃏 4 Card Match", "section": "🃏 4 CARD MATCH"},
+    {"key": "antakshari", "cls": AntakshariGame, "cmd": "/antakshari", "join": "/anti_join",
+     "start": "/anti_start", "rules": "/anti_rules", "label": "🎵 Antakshari", "section": "🎵 ANTAKSHARI"},
+    {"key": "cards", "cls": CardsGame, "cmd": "/cards", "join": "/card_join",
+     "start": "/card_start", "rules": "/card_rules", "label": "🃏 Cards", "section": "🃏 CARDS"},
+    {"key": "box", "cls": MakeTheBoxGame, "cmd": "/box", "join": "/box_join",
+     "start": "/box_start", "rules": "/box_rules", "label": "📦 Make The Box", "section": "📦 MAKE THE BOX"},
+    {"key": "ludo", "cls": LudoGame, "cmd": "/ludo", "join": "/ludo_join",
+     "start": "/ludo_start", "rules": "/ludo_rules", "label": "🎲 Ludo", "section": "🎲 LUDO"},
+    {"key": "rangers", "cls": PowerRangersGame, "cmd": "/rangers", "join": "/ranger_join",
+     "start": "/ranger_start", "rules": "/ranger_rules", "label": "⚡ Power Rangers", "section": "⚡ POWER RANGERS"},
+    {"key": "business", "cls": BusinessTycoonGame, "cmd": "/business", "join": "/business_join",
+     "start": "/business_start", "rules": "/business_rules", "label": "🏦 Business Tycoon", "section": "🏦 BUSINESS"},
+]
+CATALOG_BY_KEY = {g["key"]: g for g in GAME_CATALOG}
+
+
+# --------------------------------------------------------------------------
+# Shared helpers
+# --------------------------------------------------------------------------
+
+def ensure_user(message: Message) -> None:
+    u = message.from_user
+    if u is None:
+        return
+    db.register_user(u.id, u.username, u.first_name, STARTING_COINS)
+    db.touch_user(u.id)
+    if message.chat:
+        db.register_chat(message.chat.id, message.chat.type, message.chat.title)
+
+
+def fmt_user(user_row: Dict[str, Any]) -> str:
+    name = user_row.get("first_name") or "Player"
+    username = user_row.get("username")
+    return f"@{username}" if username else name
+
+
+async def launch_lobby(chat_id: int, creator_id: int, creator_name: str, key: str) -> str:
+    """Create and post a new lobby for the given game key. Returns an error message or ''."""
+    if chat_id in active_games:
+        return "❌ A game is already running in this chat."
+    entry = CATALOG_BY_KEY[key]
+    game = entry["cls"](bot, chat_id, creator_id, on_game_finish)
+    active_games[chat_id] = game
+    ok, _ = await game.add_player(creator_id, creator_name)
+    await game.send_lobby()
+    return ""
+
+
+async def join_lobby(chat_id: int, key: str, user_id: int, name: str) -> str:
+    entry = CATALOG_BY_KEY[key]
+    game = active_games.get(chat_id)
+    if not game or not isinstance(game, entry["cls"]):
+        return f"❌ No open {entry['label']} lobby here. Start one with {entry['cmd']}."
+    ok, msg = await game.add_player(user_id, name)
+    if ok:
+        await game._refresh_lobby()
+    return msg
+
+
+async def start_lobby(chat_id: int, key: str, user_id: int) -> str:
+    entry = CATALOG_BY_KEY[key]
+    game = active_games.get(chat_id)
+    if not game or not isinstance(game, entry["cls"]):
+        return f"❌ No open {entry['label']} lobby here."
+    ok, msg = await game.try_start(user_id)
+    return msg
+
+
+# --------------------------------------------------------------------------
+# General commands
+# --------------------------------------------------------------------------
+
+async def cmd_start(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    u = message.from_user
+    created = db.register_user(u.id, u.username, u.first_name, STARTING_COINS)
+    text = (
+        f"🎮 <b>Welcome to the Ultimate Games Bot, {u.first_name}!</b>\n\n"
+        f"All coins here are 100% virtual and just for fun - no real money involved.\n\n"
+        + (f"🎁 You've been given {STARTING_COINS} starting coins!\n\n" if created else "")
+        + "Use /help to see everything I can do, or /games to jump straight into a game."
     )
+    await message.reply(text)
 
-def remember_user(user):
-    add_user(
-        user.id,
-        user.username,
-        user.first_name
+
+async def cmd_help(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    uid = message.from_user.id
+    lines = ["❤️ <b>ULTIMATE GAMES BOT</b>", "━━━━━━━━━━━━━━━━━━", "",
+              "🎮 <b>GENERAL</b>",
+              "/start", "/help", "/games", "/balance", "/profile", "/leaderboard",
+              "/richpeople", "/join", "/cancel", "/give", "/aviator", "/flip", ""]
+    for g in GAME_CATALOG:
+        lines.append(f"<b>{g['section']}</b>")
+        lines.append(g["cmd"])
+        lines.append(g["join"])
+        lines.append(g["start"])
+        if "vote" in g:
+            lines.append(g["vote"])
+        lines.append(g["rules"])
+        lines.append("")
+
+    if is_owner_or_admin(uid):
+        lines.append("🛡 <b>ADMIN</b>")
+        lines.append("/adminpanels")
+        lines.append("/endgame")
+        lines.append("")
+
+    if is_owner(uid):
+        lines.append("👑 <b>OWNER</b>")
+        lines.append("/admin USER_ID")
+        lines.append("/unadmin USER_ID")
+        lines.append("/add USER_ID AMOUNT")
+        lines.append("/take USER_ID AMOUNT")
+        lines.append("/broadcast (reply to a message)")
+        lines.append("/info")
+        lines.append("/banuser USER_ID")
+        lines.append("/unbanuser USER_ID")
+
+    await message.reply("\n".join(lines))
+
+
+async def cmd_games(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    b = InlineKeyboardBuilder()
+    for g in GAME_CATALOG:
+        b.button(text=g["label"], callback_data=f"launch:{g['key']}")
+    b.adjust(2)
+    await message.reply("🎮 <b>CHOOSE YOUR GAME</b>\n\nTap a game to open its lobby!", reply_markup=b.as_markup())
+
+
+async def cmd_balance(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    coins = db.get_coins(message.from_user.id)
+    await message.reply(f"💰 Your balance: <b>{coins}</b> coins")
+
+
+async def cmd_profile(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    user = db.get_user(message.from_user.id)
+    rank = db.get_rank(message.from_user.id)
+    games = user["games_played"]
+    winrate = f"{(user['wins'] / games * 100):.1f}%" if games else "N/A"
+    text = (
+        f"👤 <b>PROFILE - {message.from_user.first_name}</b>\n\n"
+        f"💰 Coins: {user['coins']}\n"
+        f"🎮 Games played: {games}\n"
+        f"🏆 Wins: {user['wins']}\n"
+        f"💀 Losses: {user['losses']}\n"
+        f"📈 Win rate: {winrate}\n"
+        f"🏅 Rank: #{rank}"
     )
+    await message.reply(text)
 
-def player_name(player):
-    return (
-        player.get("first_name")
-        or player.get("username")
-        or "Player"
-    )
 
-def mention_player(player):
-    return (
-        f'<a href="tg://user?id={player["user_id"]}">'
-        f'{player_name(player)}'
-        f'</a>'
-    )
+def _medal(i: int) -> str:
+    return {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
 
-# =========================================================
-# /START
-# =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    remember_user(update.effective_user)
+async def cmd_leaderboard(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    top = db.get_leaderboard(LEADERBOARD_SIZE)
+    if not top:
+        await message.reply("No players yet!")
+        return
+    lines = ["🏆 <b>LEADERBOARD - TOP PLAYERS</b>\n"]
+    for i, u in enumerate(top, 1):
+        lines.append(f"{_medal(i)} {fmt_user(u)} - {u['coins']} coins")
+    await message.reply("\n".join(lines))
 
-    await update.message.reply_text(  
-        "🏏 <b>Welcome to 16 Parchi!</b>\n\n"  
-        "Your private connection is ready.\n"  
-        "Use /free to claim your 10,000 welcome bonus!\n\n"  
-        "Use /help to see game rules and commands.",  
-        parse_mode="HTML"  
-    )
 
-# =========================================================
-# /HELP
-# =========================================================
+async def cmd_richpeople(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    top = db.get_leaderboard(RICHLIST_SIZE)
+    if not top:
+        await message.reply("No players yet!")
+        return
+    lines = ["💎 <b>TOP 30 RICHEST PLAYERS</b>\n"]
+    for i, u in enumerate(top, 1):
+        lines.append(f"{_medal(i)} {fmt_user(u)} - {u['coins']} coins")
+    await message.reply("\n".join(lines))
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    remember_user(update.effective_user)
 
-    text = (  
-        "📖 <b>16 PARCHI — HELP & COMMANDS</b>\n\n"  
+async def cmd_join(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    chat_id = message.chat.id
+    game = active_games.get(chat_id)
+    if not game:
+        await message.reply("❌ No active lobby here. Use /games to start one!")
+        return
+    ok, msg = await game.add_player(message.from_user.id, message.from_user.first_name)
+    if ok:
+        await game._refresh_lobby()
+    await message.reply(msg)
 
-        "🏏 <b>WHAT IS 16 PARCHI?</b>\n"  
-        "16 Parchi is a 4-player card game. There are 16 cards in total "  
-        "(4 cards for 4 cricketers). Each player starts with 4 random cards. "  
-        "Players pass 1 card clockwise every turn. The first player to collect "  
-        "<b>4 identical cricket player cards</b> wins the round and earns coins!\n\n"  
 
-        "🚀 <b>WHAT IS FLY MODE?</b>\n"  
-        "Fly is an arcade crash-betting game. Place your wager during the 60s lobby. "  
-        "Cash out before the rocket crashes to multiply your coins!\n\n"  
+async def cmd_cancel(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    chat_id = message.chat.id
+    game = active_games.get(chat_id)
+    if not game:
+        await message.reply("❌ No active game to cancel.")
+        return
+    uid = message.from_user.id
+    if uid != getattr(game, "creator_id", None) and not is_owner_or_admin(uid):
+        await message.reply("❌ Only the game creator, an admin, or the owner can cancel this.")
+        return
+    if game.status != "lobby":
+        await message.reply("❌ Game already started - ask an admin/owner to use /endgame instead.")
+        return
+    await game.force_end("Cancelled.")
 
-        "🏏 <b>Game Commands</b>\n"  
-        "• /startgame — Create a game lobby\n"  
-        "• /join — Join active lobby in group\n"  
-        "• /begin — Host starts game manually\n"  
-        "• /endgame — End active game\n\n"  
 
-        "💰 <b>Economy & Bonus</b>\n"  
-        "• /free — Claim 10,000 one-time bonus\n"  
-        "• /bal — Check your coin balance\n"  
-        "• /leaderboard — Top players\n\n"  
+# --------------------------------------------------------------------------
+# Per-game commands (create / join / start / rules / vote)
+# --------------------------------------------------------------------------
 
-        "🚀 <b>Fly Mode Commands</b>\n"  
-        "• /fly — Start a Fly betting round (60s lobby)\n"  
-        "• /fly &lt;amount&gt; or /f &lt;amount&gt; — Bet custom coin amount\n"  
-        "• /stopfly — Emergency stop (Owner only)\n\n"  
+def make_game_commands(key: str):
+    entry = CATALOG_BY_KEY[key]
 
-        "👑 <b>Owner Commands</b>\n"  
-        "• /give &lt;amount&gt; — Add coins (by reply)\n"  
-        "• /removec &lt;amount&gt; — Remove coins (by reply)\n"  
-        "• /admin — Add admin (by reply)\n"  
-        "• /unadmin — Remove admin (by reply)\n\n"  
+    async def _create(message: Message, args: List[str]) -> None:
+        ensure_user(message)
+        err = await launch_lobby(message.chat.id, message.from_user.id, message.from_user.first_name, key)
+        if err:
+            await message.reply(err)
 
-        "🎴 <b>Card Values</b>\n"  
-        "• Virat Kohli — 💰 5,000\n"  
-        "• MS Dhoni — 💰 4,500\n"  
-        "• Rohit Sharma — 💰 4,000\n"  
-        "• KL Rahul — 💰 3,500\n\n"  
+    async def _join(message: Message, args: List[str]) -> None:
+        ensure_user(message)
+        msg = await join_lobby(message.chat.id, key, message.from_user.id, message.from_user.first_name)
+        await message.reply(msg)
 
-        "🔒 Cards are private. Group only receives turn reminders."  
-    )  
+    async def _start(message: Message, args: List[str]) -> None:
+        ensure_user(message)
+        msg = await start_lobby(message.chat.id, key, message.from_user.id)
+        await message.reply(msg)
 
-    await update.message.reply_text(  
-        text,  
-        parse_mode="HTML"  
-    )
+    async def _rules(message: Message, args: List[str]) -> None:
+        await message.reply(entry["cls"].RULES_TEXT)
 
-# =========================================================
-# /FREE
-# =========================================================
+    return _create, _join, _start, _rules
 
-async def free_coins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    remember_user(user)
 
-    success, amount = claim_free_coins(user.id, 10000)
+async def cmd_impostor_vote(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    game = active_games.get(message.chat.id)
+    if not isinstance(game, ImpostorGame):
+        await message.reply("❌ No Impostor game is currently running here.")
+        return
+    await game.resend_voting_keyboard(message)
 
-    if success:
-        new_balance = get_balance(user.id)
-        await update.message.reply_text(
-            f"🎉 <b>CONGRATULATIONS!</b>\n\n"
-            f"You claimed your one-time bonus of 💰 <b>{amount:,} coins</b>!\n"
-            f"💳 Total Balance: <b>{new_balance:,} coins</b>",
-            parse_mode="HTML"
-        )
+
+# --------------------------------------------------------------------------
+# Owner / admin commands
+# --------------------------------------------------------------------------
+
+async def cmd_add(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    if not is_owner(message.from_user.id):
+        await message.reply("❌ Owner-only command.")
+        return
+    if len(args) != 2 or not args[0].lstrip("-").isdigit() or not args[1].isdigit():
+        await message.reply("Usage: /add USER_ID AMOUNT")
+        return
+    target, amount = int(args[0]), int(args[1])
+    if amount <= 0:
+        await message.reply("❌ Amount must be a positive integer.")
+        return
+    if not db.user_exists(target):
+        await message.reply("❌ That user hasn't started the bot yet.")
+        return
+    new_balance = db.add_coins(target, amount)
+    await message.reply(f"✅ Added {amount} coins to user {target}. New balance: {new_balance}")
+
+
+async def cmd_take(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    if not is_owner(message.from_user.id):
+        await message.reply("❌ Owner-only command.")
+        return
+    if len(args) != 2 or not args[0].lstrip("-").isdigit() or not args[1].isdigit():
+        await message.reply("Usage: /take USER_ID AMOUNT")
+        return
+    target, amount = int(args[0]), int(args[1])
+    if amount <= 0:
+        await message.reply("❌ Amount must be a positive integer.")
+        return
+    if not db.user_exists(target):
+        await message.reply("❌ That user hasn't started the bot yet.")
+        return
+    new_balance = db.add_coins(target, -amount)
+    await message.reply(f"✅ Took {amount} coins from user {target}. New balance: {new_balance}")
+
+
+async def cmd_endgame(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    uid = message.from_user.id
+    if not is_owner_or_admin(uid):
+        await message.reply("❌ You must be an admin or the owner to use this.")
+        return
+    game = active_games.get(message.chat.id)
+    if not game:
+        await message.reply("No active game.")
+        return
+    await game.force_end("The current game was ended by an administrator.")
+
+
+async def cmd_admin(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    uid = message.from_user.id
+    if not is_owner(uid):
+        await message.reply("❌ Only the owner can appoint bot admins.")
+        return
+    if len(args) != 1 or not args[0].lstrip("-").isdigit():
+        await message.reply("Usage: /admin USER_ID")
+        return
+    target = int(args[0])
+    if target == OWNER_ID:
+        await message.reply("❌ The owner already has full permissions.")
+        return
+    if db.add_admin(target, uid):
+        await message.reply(f"✅ User {target} is now a bot admin.")
     else:
-        await update.message.reply_text(
-            "❌ You have already claimed your one-time <b>/free</b> bonus!",
-            parse_mode="HTML"
-        )
+        await message.reply("❌ That user is already an admin.")
 
-# =========================================================
-# /BAL
-# =========================================================
 
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    remember_user(update.effective_user)
+async def cmd_unadmin(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    uid = message.from_user.id
+    if not is_owner(uid):
+        await message.reply("❌ Only the owner can remove bot admins.")
+        return
+    if len(args) != 1 or not args[0].lstrip("-").isdigit():
+        await message.reply("Usage: /unadmin USER_ID")
+        return
+    target = int(args[0])
+    if target == OWNER_ID:
+        await message.reply("❌ You cannot remove the owner.")
+        return
+    if db.remove_admin(target):
+        await message.reply(f"✅ User {target} is no longer a bot admin.")
+    else:
+        await message.reply("❌ That user is not an admin.")
 
-    coins = get_balance(update.effective_user.id)  
 
-    await update.message.reply_text(  
-        f"💰 <b>Your balance:</b> {coins:,} coins",  
-        parse_mode="HTML"  
-    )
+async def cmd_adminpanels(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    admins = db.list_admins()
+    owner_row = db.get_user(OWNER_ID)
+    owner_display = f"@{owner_row['username']}" if owner_row and owner_row.get("username") else str(OWNER_ID)
 
-# =========================================================
-# /LEADERBOARD
-# =========================================================
+    lines = ["👑 <b>BOT ADMINS</b>\n", "Owner:", f"• {owner_display}", ""]
+    if admins:
+        lines.append("Admins:")
+        for i, a in enumerate(admins, 1):
+            display = f"@{a['username']}" if a.get("username") else (a.get("first_name") or str(a["user_id"]))
+            lines.append(f"{i}. {display}")
+    else:
+        lines.append("No additional admins have been added.")
+    await message.reply("\n".join(lines))
 
-async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    remember_user(update.effective_user)
 
-    rows = leaderboard(10)  
+async def cmd_give(message: Message, args: List[str]) -> None:
+    """Peer-to-peer coin transfer: reply to the recipient's message with /give AMOUNT."""
+    ensure_user(message)
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("❌ Reply to the user's message you want to give coins to, e.g. `/give 100`.")
+        return
+    if len(args) != 1 or not args[0].isdigit():
+        await message.reply("Usage: reply to a user's message with /give AMOUNT")
+        return
+    amount = int(args[0])
+    if amount <= 0:
+        await message.reply("❌ Amount must be a positive integer.")
+        return
+    sender = message.from_user
+    recipient = message.reply_to_message.from_user
+    if recipient.id == sender.id:
+        await message.reply("❌ You can't give coins to yourself.")
+        return
+    if recipient.is_bot:
+        await message.reply("❌ You can't give coins to a bot.")
+        return
+    db.register_user(recipient.id, recipient.username, recipient.first_name, STARTING_COINS)
+    if db.get_coins(sender.id) < amount:
+        await message.reply("❌ You don't have enough coins.")
+        return
+    if db.transfer_coins(sender.id, recipient.id, amount):
+        await message.reply(f"✅ Sent {amount} coins to {recipient.first_name}!")
+    else:
+        await message.reply("❌ Transfer failed.")
 
-    if not rows:  
-        await update.message.reply_text("No players yet.")  
-        return  
 
-    text = "🏆 <b>LEADERBOARD</b>\n\n"  
-
-    for index, row in enumerate(rows, 1):  
-        name = row["first_name"] or row["username"] or "Player"  
-        text += f"{index}. {name} — 💰 {row['coins']:,}\n"  
-
-    await update.message.reply_text(  
-        text,  
-        parse_mode="HTML"  
-    )
-
-# =========================================================
-# /STARTGAME
-# =========================================================
-
-async def startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ Start the game inside a group.")
+async def cmd_broadcast(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    if not is_owner(message.from_user.id):
+        await message.reply("❌ Owner-only command.")
+        return
+    if not message.reply_to_message:
+        await message.reply("❌ Reply to the message you want to broadcast with /broadcast.")
         return
 
-    remember_user(update.effective_user)  
-    chat_id = update.effective_chat.id  
+    targets = set(db.get_all_user_ids()) | set(db.get_all_group_chat_ids())
+    targets.discard(message.chat.id) if False else None  # keep sending to source chat too is fine
+    sent, failed = 0, 0
+    status = await message.reply(f"📡 Broadcasting to {len(targets)} chats...")
+    for chat_id in targets:
+        try:
+            await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=message.chat.id,
+                message_id=message.reply_to_message.message_id,
+            )
+            sent += 1
+        except (TelegramForbiddenError, TelegramBadRequest):
+            failed += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+    await status.edit_text(f"📡 Broadcast complete!\n✅ Sent: {sent}\n❌ Failed: {failed}")
 
-    existing = get_active_game(chat_id)  
 
-    if existing:  
-        await update.message.reply_text("❌ A game is already running here.")  
-        return  
+async def cmd_info(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    if not is_owner(message.from_user.id):
+        await message.reply("❌ Owner-only command.")
+        return
+    stats = db.get_bot_stats()
+    uptime = datetime.utcnow() - START_TIME
+    hours, rem = divmod(int(uptime.total_seconds()), 3600)
+    minutes, _ = divmod(rem, 60)
+    text = (
+        "📊 <b>BOT INFO</b>\n\n"
+        f"👥 Total users started: {stats['total_users']}\n"
+        f"🟢 Active in last 24h: {stats['active_24h']}\n"
+        f"🟢 Active in last 7d: {stats['active_7d']}\n"
+        f"🚫 Banned users: {stats['banned_users']}\n"
+        f"💬 Groups: {stats['groups']}\n"
+        f"🎮 Games played (all time): {stats['total_games']}\n"
+        f"⚡ Active games right now: {len(active_games)}\n"
+        f"⏱ Uptime: {hours}h {minutes}m"
+    )
+    await message.reply(text)
 
-    game_id = create_game(  
-        chat_id,  
-        update.effective_user.id,  
-        "parchi"  
-    )  
 
-    parchi_games[game_id] = {  
-        "hands": {},  
-        "turn": 0,  
-        "started": False,  
-        "winner": None  
-    }  
+async def cmd_banuser(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    if not is_owner(message.from_user.id):
+        await message.reply("❌ Owner-only command.")
+        return
+    if len(args) != 1 or not args[0].lstrip("-").isdigit():
+        await message.reply("Usage: /banuser USER_ID")
+        return
+    target = int(args[0])
+    if target == OWNER_ID:
+        await message.reply("❌ You cannot ban the owner.")
+        return
+    if db.ban_user(target):
+        await message.reply(f"🚫 User {target} has been banned.")
+    else:
+        await message.reply("❌ That user hasn't started the bot.")
 
-    keyboard = [[  
-        InlineKeyboardButton(  
-            "🎟 Join Parchi Game",  
-            callback_data=f"join:{game_id}"  
-        )  
-    ]]  
 
-    sent = await update.message.reply_text(  
-        "🏏 <b>16 PARCHI GAME</b>\n\n"  
-        f"Game ID: <code>{game_id}</code>\n\n"  
-        "👥 <b>0/4 Players Joined</b>\n"  
-        "⏳ Need 4 more players to start!\n\n"  
-        "Click the button below or type <code>/join</code> to enter.\n\n"  
-        "⚠️ Every player must first open the bot privately and send /start.",  
-        reply_markup=InlineKeyboardMarkup(keyboard),  
-        parse_mode="HTML"  
+async def cmd_unbanuser(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    if not is_owner(message.from_user.id):
+        await message.reply("❌ Owner-only command.")
+        return
+    if len(args) != 1 or not args[0].lstrip("-").isdigit():
+        await message.reply("Usage: /unbanuser USER_ID")
+        return
+    target = int(args[0])
+    if db.unban_user(target):
+        await message.reply(f"✅ User {target} has been unbanned.")
+    else:
+        await message.reply("❌ That user hasn't started the bot.")
+
+
+# --------------------------------------------------------------------------
+# AVIATOR mini-game
+# --------------------------------------------------------------------------
+
+@dataclass
+class AviatorRound:
+    round_id: int
+    chat_id: int
+    user_id: int
+    name: str
+    bet: int
+    crash_point: float
+    multiplier: float = 1.0
+    message_id: Optional[int] = None
+    finished: bool = False
+    task: Optional[asyncio.Task] = None
+
+
+_aviator_rounds: Dict[int, AviatorRound] = {}
+_aviator_counter = 0
+
+
+def _generate_crash_point() -> float:
+    r = random.random()
+    if r < 0.02:
+        return 1.00
+    val = 0.99 / max(1e-6, (1 - r))
+    return round(min(val, AVIATOR_MAX_MULTIPLIER), 2)
+
+
+def _aviator_keyboard(round_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="💰 CASH OUT", callback_data=f"av:cashout:{round_id}")
+    return b.as_markup()
+
+
+def _aviator_presets_keyboard() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for amt in AVIATOR_PRESETS:
+        b.button(text=f"{amt} coins", callback_data=f"av:bet:{amt}")
+    b.button(text="✏️ Custom Amount", callback_data="av:custom")
+    b.adjust(len(AVIATOR_PRESETS))
+    return b.as_markup()
+
+
+async def cmd_aviator(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    if args and args[0].isdigit():
+        await start_aviator_round(message.chat.id, message.from_user.id, message.from_user.first_name, int(args[0]))
+        return
+    await message.reply(
+        "✈️ <b>AVIATOR</b>\nPick a bet amount (virtual coins only):",
+        reply_markup=_aviator_presets_keyboard(),
     )
 
-# =========================================================
-# LOBBY HELPER
-# =========================================================
 
-def build_lobby_text(game_id, players):
-    needed = 4 - len(players)
-    text = (  
-        "🏏 <b>16 PARCHI GAME</b>\n\n"  
-        f"Game ID: <code>{game_id}</code>\n\n"  
-        "<b>Players Joined:</b>\n"  
-    )  
+async def start_aviator_round(chat_id: int, user_id: int, name: str, bet: int) -> None:
+    if bet < AVIATOR_MIN_BET:
+        await bot.send_message(chat_id, f"❌ Minimum bet is {AVIATOR_MIN_BET} coins.")
+        return
+    if db.get_coins(user_id) < bet:
+        await bot.send_message(chat_id, "❌ You don't have enough coins for that bet.")
+        return
+    db.add_coins(user_id, -bet)
 
-    for index, player in enumerate(players, 1):  
-        text += f"{index}. {player_name(player)}\n"  
+    global _aviator_counter
+    _aviator_counter += 1
+    round_id = _aviator_counter
+    crash_point = _generate_crash_point()
+    rnd = AviatorRound(round_id=round_id, chat_id=chat_id, user_id=user_id, name=name,
+                        bet=bet, crash_point=crash_point)
+    _aviator_rounds[round_id] = rnd
 
-    text += f"\n👥 <b>{len(players)}/4 Players</b>\n"  
+    msg = await bot.send_message(
+        chat_id,
+        f"✈️ <b>Aviator</b> - {name}\n💵 Bet: {bet}\n📈 Multiplier: <b>1.00x</b>\n\nCash out before it crashes!",
+        reply_markup=_aviator_keyboard(round_id),
+    )
+    rnd.message_id = msg.message_id
+    rnd.task = asyncio.create_task(_aviator_tick(round_id))
 
-    if needed > 0:  
-        text += f"⏳ Need <b>{needed}</b> more player(s) to start!"  
-    else:  
-        text += "\n✅ <b>4/4 PLAYERS JOINED! Starting game now...</b>"  
 
-    return text
-
-async def update_lobby_message(context, game_id, message_id=None, query=None):
-    game = get_game(game_id)
-    if not game or game["status"] != "lobby":  
-        return  
-
-    players = get_game_players(game_id)  
-    text = build_lobby_text(game_id, players)
-
-    keyboard = []
-    if len(players) < 4:
-        keyboard = [[  
-            InlineKeyboardButton(  
-                "🎟 Join Parchi Game",  
-                callback_data=f"join:{game_id}"  
-            )  
-        ]]  
-
+async def _aviator_tick(round_id: int) -> None:
+    rnd = _aviator_rounds.get(round_id)
+    if not rnd:
+        return
     try:
-        if query:
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="HTML"
-            )
-        elif message_id:
-            await context.bot.edit_message_text(
-                chat_id=game["chat_id"],
-                message_id=message_id,
-                text=text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="HTML"
-            )
-    except Exception:  
+        for _ in range(AVIATOR_MAX_TICKS):
+            await asyncio.sleep(AVIATOR_TICK_SECONDS)
+            if rnd.finished:
+                return
+            rnd.multiplier = round(rnd.multiplier + 0.05 + rnd.multiplier * 0.06, 2)
+            if rnd.multiplier >= rnd.crash_point:
+                await _aviator_crash(rnd)
+                return
+            try:
+                await bot.edit_message_text(
+                    f"✈️ <b>Aviator</b> - {rnd.name}\n💵 Bet: {rnd.bet}\n"
+                    f"📈 Multiplier: <b>{rnd.multiplier:.2f}x</b>\n\nCash out before it crashes!",
+                    rnd.chat_id, rnd.message_id, reply_markup=_aviator_keyboard(round_id),
+                )
+            except Exception:
+                pass
+        if not rnd.finished:
+            await _aviator_crash(rnd)
+    except asyncio.CancelledError:
         pass
 
-# =========================================================
-# JOIN (BUTTON & /JOIN COMMAND)
-# =========================================================
 
-async def handle_join_logic(user, game, context, query=None):
-    remember_user(user)
-    game_id = game["id"]
-
-    if game["status"] != "lobby":  
-        if query:
-            await query.answer("Game already started.", show_alert=True)
-        return False, "Game already started."
-
-    if get_game_player(game_id, user.id):  
-        if query:
-            await query.answer("You already joined!", show_alert=True)
-        return False, "You have already joined!"
-
-    players = get_game_players(game_id)  
-
-    if len(players) >= 4:  
-        if query:
-            await query.answer("Game is full!", show_alert=True)
-        return False, "Game is full!"
-
-    add_game_player(game_id, user.id, len(players))  
-    players = get_game_players(game_id)
-
-    if query:
-        await query.answer("Joined successfully!")
-        await update_lobby_message(context, game_id, query=query)
-    else:
-        await update_lobby_message(context, game_id)
-
-    # AUTOMATIC START WHEN 4 PLAYERS JOIN
-    if len(players) == 4:
-        asyncio.create_task(start_parchi_game(context, game_id))
-
-    return True, f"Joined game! ({len(players)}/4)"
-
-async def join_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()  
-
-    game_id = int(query.data.split(":")[1])  
-    game = get_game(game_id)  
-
-    if not game:  
-        await query.answer("Game does not exist.", show_alert=True)  
-        return  
-
-    await handle_join_logic(query.from_user, game, context, query=query)
-
-async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ Use /join in the group.")
-        return
-
-    game = get_active_game(update.effective_chat.id)
-    if not game or game["status"] != "lobby":
-        await update.message.reply_text("❌ No open lobby to join. Use /startgame first!")
-        return
-
-    success, msg = await handle_join_logic(update.effective_user, game, context)
-    if not success:
-        await update.message.reply_text(f"❌ {msg}")
-
-# =========================================================
-# /BEGIN
-# =========================================================
-
-async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ Use /begin inside the group.")
-        return
-
-    remember_user(update.effective_user)  
-    game = get_active_game(update.effective_chat.id)  
-
-    if not game:  
-        await update.message.reply_text("❌ No active game.")  
-        return  
-
-    if (  
-        update.effective_user.id != game["host_id"]  
-        and not is_privileged(update.effective_user.id)  
-    ):  
-        await update.message.reply_text("❌ Only the host, owner or admin can begin.")  
-        return  
-
-    players = get_game_players(game["id"])  
-
-    if len(players) != 4:  
-        await update.message.reply_text(  
-            f"❌ Need exactly 4 players to start.\n"  
-            f"Current: {len(players)}/4"  
-        )  
-        return  
-
-    await start_parchi_game(context, game["id"])
-
-# =========================================================
-# START PARCHI
-# =========================================================
-
-async def start_parchi_game(context, game_id):
-    game = get_game(game_id)
-
-    if not game or game["status"] != "lobby":  
-        return  
-
-    players = get_game_players(game_id)  
-
-    if len(players) != 4:  
-        return  
-
-    player_ids = [player["user_id"] for player in players]  
-    hands = deal_cards(player_ids)  
-
-    parchi_games[game_id] = {  
-        "hands": hands,  
-        "turn": 0,  
-        "started": True,  
-        "winner": None  
-    }  
-
-    update_game(game_id, status="active", current_turn=0)  
-
-    # PRIVATE CARD DELIVERY  
-    for player in players:  
-        cards = hands[player["user_id"]]  
-
-        card_text = "\n".join(  
-            f"🎴 {i + 1}. {card}"  
-            for i, card in enumerate(cards)  
-        )  
-
-        try:  
-            await context.bot.send_message(  
-                chat_id=player["user_id"],  
-                text=(  
-                    "🔒 <b>YOUR SECRET CARDS</b>\n\n"  
-                    f"{card_text}\n\n"  
-                    "Do not share your cards with anyone."  
-                ),  
-                parse_mode="HTML"  
-            )  
-        except Exception:  
-            pass  
-
-    await context.bot.send_message(  
-        chat_id=game["chat_id"],  
-        text=(  
-            "🔥 <b>16 PARCHI GAME STARTED!</b>\n\n"  
-            "🎴 Cards have been privately distributed.\n"  
-            "🔒 Card information is hidden from group.\n\n"  
-            "The first player received their private card selection menu in DM."  
-        ),  
-        parse_mode="HTML"  
-    )  
-
-    await show_turn(context, game["chat_id"], game_id)
-
-# =========================================================
-# SHOW TURN
-# =========================================================
-
-async def show_turn(context, chat_id, game_id):
-    game = get_game(game_id)
-
-    if not game or game["status"] != "active":  
-        return  
-
-    players = get_game_players(game_id)  
-
-    if len(players) != 4:  
-        return  
-
-    state = parchi_games.get(game_id)  
-    if not state:  
-        return  
-
-    turn = state["turn"] % 4  
-    current = players[turn]  
-
-    # GROUP REMINDER  
-    await context.bot.send_message(  
-        chat_id=chat_id,  
-        text=(  
-            f"🎴 <b>{mention_player(current)}</b>\n\n"  
-            "📩 <b>Your turn!</b> Check your DM and pick 1 card to pass."  
-        ),  
-        parse_mode="HTML"  
-    )  
-
-    # PRIVATE MENU  
-    cards = state["hands"][current["user_id"]]  
-    keyboard = []  
-
-    for index, card in enumerate(cards):  
-        keyboard.append([  
-            InlineKeyboardButton(  
-                f"🎴 {card}",  
-                callback_data=f"card:{game_id}:{index}"  
-            )  
-        ])  
-
-    try:  
-        await context.bot.send_message(  
-            chat_id=current["user_id"],  
-            text=(  
-                "🎴 <b>YOUR TURN</b>\n\n"  
-                "Choose ONE card to pass to the next player."  
-            ),  
-            reply_markup=InlineKeyboardMarkup(keyboard),  
-            parse_mode="HTML"  
-        )  
-
-    except Exception:  
-        await context.bot.send_message(  
-            chat_id=chat_id,  
-            text=(  
-                f"⚠️ {mention_player(current)}, "  
-                "please open the bot privately and send /start."  
-            ),  
-            parse_mode="HTML"  
+async def _aviator_crash(rnd: AviatorRound) -> None:
+    rnd.finished = True
+    try:
+        await bot.edit_message_text(
+            f"💥 <b>CRASHED at {rnd.crash_point:.2f}x!</b>\n{rnd.name} lost {rnd.bet} coins.",
+            rnd.chat_id, rnd.message_id,
         )
+    except Exception:
+        pass
+    db.update_stats(rnd.user_id, won=False)
+    _aviator_rounds.pop(rnd.round_id, None)
 
-# =========================================================
-# CARD SELECTION
-# =========================================================
 
-async def card_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()  
+async def handle_aviator_callback(callback: CallbackQuery) -> None:
+    data = callback.data or ""
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
 
-    parts = query.data.split(":")  
-    if len(parts) != 3:  
-        return  
+    if action == "bet":
+        amount = int(parts[2])
+        ensure_user_from_callback(callback)
+        await callback.answer()
+        await start_aviator_round(callback.message.chat.id, callback.from_user.id,
+                                   callback.from_user.first_name, amount)
+    elif action == "custom":
+        await callback.answer("Type: /aviator AMOUNT to bet a custom amount.", show_alert=True)
+    elif action == "cashout":
+        round_id = int(parts[2])
+        rnd = _aviator_rounds.get(round_id)
+        if not rnd or rnd.finished:
+            await callback.answer("This round already ended.", show_alert=True)
+            return
+        if callback.from_user.id != rnd.user_id:
+            await callback.answer("❌ This isn't your bet!", show_alert=True)
+            return
+        rnd.finished = True
+        winnings = int(rnd.bet * rnd.multiplier)
+        db.add_coins(rnd.user_id, winnings)
+        db.update_stats(rnd.user_id, won=True)
+        await callback.answer(f"Cashed out at {rnd.multiplier:.2f}x!")
+        try:
+            await bot.edit_message_text(
+                f"💰 <b>CASHED OUT at {rnd.multiplier:.2f}x!</b>\n{rnd.name} won {winnings} coins!",
+                rnd.chat_id, rnd.message_id,
+            )
+        except Exception:
+            pass
+        _aviator_rounds.pop(round_id, None)
 
-    game_id = int(parts[1])  
-    card_index = int(parts[2])  
 
-    game = get_game(game_id)  
-    if not game or game["status"] != "active":  
-        await query.edit_message_text("❌ Game is no longer active.")  
-        return  
+def ensure_user_from_callback(callback: CallbackQuery) -> None:
+    u = callback.from_user
+    db.register_user(u.id, u.username, u.first_name, STARTING_COINS)
+    db.touch_user(u.id)
 
-    players = get_game_players(game_id)  
-    if len(players) != 4:  
-        return  
 
-    state = parchi_games.get(game_id)  
-    if not state:  
-        return  
+# --------------------------------------------------------------------------
+# FLIP mini-game
+# --------------------------------------------------------------------------
 
-    turn = state["turn"] % 4  
-    sender = players[turn]  
-
-    if query.from_user.id != sender["user_id"]:  
-        await query.answer("❌ It is not your turn.", show_alert=True)  
-        return  
-
-    sender_cards = state["hands"][sender["user_id"]]  
-
-    if card_index < 0 or card_index >= len(sender_cards):  
-        await query.answer("Invalid card.", show_alert=True)  
-        return  
-
-    card = sender_cards.pop(card_index)  
-
-    receiver_index = (turn + 1) % 4  
-    receiver = players[receiver_index]  
-
-    receiver_cards = state["hands"][receiver["user_id"]]  
-    receiver_cards.append(card)  
-
-    try:  
-        await query.edit_message_text(  
-            "✅ <b>Card sent!</b>\n\n"  
-            "Your card was privately passed to the next player.",  
-            parse_mode="HTML"  
-        )  
-    except Exception:  
-        pass  
-
-    receiver_card_text = "\n".join(  
-        f"🎴 {i + 1}. {name}"  
-        for i, name in enumerate(receiver_cards)  
-    )  
-
-    try:  
-        await context.bot.send_message(  
-            chat_id=receiver["user_id"],  
-            text=(  
-                "📥 <b>CARD RECEIVED</b>\n\n"  
-                "Your current cards:\n\n"  
-                f"{receiver_card_text}\n\n"  
-                "🔒 These cards are private."  
-            ),  
-            parse_mode="HTML"  
-        )  
-    except Exception:  
-        pass  
-
-    # WINNER CHECK  
-    winner = check_winner(receiver_cards)  
-
-    if winner:  
-        winner_id = receiver["user_id"]  
-        amount = winner["amount"]  
-
-        state["winner"] = winner_id  
-
-        change_coins(  
-            winner_id,  
-            amount,  
-            f"Parchi win - {winner['player']}"  
-        )  
-
-        update_game(game_id, status="ended")  
-
-        await context.bot.send_message(  
-            chat_id=game["chat_id"],  
-            text=(  
-                "🎉 <b>PARCHI WINNER!</b>\n\n"  
-                f"🏆 {mention_player(receiver)}\n"  
-                f"💰 Prize: <b>{amount:,} coins</b>\n\n"  
-                "🏏 Game finished!"  
-            ),  
-            parse_mode="HTML"  
-        )  
-
-        try:  
-            await context.bot.send_message(  
-                chat_id=winner_id,  
-                text=(  
-                    "🏆 <b>YOU WON!</b>\n\n"  
-                    f"🎴 {winner['player']} × 4\n"  
-                    f"💰 Prize: <b>{amount:,} coins</b>\n"  
-                    f"💳 Balance: {get_balance(winner_id):,}"  
-                ),  
-                parse_mode="HTML"  
-            )  
-        except Exception:  
-            pass  
-
-        parchi_games.pop(game_id, None)  
-        return  
-
-    # NEXT TURN  
-    state["turn"] += 1  
-    update_game(game_id, current_turn=state["turn"])  
-
-    await show_turn(context, game["chat_id"], game_id)
-
-# =========================================================
-# /ENDGAME
-# =========================================================
-
-async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ Use /endgame in the group.")
+async def cmd_flip(message: Message, args: List[str]) -> None:
+    ensure_user(message)
+    if len(args) != 2:
+        await message.reply("Usage: /flip h AMOUNT  or  /flip t AMOUNT")
+        return
+    choice_raw, amount_raw = args[0].lower(), args[1]
+    if choice_raw in ("h", "heads"):
+        choice = "heads"
+    elif choice_raw in ("t", "tails"):
+        choice = "tails"
+    else:
+        await message.reply("❌ Prediction must be 'h' (heads) or 't' (tails).")
+        return
+    if not amount_raw.isdigit():
+        await message.reply("❌ Amount must be a positive whole number.")
+        return
+    amount = int(amount_raw)
+    if amount < FLIP_MIN_BET:
+        await message.reply(f"❌ Minimum bet is {FLIP_MIN_BET} coins.")
+        return
+    uid = message.from_user.id
+    if db.get_coins(uid) < amount:
+        await message.reply("❌ You don't have enough coins.")
         return
 
-    game = get_active_game(update.effective_chat.id)  
+    db.add_coins(uid, -amount)
+    result = random.choice(["heads", "tails"])
+    won = result == choice
+
+    if won:
+        payout = int(amount * FLIP_WIN_MULTIPLIER)
+        db.add_coins(uid, payout)
+        text = (f"🪙 The coin landed on <b>{result}</b>! You guessed right!\n"
+                f"🎉 You won {payout} coins ({FLIP_WIN_MULTIPLIER}x your bet)!")
+    else:
+        payout = int(amount * FLIP_LOSE_MULTIPLIER)
+        db.add_coins(uid, payout)
+        text = (f"🪙 The coin landed on <b>{result}</b>. You guessed {choice} - wrong!\n"
+                f"💸 You got back {payout} coins ({FLIP_LOSE_MULTIPLIER}x your bet).")
+    db.update_stats(uid, won=won)
+    await message.reply(text)
+
+
+# --------------------------------------------------------------------------
+# Command routing table
+# --------------------------------------------------------------------------
+
+COMMANDS: Dict[str, Callable[[Message, List[str]], Any]] = {
+    "/start": cmd_start,
+    "/help": cmd_help,
+    "/games": cmd_games,
+    "/balance": cmd_balance,
+    "/profile": cmd_profile,
+    "/leaderboard": cmd_leaderboard,
+    "/richpeople": cmd_richpeople,
+    "/join": cmd_join,
+    "/cancel": cmd_cancel,
+    "/give": cmd_give,
+    "/aviator": cmd_aviator,
+    "/flip": cmd_flip,
+    "/add": cmd_add,
+    "/take": cmd_take,
+    "/endgame": cmd_endgame,
+    "/admin": cmd_admin,
+    "/unadmin": cmd_unadmin,
+    "/adminpanels": cmd_adminpanels,
+    "/broadcast": cmd_broadcast,
+    "/info": cmd_info,
+    "/banuser": cmd_banuser,
+    "/unbanuser": cmd_unbanuser,
+    "/impostor_vote": cmd_impostor_vote,
+}
+
+for _g in GAME_CATALOG:
+    _create, _join, _start, _rules = make_game_commands(_g["key"])
+    COMMANDS[_g["cmd"]] = _create
+    COMMANDS[_g["join"]] = _join
+    COMMANDS[_g["start"]] = _start
+    COMMANDS[_g["rules"]] = _rules
+
+
+# --------------------------------------------------------------------------
+# Dispatcher-level handlers
+# --------------------------------------------------------------------------
+
+@dp.message(F.text.startswith("/"))
+async def on_command(message: Message) -> None:
+    try:
+        parts = message.text.strip().split()
+        cmd = parts[0].split("@")[0].lower()
+        args = parts[1:]
+
+        if message.from_user and db.is_banned(message.from_user.id) and cmd != "/start":
+            await message.reply("🚫 You are banned from using this bot.")
+            return
+
+        handler = COMMANDS.get(cmd)
+        if handler is None:
+            return  # unknown command - stay silent to avoid spamming groups
+        await handler(message, args)
+    except Exception:
+        logger.exception("Error handling command: %s", message.text)
+        try:
+            await message.reply("⚠️ Something went wrong processing that command. Please try again.")
+        except Exception:
+            pass
+
+
+@dp.message(F.text)
+async def on_plain_text(message: Message) -> None:
+    """Routes plain (non-command) text to a running game that needs it (e.g. Antakshari)."""
+    try:
+        if message.from_user and db.is_banned(message.from_user.id):
+            return
+        ensure_user(message)
+        game = active_games.get(message.chat.id)
+        if game is not None and isinstance(game, AntakshariGame):
+            await game.handle_message(message)
+    except Exception:
+        logger.exception("Error handling plain text message")
+
+
+@dp.callback_query()
+async def on_callback(callback: CallbackQuery) -> None:
+    try:
+        if callback.from_user and db.is_banned(callback.from_user.id):
+            await callback.answer("🚫 You are banned from using this bot.", show_alert=True)
+            return
+
+        data = callback.data or ""
+        chat_id = callback.message.chat.id if callback.message else None
+
+        if data.startswith("launch:"):
+            key = data.split(":", 1)[1]
+            entry = CATALOG_BY_KEY.get(key)
+            if not entry:
+                await callback.answer("Unknown game.", show_alert=True)
+                return
+            ensure_user_from_callback(callback)
+            err = await launch_lobby(chat_id, callback.from_user.id, callback.from_user.first_name, key)
+            await callback.answer(err if err else f"{entry['label']} lobby created!")
+            return
+
+        if data.startswith("av:"):
+            await handle_aviator_callback(callback)
+            return
+
+        game = active_games.get(chat_id) if chat_id is not None else None
+        if game is not None and data.startswith(f"{game.PREFIX}:"):
+            await game.handle_callback(callback)
+            return
+
+        await callback.answer()  # stale/unknown callback - no-op
+    except Exception:
+        logger.exception("Error handling callback: %s", callback.data)
+        try:
+            await callback.answer("⚠️ Something went wrong.", show_alert=True)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Startup / shutdown
+# --------------------------------------------------------------------------
+
+async def on_startup() -> None:
+    db.init_db()
+    logger.info("Database initialized.")
+    try:
+        await bot.set_my_commands([
+            {"command": "start", "description": "Start the bot / register"},
+            {"command": "help", "description": "Show all commands"},
+            {"command": "games", "description": "Browse all games"},
+            {"command": "balance", "description": "Check your coin balance"},
+            {"command": "profile", "description": "View your profile"},
+            {"command": "leaderboard", "description": "Top players"},
+            {"command": "richpeople", "description": "Top 30 richest players"},
+            {"command": "aviator", "description": "Play Aviator"},
+            {"command": "flip", "description": "Flip a coin and bet coins"},
+        ])
+    except Exception:
+        logger.warning("Could not set bot commands (non-fatal).")
+    logger.info("Bot started as configured. Owner ID: %s", OWNER_ID)
+
+
+async def on_shutdown() -> None:
+    logger.info("Shutting down - ending all active games gracefully...")
+    for chat_id, game in list(active_games.items()):
+        try:
+            await game.force_end("The bot is restarting. Sorry for the interruption!")
+        except Exception:
+            pass
+    active_games.clear()
+
+
+async def main() -> None:
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
-    if not game:  
-        await update.message.reply_text("❌ No active game.")  
-        return  
-
-    if (  
-        update.effective_user.id != game["host_id"]  
-        and not is_privileged(update.effective_user.id)  
-    ):  
-        await update.message.reply_text("❌ Only the host, owner or admin can end it.")  
-        return  
-
-    end_game(game["id"])  
-    parchi_games.pop(game["id"], None)  
-
-    await update.message.reply_text(  
-        "🛑 <b>GAME ENDED</b>\n\n"  
-        "The current Parchi game has been stopped.",  
-        parse_mode="HTML"  
-    )
-
-# =========================================================
-# FLY GAME LOBBY & ENGINE
-# =========================================================
-
-def build_fly_bet_keyboard(chat_id):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("100", callback_data=f"flybet:{chat_id}:100"),
-            InlineKeyboardButton("200", callback_data=f"flybet:{chat_id}:200"),
-            InlineKeyboardButton("500", callback_data=f"flybet:{chat_id}:500"),
-        ],
-        [
-            InlineKeyboardButton("1000", callback_data=f"flybet:{chat_id}:1000"),
-            InlineKeyboardButton("2500", callback_data=f"flybet:{chat_id}:2500"),
-            InlineKeyboardButton("5000", callback_data=f"flybet:{chat_id}:5000"),
-        ]
-    ])
-
-def build_fly_lobby_text(time_left, bets):
-    text = (
-        "🚀 <b>FLY ROUND STARTING SOON!</b>\n\n"
-        f"⏳ Time remaining to place wagers: <b>{time_left}s</b>\n\n"
-        "Select an amount below or use <code>/f <amount></code> or <code>/fly <amount></code> to set a custom wager.\n\n"
-        "👥 <b>Current Bets:</b>\n"
-    )
-
-    if not bets:  
-        text += "<i>No wagers placed yet.</i>\n"  
-    else:  
-        for user_id, info in bets.items():  
-            name = info["first_name"] or info["username"] or "Player"  
-            text += f"• {name}: 💰 <b>{info['amount']:,} coins</b>\n"  
-
-    return text
-
-async def fly(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Route custom bet if arguments are supplied with /fly (e.g. /fly 89)
-    if context.args:
-        await fly_custom_bet(update, context)
-        return
-
-    remember_user(update.effective_user)
-    chat_id = update.effective_chat.id  
-
-    if chat_id in fly_games:  
-        await update.message.reply_text("🚀 A Fly round is already active in this group.")  
-        return  
-
-    fly_games[chat_id] = {  
-        "status": "lobby",  
-        "message_id": None,  
-        "owner_user_id": update.effective_user.id,  
-        "bets": {},  
-        "started_at": None,  
-        "stopped": False  
-    }  
-
-    keyboard = build_fly_bet_keyboard(chat_id)  
-    text = build_fly_lobby_text(60, {})  
-
-    sent = await update.message.reply_text(  
-        text,  
-        reply_markup=keyboard,  
-        parse_mode="HTML"  
-    )  
-
-    fly_games[chat_id]["message_id"] = sent.message_id  
-    asyncio.create_task(fly_lobby_timer(context, chat_id))
-
-async def fly_custom_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    remember_user(update.effective_user)
-    chat_id = update.effective_chat.id  
-    state = fly_games.get(chat_id)  
-
-    if not state or state["status"] != "lobby":  
-        await update.message.reply_text("❌ No Fly betting lobby is active right now.")  
-        return  
-
-    if not context.args:  
-        await update.message.reply_text(  
-            "❌ Please enter an amount. Example: <code>/f 1500</code>",  
-            parse_mode="HTML"  
-        )  
-        return  
-
-    try:  
-        amount = int(context.args[0])  
-    except ValueError:  
-        await update.message.reply_text("❌ Amount must be a valid number.")  
-        return  
-
-    if amount <= 0:  
-        await update.message.reply_text("❌ Amount must be greater than 0.")  
-        return  
-
-    user = update.effective_user  
-    user_id = user.id  
-    current_balance = get_balance(user_id)  
-    existing_bet = state["bets"].get(user_id, {}).get("amount", 0)  
-
-    if current_balance + existing_bet < amount:  
-        await update.message.reply_text(  
-            f"❌ Insufficient balance! Your total balance is {current_balance:,} coins."  
-        )  
-        return  
-
-    if existing_bet > 0:  
-        change_coins(user_id, existing_bet, "Fly bet update refund")  
-
-    change_coins(user_id, -amount, "Fly bet placed")  
-
-    state["bets"][user_id] = {  
-        "amount": amount,  
-        "first_name": user.first_name,  
-        "username": user.username,  
-        "cashed_out": False,  
-        "cashout_mult": 0.0,  
-        "win_amount": 0  
-    }  
-
-    await update.message.reply_text(  
-        f"✅ <b>Wager set!</b> {user.first_name} bet 💰 <b>{amount:,} coins</b>.",  
-        parse_mode="HTML"  
-    )
-
-async def fly_bet_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    parts = query.data.split(":")  
-    chat_id = int(parts[1])  
-    amount = int(parts[2])  
-
-    state = fly_games.get(chat_id)  
-
-    if not state or state["status"] != "lobby":  
-        await query.answer("Lobby timer finished or round ended.", show_alert=True)  
-        return  
-
-    user = query.from_user  
-    remember_user(user)  
-    user_id = user.id  
-    current_balance = get_balance(user_id)  
-    existing_bet = state["bets"].get(user_id, {}).get("amount", 0)  
-
-    if current_balance + existing_bet < amount:  
-        await query.answer(  
-            f"Insufficient balance! You have {current_balance:,} coins.",  
-            show_alert=True  
-        )  
-        return  
-
-    if existing_bet > 0:  
-        change_coins(user_id, existing_bet, "Fly bet update refund")  
-
-    change_coins(user_id, -amount, "Fly bet placed")  
-
-    state["bets"][user_id] = {  
-        "amount": amount,  
-        "first_name": user.first_name,  
-        "username": user.username,  
-        "cashed_out": False,  
-        "cashout_mult": 0.0,  
-        "win_amount": 0  
-    }  
-
-    await query.answer(f"Wager set to {amount:,} coins!", show_alert=False)
-
-async def fly_lobby_timer(context, chat_id):
-    for time_left in range(60, 0, -5):
-        await asyncio.sleep(5)
-        state = fly_games.get(chat_id)  
-
-        if not state or state["stopped"]:  
-            return  
-
-        keyboard = build_fly_bet_keyboard(chat_id)  
-        text = build_fly_lobby_text(time_left, state["bets"])  
-
-        try:  
-            await context.bot.edit_message_text(  
-                chat_id=chat_id,  
-                message_id=state["message_id"],  
-                text=text,  
-                reply_markup=keyboard,  
-                parse_mode="HTML"  
-            )  
-        except Exception:  
-            pass  
-
-    state = fly_games.get(chat_id)  
-
-    if not state or state["stopped"]:  
-        return  
-
-    if not state["bets"]:  
-        try:  
-            await context.bot.edit_message_text(  
-                chat_id=chat_id,  
-                message_id=state["message_id"],  
-                text="🚀 <b>FLY CANCELLED</b>\n\nNo wagers were placed.",  
-                parse_mode="HTML"  
-            )  
-        except Exception:  
-            pass  
-
-        fly_games.pop(chat_id, None)  
-        return  
-
-    state["status"] = "flying"  
-    state["started_at"] = time.monotonic()  
-
-    asyncio.create_task(fly_flight_loop(context, chat_id))
-
-async def fly_flight_loop(context, chat_id):
-    state = fly_games.get(chat_id)
-    if not state:  
-        return  
-
-    started_at = state["started_at"]  
-    crash = round(min(100.0, max(1.25, 1.10 / random.random())), 2)  
-    last_multiplier = 1.10  
-
-    while True:  
-        await asyncio.sleep(1)  
-        state = fly_games.get(chat_id)  
-
-        if not state or state["stopped"]:  
-            return  
-
-        elapsed = time.monotonic() - started_at  
-        multiplier = arcade_multiplier(elapsed)  
-
-        all_cashed_out = all(b["cashed_out"] for b in state["bets"].values())  
-
-        if multiplier >= crash or all_cashed_out:  
-            text = (  
-                "💥 <b>FLY CRASHED!</b>\n\n"  
-                f"📉 Final Multiplier: <b>{crash if multiplier >= crash else multiplier:.2f}x</b>\n\n"  
-                "📊 <b>Results:</b>\n"  
-            )  
-
-            for user_id, b in state["bets"].items():  
-                name = b["first_name"] or b["username"] or "Player"  
-
-                if b["cashed_out"]:  
-                    text += (  
-                        f"• {name}: Cashed out @ <b>{b['cashout_mult']:.2f}x</b> "  
-                        f"(+<b>{b['win_amount']:,}</b> coins)\n"  
-                    )  
-                else:  
-                    text += f"• {name}: Crashed! (-<b>{b['amount']:,}</b> coins)\n"  
-
-            try:  
-                await context.bot.edit_message_text(  
-                    chat_id=chat_id,  
-                    message_id=state["message_id"],  
-                    text=text,  
-                    parse_mode="HTML"  
-                )  
-            except Exception:  
-                pass  
-
-            fly_games.pop(chat_id, None)  
-            return  
-
-        if multiplier > last_multiplier:  
-            keyboard = [[  
-                InlineKeyboardButton(  
-                    "💰 CASH OUT",  
-                    callback_data=f"flycash:{chat_id}"  
-                )  
-            ]]  
-
-            text = (  
-                "🚀 <b>FLYING...</b>\n\n"  
-                f"📈 Multiplier: <b>{multiplier:.2f}x</b>\n\n"  
-                "👥 <b>Players:</b>\n"  
-            )  
-
-            for user_id, b in state["bets"].items():  
-                name = b["first_name"] or b["username"] or "Player"  
-
-                if b["cashed_out"]:  
-                    text += (  
-                        f"• {name}: Cashed out @ <b>{b['cashout_mult']:.2f}x</b> "  
-                        f"(<b>{b['win_amount']:,}</b> coins)\n"  
-                    )  
-                else:  
-                    text += f"• {name}: 💰 <b>{b['amount']:,} coins</b> in play\n"  
-
-            try:  
-                await context.bot.edit_message_text(  
-                    chat_id=chat_id,  
-                    message_id=state["message_id"],  
-                    text=text,  
-                    reply_markup=InlineKeyboardMarkup(keyboard),  
-                    parse_mode="HTML"  
-                )  
-            except Exception:  
-                pass  
-
-            last_multiplier = multiplier
-
-async def fly_cashout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    chat_id = int(query.data.split(":")[1])  
-    state = fly_games.get(chat_id)  
-
-    if not state or state["status"] != "flying" or state["stopped"]:  
-        await query.answer("Fly round is not active.", show_alert=True)  
-        return  
-
-    user_id = query.from_user.id  
-
-    if user_id not in state["bets"]:  
-        await query.answer("You are not in this Fly round!", show_alert=True)  
-        return  
-
-    b = state["bets"][user_id]  
-
-    if b["cashed_out"]:  
-        await query.answer("You already cashed out!", show_alert=True)  
-        return  
-
-    elapsed = time.monotonic() - state["started_at"]  
-    multiplier = arcade_multiplier(elapsed)  
-    winnings = int(b["amount"] * multiplier)  
-
-    b["cashed_out"] = True  
-    b["cashout_mult"] = multiplier  
-    b["win_amount"] = winnings  
-
-    change_coins(user_id, winnings, f"Fly win @ {multiplier}x")  
-
-    await query.answer(  
-        f"Cashed out at {multiplier:.2f}x! (+{winnings:,} coins)",  
-        show_alert=True  
-    )
-
-# =========================================================
-# /STOPFLY — OWNER ONLY
-# =========================================================
-
-async def stopfly(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Owner only.")
-        return
-
-    chat_id = update.effective_chat.id  
-    state = fly_games.get(chat_id)  
-
-    if not state:  
-        await update.message.reply_text("❌ No Fly round is running.")  
-        return  
-
-    state["stopped"] = True  
-
-    for user_id, b in state["bets"].items():  
-        if not b["cashed_out"]:  
-            change_coins(user_id, b["amount"], "Fly round stopped refund")  
-
-    try:  
-        await context.bot.edit_message_text(  
-            chat_id=chat_id,  
-            message_id=state["message_id"],  
-            text=(  
-                "🛑 <b>FLY STOPPED BY OWNER</b>\n\n"  
-                "The round was cancelled and non-cashed out wagers were refunded."  
-            ),  
-            parse_mode="HTML"  
-        )  
-    except Exception:  
-        pass  
-
-    fly_games.pop(chat_id, None)  
-    await update.message.reply_text("✅ Fly round stopped.")
-
-# =========================================================
-# /GIVE + /ADD
-# =========================================================
-
-async def give_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Owner only.")
-        return
-
-    if not update.message.reply_to_message:  
-        await update.message.reply_text(  
-            "❌ Reply to the user's message.\n\n"  
-            "Example:\n"  
-            "/give 5000"  
-        )  
-        return  
-
-    if not context.args:  
-        await update.message.reply_text("❌ Enter an amount.")  
-        return  
-
-    try:  
-        amount = int(context.args[0])  
-    except ValueError:  
-        await update.message.reply_text("❌ Amount must be a number.")  
-        return  
-
-    if amount <= 0:  
-        await update.message.reply_text("❌ Amount must be greater than 0.")  
-        return  
-
-    target = update.message.reply_to_message.from_user  
-    remember_user(target)  
-
-    change_coins(target.id, amount, f"Owner gave {amount} coins")  
-
-    await update.message.reply_text(  
-        "✅ <b>COINS ADDED</b>\n\n"  
-        f"👤 {target.first_name}\n"  
-        f"💰 Added: {amount:,}\n"  
-        f"💳 Balance: {get_balance(target.id):,}",  
-        parse_mode="HTML"  
-    )
-
-# =========================================================
-# /REMOVEC
-# =========================================================
-
-async def remove_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Owner only.")
-        return
-
-    if not update.message.reply_to_message:  
-        await update.message.reply_text("❌ Reply to the user's message.")  
-        return  
-
-    if not context.args:  
-        await update.message.reply_text("❌ Enter an amount.")  
-        return  
-
-    try:  
-        amount = int(context.args[0])  
-    except ValueError:  
-        await update.message.reply_text("❌ Amount must be a number.")  
-        return  
-
-    if amount <= 0:  
-        await update.message.reply_text("❌ Amount must be greater than 0.")  
-        return  
-
-    target = update.message.reply_to_message.from_user  
-    remember_user(target)  
-
-    current = get_balance(target.id)  
-    actual_remove = min(amount, current)  
-
-    change_coins(target.id, -actual_remove, f"Owner removed {actual_remove} coins")  
-
-    await update.message.reply_text(  
-        "✅ <b>COINS REMOVED</b>\n\n"  
-        f"👤 {target.first_name}\n"  
-        f"💰 Removed: {actual_remove:,}\n"  
-        f"💳 Balance: {get_balance(target.id):,}",  
-        parse_mode="HTML"  
-    )
-
-# =========================================================
-# /ADMIN
-# =========================================================
-
-async def make_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Owner only.")
-        return
-
-    if not update.message.reply_to_message:  
-        await update.message.reply_text("❌ Reply to a user with /admin.")  
-        return  
-
-    target = update.message.reply_to_message.from_user  
-    remember_user(target)  
-    add_admin(target.id)  
-
-    await update.message.reply_text(f"✅ {target.first_name} is now an admin.")
-
-# =========================================================
-# /UNADMIN
-# =========================================================
-
-async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Owner only.")
-        return
-
-    if not update.message.reply_to_message:  
-        await update.message.reply_text("❌ Reply to a user with /unadmin.")  
-        return  
-
-    target = update.message.reply_to_message.from_user  
-    remove_admin(target.id)  
-
-    await update.message.reply_text(f"✅ {target.first_name} is no longer an admin.")
-
-# =========================================================
-# CALLBACK ROUTER
-# =========================================================
-
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-
-    if query.data.startswith("join:"):  
-        await join_button(update, context)  
-
-    elif query.data.startswith("card:"):  
-        await card_selected(update, context)  
-
-    elif query.data.startswith("flybet:"):  
-        await fly_bet_button(update, context)  
-
-    elif query.data.startswith("flycash:"):  
-        await fly_cashout(update, context)
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is missing.")
-
-    if not OWNER_ID:  
-        raise RuntimeError("OWNER_ID environment variable is missing.")  
-
-    init_db()  
-
-    application = (  
-        Application.builder()  
-        .token(BOT_TOKEN)  
-        .build()  
-    )  
-
-    # Basic Commands 
-    application.add_handler(CommandHandler("start", start))  
-    application.add_handler(CommandHandler("help", help_command))  
-    application.add_handler(CommandHandler("free", free_coins_command))  
-    application.add_handler(CommandHandler("bal", balance))  
-    application.add_handler(CommandHandler("leaderboard", show_leaderboard))  
-
-    # Parchi Game Commands 
-    application.add_handler(CommandHandler("startgame", startgame))  
-    application.add_handler(CommandHandler("join", join_command))  
-    application.add_handler(CommandHandler("begin", begin))  
-    application.add_handler(CommandHandler("endgame", endgame))  
-
-    # Fly Game Commands 
-    application.add_handler(CommandHandler("fly", fly))  
-    application.add_handler(CommandHandler("f", fly_custom_bet))  
-    application.add_handler(CommandHandler("stopfly", stopfly))  
-
-    # Owner Commands 
-    application.add_handler(CommandHandler("give", give_coins))  
-    application.add_handler(CommandHandler("add", give_coins))  
-    application.add_handler(CommandHandler("removec", remove_coins))  
-    application.add_handler(CommandHandler("admin", make_admin))  
-    application.add_handler(CommandHandler("unadmin", remove_admin_command))  
-
-    # Inline Buttons  
-    application.add_handler(CallbackQueryHandler(callbacks))  
-
-    print("🏏 16 Parchi Bot started!")  
-    application.run_polling()
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped.")
