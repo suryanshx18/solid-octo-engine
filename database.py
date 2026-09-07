@@ -33,14 +33,14 @@ MAX_PLAYERS_DEFAULT = 8
 
 # Per-game min/max players
 GAME_LIMITS = {
-    "raja_mantri": (4, 4),
+    "raja": (4, 4),
     "impostor": (4, 10),
     "4card": (2, 4),
     "antakshari": (2, 8),
     "cards": (2, 6),
     "box": (2, 4),
     "ludo": (2, 4),
-    "rangers": (2, 2),
+    "rangers": (2, 6),
     "business": (2, 4),
 }
 
@@ -153,7 +153,7 @@ def get_user(user_id: int) -> Optional[sqlite3.Row]:
         return cur.fetchone()
 
 
-def register_user(user_id: int, username: Optional[str], first_name: Optional[str]) -> sqlite3.Row:
+def register_user(user_id: int, username: Optional[str], first_name: Optional[str], starting_coins: Optional[int] = None) -> sqlite3.Row:
     """Register the user if new, otherwise refresh their username/name/activity."""
     existing = get_user(user_id)
     now = _now()
@@ -405,7 +405,10 @@ def get_bot_stats() -> dict:
         total_games = conn.execute("SELECT COUNT(*) AS c FROM game_results").fetchone()["c"]
         # "active" = touched in the last 24 hours
         active_24h = conn.execute(
-            "SELECT COUNT(*) AS c FROM users WHERE updated_at >= datetime('now', '-1 day')"
+            "SELECT COUNT(*) AS c FROM users WHERE datetime(updated_at) >= datetime('now', '-1 day')"
+        ).fetchone()["c"]
+        active_7d = conn.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE datetime(updated_at) >= datetime('now', '-7 day')"
         ).fetchone()["c"]
     return {
         "total_users": total_users,
@@ -414,4 +417,39 @@ def get_bot_stats() -> dict:
         "total_coins_in_circulation": total_coins,
         "total_games_played": total_games,
         "active_last_24h": active_24h,
+        "active_last_7d": active_7d,
+        "active_24h": active_24h,
+        "active_7d": active_7d,
+        "groups": total_groups,
+        "total_games": total_games,
     }
+
+
+# Compatibility aliases for older bot/game modules.
+def get_coins(user_id: int) -> int:
+    return get_balance(user_id)
+
+def touch_user(user_id: int) -> None:
+    touch_activity(user_id)
+
+def update_stats(user_id: int, won: bool) -> None:
+    record_game_stat(user_id, won)
+
+def is_admin_db(user_id: int) -> bool:
+    return is_admin(user_id)
+
+def ban_user(user_id: int) -> bool:
+    return set_banned(user_id, True)
+
+def unban_user(user_id: int) -> bool:
+    return set_banned(user_id, False)
+
+def get_all_user_ids() -> list[int]:
+    with get_conn() as conn:
+        cur = conn.execute("SELECT user_id FROM users")
+        return [int(r["user_id"]) for r in cur.fetchall()]
+
+def get_all_group_chat_ids() -> list[int]:
+    with get_conn() as conn:
+        cur = conn.execute("SELECT chat_id FROM known_chats WHERE chat_type IN ('group','supergroup')")
+        return [int(r["chat_id"]) for r in cur.fetchall()]
