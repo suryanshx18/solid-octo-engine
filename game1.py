@@ -55,11 +55,13 @@ class BaseGame:
     display_name_: str = "Game"
     emoji: str = "🎮"
 
-    def __init__(self, bot: Bot, chat_id: int, host_id: int, host_name: str, manager: "GameManager"):
+    def __init__(self, bot: Bot, chat_id: int, host_id: int, host_name: str, manager: Optional["GameManager"] = None):
         self.bot = bot
         self.chat_id = chat_id
         self.host_id = host_id
+        self.creator_id = host_id
         self.manager = manager
+        self.on_finish = None
         self.players: dict[int, str] = {host_id: host_name}
         self.status = "lobby"  # lobby -> running -> ended
         self.lobby_message_id: Optional[int] = None
@@ -90,8 +92,11 @@ class BaseGame:
             ]
         )
 
-    async def send_lobby(self, message: Message) -> None:
-        sent = await message.answer(self.lobby_text(), reply_markup=self.lobby_keyboard())
+    async def send_lobby(self, message: Optional[Message] = None) -> None:
+        if message is not None:
+            sent = await message.answer(self.lobby_text(), reply_markup=self.lobby_keyboard())
+        else:
+            sent = await self.bot.send_message(self.chat_id, self.lobby_text(), reply_markup=self.lobby_keyboard())
         self.lobby_message_id = sent.message_id
 
     async def refresh_lobby(self) -> None:
@@ -107,19 +112,30 @@ class BaseGame:
         except Exception as exc:  # message not modified, deleted, etc.
             logger.debug("refresh_lobby: %s", exc)
 
-    async def add_player(self, user_id: int, name: str) -> str:
-        if self.status != "lobby":
-            return "started"
-        if user_id in self.players:
-            return "already_joined"
-        if len(self.players) >= self.max_players:
-            return "full"
-        self.players[user_id] = name
+    async def _refresh_lobby(self) -> None:
         await self.refresh_lobby()
-        return "joined"
+
+    async def add_player(self, user_id: int, name: str) -> tuple[bool, str]:
+        if self.status != "lobby":
+            return False, "❌ This game has already started."
+        if user_id in self.players:
+            return False, "❌ You already joined this game."
+        if len(self.players) >= self.max_players:
+            return False, "❌ Lobby is full."
+        self.players[user_id] = name or "Player"
+        await self.refresh_lobby()
+        return True, f"✅ {self.players[user_id]} joined ({len(self.players)}/{self.max_players})."
 
     def can_start(self) -> bool:
         return len(self.players) >= self.min_players
+
+    async def try_start(self, requester_id: int) -> tuple[bool, str]:
+        if self.status != "lobby":
+            return False, "❌ Game already started."
+        if not self.can_start():
+            return False, f"❌ Need at least {self.min_players} players (have {len(self.players)})."
+        await self.begin()
+        return True, "🚀 Game starting!"
 
     async def begin(self) -> str:
         if self.status != "lobby":
@@ -147,7 +163,13 @@ class BaseGame:
     async def cleanup(self) -> None:
         self.cancel_tasks()
         self.status = "ended"
-        self.manager.remove(self.chat_id)
+        if self.manager is not None:
+            self.manager.remove(self.chat_id)
+        if callable(self.on_finish):
+            try:
+                self.on_finish(self.chat_id)
+            except Exception:
+                logger.exception("Game finish callback failed")
 
     async def force_end(self, reason_text: str) -> None:
         try:
@@ -673,3 +695,8 @@ RULES_TEXT_G1 = {
         "Most pairs when the board clears wins."
     ),
 }
+
+
+RajaMantriGame.RULES_TEXT = RULES_TEXT_G1["raja"]
+ImpostorGame.RULES_TEXT = RULES_TEXT_G1["impostor"]
+FourCardMatchGame.RULES_TEXT = RULES_TEXT_G1["4card"]
