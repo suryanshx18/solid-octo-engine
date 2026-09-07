@@ -1,437 +1,417 @@
+"""
+database.py
+============
+All persistence for the Telegram Games Bot lives here: SQLite schema,
+player/admin/owner management, the virtual coin economy, game result
+logging, bans, and bot-wide statistics.
+
+Every query is parameterized. No raw string interpolation of user input
+ever reaches SQL.
+"""
+
+from __future__ import annotations
+
+import os
 import sqlite3
+import logging
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from typing import Optional, Iterable
 
-DB_NAME = "chaoscore.db"
+logger = logging.getLogger("games_bot.database")
 
-def now():
+# --------------------------------------------------------------------------
+# Configuration constants (used across bot.py / game1.py / game2.py / game3.py)
+# --------------------------------------------------------------------------
+
+DB_PATH = os.environ.get("BOT_DB_PATH", "games_bot.db")
+OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
+
+STARTING_COINS = 1000          # coins a brand-new player receives
+MIN_PLAYERS_DEFAULT = 2
+MAX_PLAYERS_DEFAULT = 8
+
+# Per-game min/max players
+GAME_LIMITS = {
+    "raja_mantri": (4, 4),
+    "impostor": (4, 10),
+    "4card": (2, 4),
+    "antakshari": (2, 8),
+    "cards": (2, 6),
+    "box": (2, 4),
+    "ludo": (2, 4),
+    "rangers": (2, 2),
+    "business": (2, 4),
+}
+
+# Timeouts (seconds)
+LOBBY_TIMEOUT = 90
+TURN_TIMEOUT = 30
+DISCUSSION_TIMEOUT = 60
+VOTE_TIMEOUT = 30
+
+# Reward structure (virtual coins, configurable)
+REWARDS = {
+    "first": 500,
+    "second": 250,
+    "participation": 50,
+}
+
+# Aviator / Flip config
+FLIP_WIN_MULTIPLIER = 2.0
+FLIP_LOSE_MULTIPLIER = 0.2
+AVIATOR_PRESET_AMOUNTS = (50, 100, 250, 500)
+AVIATOR_MAX_MULTIPLIER = 20.0
+
+# --------------------------------------------------------------------------
+# Connection helpers
+# --------------------------------------------------------------------------
+
+
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def get_db():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
 
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
+def init_db() -> None:
+    """Create all required tables if they do not already exist."""
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id       INTEGER PRIMARY KEY,
+                username      TEXT,
+                first_name    TEXT,
+                coins         INTEGER NOT NULL DEFAULT 0,
+                games_played  INTEGER NOT NULL DEFAULT 0,
+                wins          INTEGER NOT NULL DEFAULT 0,
+                losses        INTEGER NOT NULL DEFAULT 0,
+                banned        INTEGER NOT NULL DEFAULT 0,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id     INTEGER PRIMARY KEY,
+                added_by    INTEGER NOT NULL,
+                created_at  TEXT NOT NULL
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_results (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id     INTEGER NOT NULL,
+                game_name   TEXT NOT NULL,
+                winner_id   INTEGER,
+                players     TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS known_chats (
+                chat_id     INTEGER PRIMARY KEY,
+                chat_type   TEXT NOT NULL,
+                title       TEXT,
+                created_at  TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    logger.info("Database initialised at %s", DB_PATH)
 
-    cur.execute("""  
-        CREATE TABLE IF NOT EXISTS users (  
-            user_id INTEGER PRIMARY KEY,  
-            username TEXT,  
-            first_name TEXT,  
-            coins INTEGER DEFAULT 0,  
-            claimed_free INTEGER DEFAULT 0,
-            created_at TEXT  
-        )  
-    """)  
 
-    # Safe migration: ensure claimed_free column exists if DB was already created
-    try:
-        cur.execute("ALTER TABLE users ADD COLUMN claimed_free INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
+# --------------------------------------------------------------------------
+# User / player management
+# --------------------------------------------------------------------------
 
-    cur.execute("""  
-        CREATE TABLE IF NOT EXISTS admins (  
-            user_id INTEGER PRIMARY KEY,  
-            added_at TEXT  
-        )  
-    """)  
 
-    cur.execute("""  
-        CREATE TABLE IF NOT EXISTS coin_transactions (  
-            id INTEGER PRIMARY KEY AUTOINCREMENT,  
-            user_id INTEGER NOT NULL,  
-            amount INTEGER NOT NULL,  
-            reason TEXT,  
-            created_at TEXT  
-        )  
-    """)  
+def get_user(user_id: int) -> Optional[sqlite3.Row]:
+    with get_conn() as conn:
+        cur = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        return cur.fetchone()
 
-    cur.execute("""  
-        CREATE TABLE IF NOT EXISTS games (  
-            id INTEGER PRIMARY KEY AUTOINCREMENT,  
-            chat_id INTEGER NOT NULL,  
-            host_id INTEGER NOT NULL,  
-            game_type TEXT NOT NULL,  
-            status TEXT NOT NULL,  
-            current_turn INTEGER DEFAULT 0,  
-            created_at TEXT,  
-            ended_at TEXT  
-        )  
-    """)  
 
-    cur.execute("""  
-        CREATE TABLE IF NOT EXISTS game_players (  
-            game_id INTEGER NOT NULL,  
-            user_id INTEGER NOT NULL,  
-            position INTEGER NOT NULL,  
-            joined_at TEXT,  
-            PRIMARY KEY (game_id, user_id)  
-        )  
-    """)  
+def register_user(user_id: int, username: Optional[str], first_name: Optional[str]) -> sqlite3.Row:
+    """Register the user if new, otherwise refresh their username/name/activity."""
+    existing = get_user(user_id)
+    now = _now()
+    with get_conn() as conn:
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO users (user_id, username, first_name, coins, games_played,
+                                    wins, losses, banned, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?)
+                """,
+                (user_id, username or "", first_name or "Player", STARTING_COINS, now, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE users SET username = ?, first_name = ?, updated_at = ? WHERE user_id = ?",
+                (username or existing["username"], first_name or existing["first_name"], now, user_id),
+            )
+    return get_user(user_id)
 
-    conn.commit()  
-    conn.close()
 
-# =========================================================
-# USERS
-# =========================================================
+def touch_activity(user_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET updated_at = ? WHERE user_id = ?", (_now(), user_id))
 
-def add_user(user_id, username=None, first_name=None):
-    conn = get_db()
 
-    conn.execute("""  
-        INSERT OR IGNORE INTO users  
-        (user_id, username, first_name, coins, claimed_free, created_at)  
-        VALUES (?, ?, ?, 0, 0, ?)  
-    """, (  
-        user_id,  
-        username,  
-        first_name,  
-        now()  
-    ))  
+def user_exists(user_id: int) -> bool:
+    return get_user(user_id) is not None
 
-    conn.execute("""  
-        UPDATE users  
-        SET username = ?,  
-            first_name = ?  
-        WHERE user_id = ?  
-    """, (  
-        username,  
-        first_name,  
-        user_id  
-    ))  
 
-    conn.commit()  
-    conn.close()
-
-def get_user(user_id):
-    conn = get_db()
-
-    row = conn.execute("""  
-        SELECT *  
-        FROM users  
-        WHERE user_id = ?  
-    """, (user_id,)).fetchone()  
-
-    conn.close()  
-
-    return row
-
-def get_balance(user_id):
+def is_banned(user_id: int) -> bool:
     row = get_user(user_id)
-    return row["coins"] if row else 0
+    return bool(row and row["banned"])
 
-def claim_free_coins(user_id, amount=10000):
-    user = get_user(user_id)
-    if not user or user["claimed_free"] == 1:
-        return False, 0
-    
-    conn = get_db()
-    conn.execute("""
-        UPDATE users
-        SET coins = coins + ?,
-            claimed_free = 1
-        WHERE user_id = ?
-    """, (amount, user_id))
-    
-    conn.execute("""  
-        INSERT INTO coin_transactions  
-        (user_id, amount, reason, created_at)  
-        VALUES (?, ?, ?, ?)  
-    """, (  
-        user_id,  
-        amount,  
-        "Claimed /free bonus",  
-        now()  
-    ))
-    
-    conn.commit()
-    conn.close()
-    return True, amount
 
-def change_coins(user_id, amount, reason=""):
-    conn = get_db()
+def set_banned(user_id: int, banned: bool) -> bool:
+    if not user_exists(user_id):
+        return False
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET banned = ?, updated_at = ? WHERE user_id = ?",
+            (1 if banned else 0, _now(), user_id),
+        )
+    return True
 
-    conn.execute("""  
-        UPDATE users  
-        SET coins = coins + ?  
-        WHERE user_id = ?  
-    """, (  
-        amount,  
-        user_id  
-    ))  
 
-    conn.execute("""  
-        INSERT INTO coin_transactions  
-        (user_id, amount, reason, created_at)  
-        VALUES (?, ?, ?, ?)  
-    """, (  
-        user_id,  
-        amount,  
-        reason,  
-        now()  
-    ))  
+# --------------------------------------------------------------------------
+# Coin economy - ALL coin mutation goes through these functions
+# --------------------------------------------------------------------------
 
-    conn.commit()  
-    conn.close()
 
-# =========================================================
-# ADMINS
-# =========================================================
+def get_balance(user_id: int) -> int:
+    row = get_user(user_id)
+    return int(row["coins"]) if row else 0
 
-def is_admin(user_id):
-    conn = get_db()
 
-    row = conn.execute("""  
-        SELECT user_id  
-        FROM admins  
-        WHERE user_id = ?  
-    """, (user_id,)).fetchone()  
+def add_coins(user_id: int, amount: int) -> int:
+    """Add coins (amount must be >= 0). Returns new balance."""
+    if amount < 0:
+        raise ValueError("add_coins requires a non-negative amount")
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET coins = coins + ?, updated_at = ? WHERE user_id = ?",
+            (amount, _now(), user_id),
+        )
+        row = conn.execute("SELECT coins FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return int(row["coins"]) if row else 0
 
-    conn.close()  
 
+def take_coins(user_id: int, amount: int) -> bool:
+    """
+    Remove coins, never allowing the balance to go negative.
+    Returns True on success, False if the user doesn't have enough coins.
+    """
+    if amount < 0:
+        raise ValueError("take_coins requires a non-negative amount")
+    with get_conn() as conn:
+        row = conn.execute("SELECT coins FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None or row["coins"] < amount:
+            return False
+        conn.execute(
+            "UPDATE users SET coins = coins - ?, updated_at = ? WHERE user_id = ?",
+            (amount, _now(), user_id),
+        )
+    return True
+
+
+def transfer_coins(from_id: int, to_id: int, amount: int) -> bool:
+    """Peer-to-peer coin transfer. Atomic: both succeed or neither does."""
+    if amount <= 0:
+        return False
+    with get_conn() as conn:
+        row = conn.execute("SELECT coins FROM users WHERE user_id = ?", (from_id,)).fetchone()
+        if row is None or row["coins"] < amount:
+            return False
+        if conn.execute("SELECT 1 FROM users WHERE user_id = ?", (to_id,)).fetchone() is None:
+            return False
+        conn.execute(
+            "UPDATE users SET coins = coins - ?, updated_at = ? WHERE user_id = ?",
+            (amount, _now(), from_id),
+        )
+        conn.execute(
+            "UPDATE users SET coins = coins + ?, updated_at = ? WHERE user_id = ?",
+            (amount, _now(), to_id),
+        )
+    return True
+
+
+# --------------------------------------------------------------------------
+# Stats
+# --------------------------------------------------------------------------
+
+
+def record_game_stat(user_id: int, won: bool) -> None:
+    with get_conn() as conn:
+        if won:
+            conn.execute(
+                "UPDATE users SET games_played = games_played + 1, wins = wins + 1, updated_at = ? WHERE user_id = ?",
+                (_now(), user_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE users SET games_played = games_played + 1, losses = losses + 1, updated_at = ? WHERE user_id = ?",
+                (_now(), user_id),
+            )
+
+
+def get_leaderboard(limit: int = 10) -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT user_id, username, first_name, coins FROM users "
+            "WHERE banned = 0 ORDER BY coins DESC LIMIT ?",
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def get_rank(user_id: int) -> Optional[int]:
+    row = get_user(user_id)
+    if not row:
+        return None
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE coins > ? AND banned = 0", (row["coins"],)
+        )
+        higher = cur.fetchone()["c"]
+    return higher + 1
+
+
+# --------------------------------------------------------------------------
+# Game results
+# --------------------------------------------------------------------------
+
+
+def record_game_result(chat_id: int, game_name: str, winner_id: Optional[int], players: Iterable[int]) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO game_results (chat_id, game_name, winner_id, players, created_at) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, game_name, winner_id, ",".join(str(p) for p in players), _now()),
+        )
+
+
+# --------------------------------------------------------------------------
+# Admin / owner management
+# --------------------------------------------------------------------------
+
+
+def is_owner(user_id: int) -> bool:
+    return OWNER_ID != 0 and user_id == OWNER_ID
+
+
+def is_admin(user_id: int) -> bool:
+    with get_conn() as conn:
+        row = conn.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)).fetchone()
     return row is not None
 
-def add_admin(user_id):
-    conn = get_db()
 
-    conn.execute("""  
-        INSERT OR IGNORE INTO admins  
-        (user_id, added_at)  
-        VALUES (?, ?)  
-    """, (  
-        user_id,  
-        now()  
-    ))  
+def is_owner_or_admin(user_id: int) -> bool:
+    return is_owner(user_id) or is_admin(user_id)
 
-    conn.commit()  
-    conn.close()
 
-def remove_admin(user_id):
-    conn = get_db()
+def add_admin(user_id: int, added_by: int) -> bool:
+    if is_admin(user_id):
+        return False
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO admins (user_id, added_by, created_at) VALUES (?, ?, ?)",
+            (user_id, added_by, _now()),
+        )
+    return True
 
-    conn.execute("""  
-        DELETE FROM admins  
-        WHERE user_id = ?  
-    """, (user_id,))  
 
-    conn.commit()  
-    conn.close()
+def remove_admin(user_id: int) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+    return cur.rowcount > 0
 
-# =========================================================
-# LEADERBOARD
-# =========================================================
 
-def leaderboard(limit=10):
-    conn = get_db()
+def list_admins() -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            SELECT admins.user_id AS user_id, users.username AS username, users.first_name AS first_name
+            FROM admins LEFT JOIN users ON admins.user_id = users.user_id
+            ORDER BY admins.created_at ASC
+            """
+        )
+        return cur.fetchall()
 
-    rows = conn.execute("""  
-        SELECT user_id, username, first_name, coins  
-        FROM users  
-        ORDER BY coins DESC  
-        LIMIT ?  
-    """, (limit,)).fetchall()  
 
-    conn.close()  
+# --------------------------------------------------------------------------
+# Known chats (for /broadcast) & bot-wide stats (for /info)
+# --------------------------------------------------------------------------
 
-    return rows
 
-# =========================================================
-# GAMES
-# =========================================================
+def register_chat(chat_id: int, chat_type: str, title: Optional[str]) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO known_chats (chat_id, chat_type, title, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, chat_type, title, _now()),
+        )
+        # keep title fresh
+        conn.execute(
+            "UPDATE known_chats SET title = ?, chat_type = ? WHERE chat_id = ?",
+            (title, chat_type, chat_id),
+        )
 
-def create_game(chat_id, host_id, game_type="parchi"):
-    conn = get_db()
 
-    cur = conn.cursor()  
+def list_all_chat_ids() -> list[int]:
+    with get_conn() as conn:
+        cur = conn.execute("SELECT chat_id FROM known_chats")
+        return [r["chat_id"] for r in cur.fetchall()]
 
-    cur.execute("""  
-        INSERT INTO games  
-        (  
-            chat_id,  
-            host_id,  
-            game_type,  
-            status,  
-            current_turn,  
-            created_at  
-        )  
-        VALUES (?, ?, ?, 'lobby', 0, ?)  
-    """, (  
-        chat_id,  
-        host_id,  
-        game_type,  
-        now()  
-    ))  
 
-    game_id = cur.lastrowid  
+def list_private_user_ids() -> list[int]:
+    with get_conn() as conn:
+        cur = conn.execute("SELECT chat_id FROM known_chats WHERE chat_type = 'private'")
+        return [r["chat_id"] for r in cur.fetchall()]
 
-    conn.commit()  
-    conn.close()  
 
-    return game_id
-
-def get_game(game_id):
-    conn = get_db()
-
-    row = conn.execute("""  
-        SELECT *  
-        FROM games  
-        WHERE id = ?  
-    """, (game_id,)).fetchone()  
-
-    conn.close()  
-
-    return row
-
-def get_active_game(chat_id):
-    conn = get_db()
-
-    row = conn.execute("""  
-        SELECT *  
-        FROM games  
-        WHERE chat_id = ?  
-        AND status IN ('lobby', 'active')  
-        ORDER BY id DESC  
-        LIMIT 1  
-    """, (chat_id,)).fetchone()  
-
-    conn.close()  
-
-    return row
-
-def update_game(game_id, status=None, current_turn=None):
-    conn = get_db()
-
-    if status is not None and current_turn is not None:  
-        conn.execute("""  
-            UPDATE games  
-            SET status = ?,  
-                current_turn = ?  
-            WHERE id = ?  
-        """, (  
-            status,  
-            current_turn,  
-            game_id  
-        ))  
-
-    elif status is not None:  
-        conn.execute("""  
-            UPDATE games  
-            SET status = ?  
-            WHERE id = ?  
-        """, (  
-            status,  
-            game_id  
-        ))  
-
-    elif current_turn is not None:  
-        conn.execute("""  
-            UPDATE games  
-            SET current_turn = ?  
-            WHERE id = ?  
-        """, (  
-            current_turn,  
-            game_id  
-        ))  
-
-    conn.commit()  
-    conn.close()
-
-def end_game(game_id):
-    conn = get_db()
-
-    conn.execute("""  
-        UPDATE games  
-        SET status = 'ended',  
-            ended_at = ?  
-        WHERE id = ?  
-    """, (  
-        now(),  
-        game_id  
-    ))  
-
-    conn.commit()  
-    conn.close()
-
-# =========================================================
-# GAME PLAYERS
-# =========================================================
-
-def add_game_player(game_id, user_id, position):
-    conn = get_db()
-
-    conn.execute("""  
-        INSERT OR IGNORE INTO game_players  
-        (game_id, user_id, position, joined_at)  
-        VALUES (?, ?, ?, ?)  
-    """, (  
-        game_id,  
-        user_id,  
-        position,  
-        now()  
-    ))  
-
-    conn.commit()  
-    conn.close()
-
-def remove_game_player(game_id, user_id):
-    conn = get_db()
-
-    conn.execute("""  
-        DELETE FROM game_players  
-        WHERE game_id = ?  
-        AND user_id = ?  
-    """, (  
-        game_id,  
-        user_id  
-    ))  
-
-    conn.commit()  
-    conn.close()
-
-def get_game_players(game_id):
-    conn = get_db()
-
-    rows = conn.execute("""  
-        SELECT  
-            gp.game_id,  
-            gp.user_id,  
-            gp.position,  
-            gp.joined_at,  
-            u.username,  
-            u.first_name  
-        FROM game_players gp  
-        JOIN users u  
-        ON gp.user_id = u.user_id  
-        WHERE gp.game_id = ?  
-        ORDER BY gp.position ASC  
-    """, (game_id,)).fetchall()  
-
-    conn.close()  
-
-    return rows
-
-def get_game_player(game_id, user_id):
-    conn = get_db()
-
-    row = conn.execute("""  
-        SELECT  
-            gp.*,  
-            u.username,  
-            u.first_name  
-        FROM game_players gp  
-        JOIN users u  
-        ON gp.user_id = u.user_id  
-        WHERE gp.game_id = ?  
-        AND gp.user_id = ?  
-    """, (  
-        game_id,  
-        user_id  
-    )).fetchone()  
-
-    conn.close()  
-
-    return row
+def get_bot_stats() -> dict:
+    with get_conn() as conn:
+        total_users = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+        total_banned = conn.execute("SELECT COUNT(*) AS c FROM users WHERE banned = 1").fetchone()["c"]
+        total_groups = conn.execute(
+            "SELECT COUNT(*) AS c FROM known_chats WHERE chat_type IN ('group','supergroup')"
+        ).fetchone()["c"]
+        total_coins = conn.execute("SELECT COALESCE(SUM(coins),0) AS c FROM users").fetchone()["c"]
+        total_games = conn.execute("SELECT COUNT(*) AS c FROM game_results").fetchone()["c"]
+        # "active" = touched in the last 24 hours
+        active_24h = conn.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE updated_at >= datetime('now', '-1 day')"
+        ).fetchone()["c"]
+    return {
+        "total_users": total_users,
+        "banned_users": total_banned,
+        "total_groups": total_groups,
+        "total_coins_in_circulation": total_coins,
+        "total_games_played": total_games,
+        "active_last_24h": active_24h,
+    }
