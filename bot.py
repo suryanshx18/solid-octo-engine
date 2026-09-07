@@ -69,7 +69,7 @@ RICHLIST_SIZE = 30
 # Aviator / Flip config
 AVIATOR_MIN_BET = 10
 AVIATOR_PRESETS = [50, 100, 250, 500, 1000]
-AVIATOR_TICK_SECONDS = 1.2
+AVIATOR_TICK_SECONDS = 0.8
 AVIATOR_MAX_MULTIPLIER = 50.0
 AVIATOR_MAX_TICKS = 120
 
@@ -160,8 +160,15 @@ def ensure_user(message: Message) -> None:
 
 
 def fmt_user(user_row: Dict[str, Any]) -> str:
-    name = user_row.get("first_name") or "Player"
-    username = user_row.get("username")
+    # sqlite3.Row supports mapping/index access, but not .get().
+    try:
+        name = user_row["first_name"] or "Player"
+    except (KeyError, TypeError, IndexError):
+        name = "Player"
+    try:
+        username = user_row["username"]
+    except (KeyError, TypeError, IndexError):
+        username = None
     return f"@{username}" if username else name
 
 
@@ -480,13 +487,16 @@ async def cmd_adminpanels(message: Message, args: List[str]) -> None:
     ensure_user(message)
     admins = db.list_admins()
     owner_row = db.get_user(OWNER_ID)
-    owner_display = f"@{owner_row['username']}" if owner_row and owner_row.get("username") else str(OWNER_ID)
+    owner_username = owner_row["username"] if owner_row is not None else None
+    owner_display = f"@{owner_username}" if owner_username else str(OWNER_ID)
 
     lines = ["👑 <b>BOT ADMINS</b>\n", "Owner:", f"• {owner_display}", ""]
     if admins:
         lines.append("Admins:")
         for i, a in enumerate(admins, 1):
-            display = f"@{a['username']}" if a.get("username") else (a.get("first_name") or str(a["user_id"]))
+            username = a["username"]
+            first_name = a["first_name"]
+            display = f"@{username}" if username else (first_name or str(a["user_id"]))
             lines.append(f"{i}. {display}")
     else:
         lines.append("No additional admins have been added.")
@@ -702,6 +712,7 @@ async def _aviator_tick(round_id: int) -> None:
                 return
             rnd.multiplier = round(rnd.multiplier + 0.05 + rnd.multiplier * 0.06, 2)
             if rnd.multiplier >= rnd.crash_point:
+                rnd.multiplier = rnd.crash_point
                 await _aviator_crash(rnd)
                 return
             try:
@@ -722,7 +733,9 @@ async def _aviator_crash(rnd: AviatorRound) -> None:
     rnd.finished = True
     try:
         await bot.edit_message_text(
-            f"💥 <b>CRASHED at {rnd.crash_point:.2f}x!</b>\n{rnd.name} lost {rnd.bet} coins.",
+            f"✈️ <b>Aviator</b> - {rnd.name}\n💵 Bet: {rnd.bet}\n"
+            f"💥 <b>CRASHED AT {rnd.crash_point:.2f}x</b>\n"
+            f"❌ {rnd.name} lost {rnd.bet} coins.",
             rnd.chat_id, rnd.message_id,
         )
     except Exception:
