@@ -144,7 +144,7 @@ class AntakshariGame(BaseGame):
             lines.append(f"💰 {display_name(uid, self.players)} earned {coins} coins")
         db.record_game_result(self.chat_id, self.key, winner_id, list(self.players.keys()))
         await self.bot.send_message(self.chat_id, "\n".join(lines))
-        await self.manager.remove(self.chat_id) if False else self.manager.remove(self.chat_id)
+        await self.cleanup()
 
 
 # ==========================================================================
@@ -543,3 +543,8 @@ RULES_TEXT_G2 = {
         "Most boxes when the grid is full wins."
     ),
 }
+
+
+AntakshariGame.RULES_TEXT = RULES_TEXT_G2["antakshari"]
+CardsGame.RULES_TEXT = RULES_TEXT_G2["cards"]
+MakeTheBoxGame.RULES_TEXT = RULES_TEXT_G2["box"]
