@@ -147,6 +147,14 @@ class BaseGame:
         await self.on_start()
         return "ok"
 
+    async def announce_turn(self, user_id: int, label: str = "🎯") -> None:
+        """Send a fresh turn notification in the group chat."""
+        try:
+            name = display_name(user_id, self.players)
+            await self.bot.send_message(self.chat_id, f"{label} {name}, it\'s your turn! 🎮")
+        except Exception as exc:
+            logger.debug("announce_turn failed: %s", exc)
+
     # -- lifecycle -----------------------------------------------------
 
     def track(self, coro) -> asyncio.Task:
@@ -551,6 +559,7 @@ class FourCardMatchGame(BaseGame):
         random.shuffle(self.turn_order)
         self.scores = {uid: 0 for uid in self.players}
         await self._send_board(new=True)
+        await self.announce_turn(self.turn_order[self.turn_index])
 
     def _cell_text(self, i: int) -> str:
         if self.matched[i]:
@@ -639,6 +648,7 @@ class FourCardMatchGame(BaseGame):
             self.revealed[idx] = False
             self.turn_index = (self.turn_index + 1) % len(self.turn_order)
             await self._send_board(new=False)
+            await self.announce_turn(self.turn_order[self.turn_index])
 
     async def _finish(self) -> None:
         top_score = max(self.scores.values())
