@@ -27,7 +27,7 @@ logger = logging.getLogger("games_bot.database")
 DB_PATH = os.environ.get("BOT_DB_PATH", "games_bot.db")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
 
-STARTING_COINS = 1000          # coins a brand-new player receives
+STARTING_COINS = 5000          # coins a brand-new player receives
 MIN_PLAYERS_DEFAULT = 2
 MAX_PLAYERS_DEFAULT = 8
 
@@ -52,9 +52,9 @@ VOTE_TIMEOUT = 30
 
 # Reward structure (virtual coins, configurable)
 REWARDS = {
-    "first": 500,
-    "second": 250,
-    "participation": 50,
+    "first": 1000,
+    "second": 500,
+    "participation": 100,
 }
 
 # Aviator / Flip config
