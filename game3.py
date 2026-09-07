@@ -1137,6 +1137,11 @@ class PowerRangersGame:
 
                 self._next_turn()
                 await self._refresh_board()
+                if self.status == "running" and self._alive():
+                    await self.bot.send_message(
+                        self.chat_id,
+                        f"🎯 {self.players[self._current()]}, it's your turn! ⚔️"
+                    )
 
         except asyncio.CancelledError:
             pass
@@ -1383,6 +1388,10 @@ class PowerRangersGame:
 
         if not await self._check_win():
             await self._refresh_board()
+            await self.bot.send_message(
+                self.chat_id,
+                f"🎯 {self.players[self._current()]}, it's your turn! ⚔️"
+            )
 
     async def _check_win(self) -> bool:
         alive = self._alive()
@@ -1742,6 +1751,10 @@ class BusinessTycoonGame:
 
                 if not await self._check_end():
                     await self._refresh_board()
+                    await self.bot.send_message(
+                        self.chat_id,
+                        f"🎯 {self.players[self._current()]}, it's your turn! 💼"
+                    )
 
         except asyncio.CancelledError:
             pass
@@ -1923,12 +1936,22 @@ class BusinessTycoonGame:
 
             self._next_turn()
             await self._refresh_board()
+            if self.status == "running":
+                await self.bot.send_message(
+                    self.chat_id,
+                    f"🎯 {self.players[self._current()]}, it's your turn! 💼"
+                )
             return
 
         if keyboard is None:
             self._next_turn()
 
         await self._refresh_board(keyboard=keyboard)
+        if keyboard is None and self.status == "running":
+            await self.bot.send_message(
+                self.chat_id,
+                f"🎯 {self.players[self._current()]}, it's your turn! 💼"
+            )
 
     async def _handle_buy_decision(
         self,
@@ -2009,6 +2032,10 @@ class BusinessTycoonGame:
 
         if not await self._check_end():
             await self._refresh_board()
+            await self.bot.send_message(
+                self.chat_id,
+                f"🎯 {self.players[self._current()]}, it's your turn! 💼"
+            )
 
     async def _go_bankrupt(self, uid: int) -> None:
         self.bankrupt[uid] = True
