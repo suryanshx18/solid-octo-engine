@@ -10,14 +10,9 @@ from telegram.ext import (
     ContextTypes,
 )
 
-
 # =========================
 # CONFIG
 # =========================
-
-# Railway Environment Variables:
-# BOT_TOKEN = your Telegram bot token
-# OWNER_ID = your Telegram numeric user ID
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
@@ -102,10 +97,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     await update.message.reply_text(
-        f"Hello {user.first_name}!\n\n"
+        f"Hello {user.first_name}! 👋\n\n"
         "Payment/order request banane ke liye:\n"
-        "/order\n\n"
-        "Example:\n"
         "/order 500\n\n"
         "Apne orders dekhne ke liye:\n"
         "/myorders"
@@ -117,12 +110,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     user = update.effective_user
 
     if not context.args:
         await update.message.reply_text(
-            "Amount bhi do.\n\n"
+            "❌ Amount bhi do.\n\n"
             "Example:\n"
             "/order 500"
         )
@@ -130,7 +122,6 @@ async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     amount = context.args[0]
 
-    # Validate amount
     try:
         amount_float = float(amount)
 
@@ -161,7 +152,6 @@ async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Payment complete hone ke baad owner verification karega."
     )
 
-    # Owner buttons
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
@@ -197,17 +187,15 @@ async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# OWNER BUTTONS
+# APPROVE / REJECT BUTTONS
 # =========================
 
 async def button_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-
     query = update.callback_query
 
-    # Only owner
     if query.from_user.id != OWNER_ID:
         await query.answer(
             "❌ You are not authorized.",
@@ -220,6 +208,7 @@ async def button_handler(
     try:
         action, order_id_text = query.data.split(":", 1)
         order_id = int(order_id_text)
+
     except (ValueError, AttributeError):
         await query.edit_message_text(
             "❌ Invalid button data."
@@ -240,7 +229,6 @@ async def button_handler(
         )
         return
 
-    # Database columns:
     # id, user_id, telegram_id, amount,
     # status, confirmation_id, created_at
 
@@ -256,9 +244,9 @@ async def button_handler(
         )
         return
 
-    # =========================
+    # =====================
     # APPROVE
-    # =========================
+    # =====================
 
     if action == "approve":
 
@@ -291,9 +279,11 @@ async def button_handler(
                     "Your order has been approved."
                 ),
             )
+
         except Exception as e:
             print(
-                f"Could not notify user {user_id}: {e}"
+                f"Could not notify user "
+                f"{user_id}: {e}"
             )
 
         await query.edit_message_text(
@@ -304,9 +294,9 @@ async def button_handler(
             f"Confirmation ID: {confirmation_id}"
         )
 
-    # =========================
+    # =====================
     # REJECT
-    # =========================
+    # =====================
 
     elif action == "reject":
 
@@ -326,12 +316,15 @@ async def button_handler(
                     "❌ PAYMENT/ORDER REJECTED\n\n"
                     f"Order ID: #{order_id}\n"
                     f"Amount: ₹{amount}\n\n"
-                    "Please contact the owner if you think this was a mistake."
+                    "Please contact the owner "
+                    "if you think this was a mistake."
                 ),
             )
+
         except Exception as e:
             print(
-                f"Could not notify user {user_id}: {e}"
+                f"Could not notify user "
+                f"{user_id}: {e}"
             )
 
         await query.edit_message_text(
@@ -348,9 +341,8 @@ async def button_handler(
 
 async def myorders(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-
     user_id = update.effective_user.id
 
     with sqlite3.connect(DB_NAME) as conn:
@@ -373,7 +365,12 @@ async def myorders(
 
     text = "📋 YOUR ORDERS\n\n"
 
-    for order_id, amount, status, confirmation_id in orders:
+    for (
+        order_id,
+        amount,
+        status,
+        confirmation_id,
+    ) in orders:
 
         text += (
             f"Order #{order_id}\n"
@@ -383,7 +380,8 @@ async def myorders(
 
         if confirmation_id:
             text += (
-                f"Confirmation: {confirmation_id}\n"
+                f"Confirmation: "
+                f"{confirmation_id}\n"
             )
 
         text += "\n"
@@ -397,9 +395,8 @@ async def myorders(
 
 async def admin(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text(
             "❌ Unauthorized."
@@ -425,7 +422,12 @@ async def admin(
 
     text = "🔔 PENDING ORDERS\n\n"
 
-    for order_id, user_id, amount, status in orders:
+    for (
+        order_id,
+        user_id,
+        amount,
+        status,
+    ) in orders:
 
         text += (
             f"#{order_id}\n"
@@ -442,19 +444,27 @@ async def admin(
 # =========================
 
 def main():
+
     init_db()
 
     if not BOT_TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN environment variable is missing."
+            "BOT_TOKEN environment variable "
+            "is missing."
         )
 
     if OWNER_ID == 0:
         raise RuntimeError(
-            "OWNER_ID environment variable is missing or invalid."
+            "OWNER_ID environment variable "
+            "is missing or invalid."
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
     app.add_handler(
         CommandHandler("start", start)
@@ -482,7 +492,7 @@ def main():
 
 
 # =========================
-# PROGRAM ENTRY POINT
+# PYTHON ENTRY POINT
 # =========================
 
 if __name__ == "__main__":
