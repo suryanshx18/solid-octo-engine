@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import secrets
 
@@ -14,10 +15,12 @@ from telegram.ext import (
 # CONFIG
 # =========================
 
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
+# Railway Environment Variables:
+# BOT_TOKEN = your Telegram bot token
+# OWNER_ID = your Telegram numeric user ID
 
-# Put your Telegram numeric user ID here
-OWNER_ID = 123456789
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 DB_NAME = "orders.db"
 
@@ -237,7 +240,7 @@ async def button_handler(
         )
         return
 
-    # Database:
+    # Database columns:
     # id, user_id, telegram_id, amount,
     # status, confirmation_id, created_at
 
@@ -289,7 +292,9 @@ async def button_handler(
                 ),
             )
         except Exception as e:
-            print(f"Could not notify user {user_id}: {e}")
+            print(
+                f"Could not notify user {user_id}: {e}"
+            )
 
         await query.edit_message_text(
             "✅ ORDER APPROVED\n\n"
@@ -325,7 +330,9 @@ async def button_handler(
                 ),
             )
         except Exception as e:
-            print(f"Could not notify user {user_id}: {e}")
+            print(
+                f"Could not notify user {user_id}: {e}"
+            )
 
         await query.edit_message_text(
             "❌ ORDER REJECTED\n\n"
@@ -434,20 +441,49 @@ async def admin(
 # MAIN
 # =========================
 
-    def main():
+def main():
     init_db()
+
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing."
+        )
+
+    if OWNER_ID == 0:
+        raise RuntimeError(
+            "OWNER_ID environment variable is missing or invalid."
+        )
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("order", order))
-    app.add_handler(CommandHandler("myorders", myorders))
-    app.add_handler(CommandHandler("admin", admin))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        CommandHandler("order", order)
+    )
+
+    app.add_handler(
+        CommandHandler("myorders", myorders)
+    )
+
+    app.add_handler(
+        CommandHandler("admin", admin)
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(button_handler)
+    )
 
     print("Bot is running...")
+
     app.run_polling()
 
+
+# =========================
+# PROGRAM ENTRY POINT
+# =========================
 
 if __name__ == "__main__":
     main()
