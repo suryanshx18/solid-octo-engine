@@ -434,42 +434,20 @@ async def admin(
 # MAIN
 # =========================
 
-def main():
-
+    def main():
     init_db()
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        CommandHandler("order", order)
-    )
-
-    app.add_handler(
-        CommandHandler("myorders", myorders)
-    )
-
-    app.add_handler(
-        CommandHandler("admin", admin)
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(button_handler)
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("order", order))
+    app.add_handler(CommandHandler("myorders", myorders))
+    app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
     print("Bot is running...")
-
     app.run_polling()
 
 
-# IMPORTANT:
-# This was the error in your original code.
 if __name__ == "__main__":
     main()
