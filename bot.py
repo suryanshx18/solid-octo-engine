@@ -1,14 +1,14 @@
 import sqlite3
 import secrets
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    filters,
 )
+
 
 # =========================
 # CONFIG
@@ -16,116 +16,79 @@ from telegram.ext import (
 
 BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
 
-# Apna Telegram numeric user ID yahan daalo
+# Put your Telegram numeric user ID here
 OWNER_ID = 123456789
+
+DB_NAME = "orders.db"
+
 
 # =========================
 # DATABASE
 # =========================
 
-DB_NAME = "orders.db"
-
-
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            telegram_id TEXT NOT NULL,
-            amount TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            confirmation_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                telegram_id TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                confirmation_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
 
 def create_order(user_id, telegram_id, amount):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO orders
-        (user_id, telegram_id, amount, status)
-        VALUES (?, ?, ?, 'pending')
-        """,
-        (user_id, telegram_id, amount),
-    )
-
-    order_id = cur.lastrowid
-
-    conn.commit()
-    conn.close()
-
-    return order_id
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO orders
+            (user_id, telegram_id, amount, status)
+            VALUES (?, ?, ?, 'pending')
+            """,
+            (user_id, telegram_id, amount),
+        )
+        return cur.lastrowid
 
 
 def get_order(order_id):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT * FROM orders WHERE id = ?",
-        (order_id,)
-    )
-
-    order = cur.fetchone()
-
-    conn.close()
-
-    return order
+    with sqlite3.connect(DB_NAME) as conn:
+        return conn.execute(
+            "SELECT * FROM orders WHERE id = ?",
+            (order_id,),
+        ).fetchone()
 
 
 def approve_order(order_id, confirmation_id):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        UPDATE orders
-        SET status = 'approved',
-            confirmation_id = ?
-        WHERE id = ?
-        AND status = 'pending'
-        """,
-        (confirmation_id, order_id),
-    )
-
-    changed = cur.rowcount
-
-    conn.commit()
-    conn.close()
-
-    return changed
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute(
+            """
+            UPDATE orders
+            SET status = 'approved',
+                confirmation_id = ?
+            WHERE id = ?
+            AND status = 'pending'
+            """,
+            (confirmation_id, order_id),
+        )
+        return cur.rowcount
 
 
 def reject_order(order_id):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        UPDATE orders
-        SET status = 'rejected'
-        WHERE id = ?
-        AND status = 'pending'
-        """,
-        (order_id,),
-    )
-
-    changed = cur.rowcount
-
-    conn.commit()
-    conn.close()
-
-    return changed
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute(
+            """
+            UPDATE orders
+            SET status = 'rejected'
+            WHERE id = ?
+            AND status = 'pending'
+            """,
+            (order_id,),
+        )
+        return cur.rowcount
 
 
 # =========================
@@ -133,7 +96,6 @@ def reject_order(order_id):
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     user = update.effective_user
 
     await update.message.reply_text(
@@ -141,12 +103,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Payment/order request banane ke liye:\n"
         "/order\n\n"
         "Example:\n"
-        "/order 500"
+        "/order 500\n\n"
+        "Apne orders dekhne ke liye:\n"
+        "/myorders"
     )
 
 
 # =========================
-# CREATE ORDER
+# /ORDER
 # =========================
 
 async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -163,21 +127,21 @@ async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     amount = context.args[0]
 
-    # Basic validation
+    # Validate amount
     try:
         amount_float = float(amount)
 
         if amount_float <= 0:
             raise ValueError
 
-    except ValueError:
+    except (ValueError, TypeError):
         await update.message.reply_text(
-            "Valid amount enter karo.\n"
-            "Example: /order 500"
+            "❌ Valid amount enter karo.\n\n"
+            "Example:\n"
+            "/order 500"
         )
         return
 
-    # User apna Telegram ID submit kar raha hai
     telegram_id = str(user.id)
 
     order_id = create_order(
@@ -187,26 +151,32 @@ async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        f"Order created successfully.\n\n"
+        "✅ ORDER CREATED\n\n"
         f"Order ID: #{order_id}\n"
         f"Amount: ₹{amount}\n"
-        f"Status: Pending\n\n"
+        "Status: Pending\n\n"
         "Payment complete hone ke baad owner verification karega."
     )
 
-# Owner notification
+    # Owner buttons
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "✅ Approve",
-                callback_data=f"approve:{order_id}"
+                callback_data=f"approve:{order_id}",
             ),
             InlineKeyboardButton(
                 "❌ Reject",
-                callback_data=f"reject:{order_id}"
+                callback_data=f"reject:{order_id}",
             ),
         ]
     ])
+
+    username = (
+        f"@{user.username}"
+        if user.username
+        else "N/A"
+    )
 
     await context.bot.send_message(
         chat_id=OWNER_ID,
@@ -214,7 +184,7 @@ async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔔 NEW ORDER\n\n"
             f"Order ID: #{order_id}\n"
             f"User: {user.first_name}\n"
-            f"Username: @{user.username if user.username else 'N/A'}\n"
+            f"Username: {username}\n"
             f"Telegram ID: {user.id}\n"
             f"Amount: ₹{amount}\n\n"
             "Payment verify karke action choose karo."
@@ -229,26 +199,35 @@ async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     query = update.callback_query
 
-    await query.answer()
-
-    # Sirf owner buttons use kar sakta hai
+    # Only owner
     if query.from_user.id != OWNER_ID:
         await query.answer(
-            "You are not authorized.",
-            show_alert=True
+            "❌ You are not authorized.",
+            show_alert=True,
         )
         return
 
-    data = query.data
+    await query.answer()
 
-    action, order_id = data.split(":")
+    try:
+        action, order_id_text = query.data.split(":", 1)
+        order_id = int(order_id_text)
+    except (ValueError, AttributeError):
+        await query.edit_message_text(
+            "❌ Invalid button data."
+        )
+        return
 
-    order_id = int(order_id)
+    if action not in ("approve", "reject"):
+        await query.edit_message_text(
+            "❌ Unknown action."
+        )
+        return
 
     order_data = get_order(order_id)
 
@@ -258,11 +237,10 @@ async def button_handler(
         )
         return
 
-    # Database structure:
+    # Database:
     # id, user_id, telegram_id, amount,
     # status, confirmation_id, created_at
 
-    db_order_id = order_data[0]
     user_id = order_data[1]
     telegram_id = order_data[2]
     amount = order_data[3]
@@ -271,7 +249,7 @@ async def button_handler(
     if status != "pending":
         await query.answer(
             f"Order already {status}.",
-            show_alert=True
+            show_alert=True,
         )
         return
 
@@ -288,38 +266,37 @@ async def button_handler(
 
         changed = approve_order(
             order_id,
-            confirmation_id
+            confirmation_id,
         )
 
         if changed == 0:
             await query.answer(
                 "Order already processed.",
-                show_alert=True
+                show_alert=True,
             )
             return
 
-        # User ko confirmation
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "✅ PAYMENT APPROVED\n\n"
-                f"Order ID: #{order_id}\n"
-                f"Amount: ₹{amount}\n\n"
-                f"Confirmation ID:\n"
-                f"{confirmation_id}\n\n"
-                "Your order has been approved."
-            ),
-            parse_mode="Markdown",
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "✅ PAYMENT APPROVED\n\n"
+                    f"Order ID: #{order_id}\n"
+                    f"Amount: ₹{amount}\n\n"
+                    "Confirmation ID:\n"
+                    f"{confirmation_id}\n\n"
+                    "Your order has been approved."
+                ),
+            )
+        except Exception as e:
+            print(f"Could not notify user {user_id}: {e}")
 
         await query.edit_message_text(
-            (
-                "✅ ORDER APPROVED\n\n"
-                f"Order ID: #{order_id}\n"
-                f"Telegram ID: {telegram_id}\n"
-                f"Amount: ₹{amount}\n"
-                f"Confirmation ID: {confirmation_id}"
-            )
+            "✅ ORDER APPROVED\n\n"
+            f"Order ID: #{order_id}\n"
+            f"Telegram ID: {telegram_id}\n"
+            f"Amount: ₹{amount}\n"
+            f"Confirmation ID: {confirmation_id}"
         )
 
     # =========================
@@ -333,27 +310,28 @@ async def button_handler(
         if changed == 0:
             await query.answer(
                 "Order already processed.",
-                show_alert=True
+                show_alert=True,
             )
             return
 
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "❌ PAYMENT/ORDER REJECTED\n\n"
-                f"Order ID: #{order_id}\n"
-                f"Amount: ₹{amount}\n\n"
-                "Please contact the owner if you think this was a mistake."
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "❌ PAYMENT/ORDER REJECTED\n\n"
+                    f"Order ID: #{order_id}\n"
+                    f"Amount: ₹{amount}\n\n"
+                    "Please contact the owner if you think this was a mistake."
+                ),
             )
-        )
+        except Exception as e:
+            print(f"Could not notify user {user_id}: {e}")
 
         await query.edit_message_text(
-            (
-                "❌ ORDER REJECTED\n\n"
-                f"Order ID: #{order_id}\n"
-                f"Telegram ID: {telegram_id}\n"
-                f"Amount: ₹{amount}"
-            )
+            "❌ ORDER REJECTED\n\n"
+            f"Order ID: #{order_id}\n"
+            f"Telegram ID: {telegram_id}\n"
+            f"Amount: ₹{amount}"
         )
 
 
@@ -363,28 +341,22 @@ async def button_handler(
 
 async def myorders(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     user_id = update.effective_user.id
 
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT id, amount, status, confirmation_id
-        FROM orders
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 10
-        """,
-        (user_id,),
-    )
-
-    orders = cur.fetchall()
-
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        orders = conn.execute(
+            """
+            SELECT id, amount, status, confirmation_id
+            FROM orders
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 10
+            """,
+            (user_id,),
+        ).fetchall()
 
     if not orders:
         await update.message.reply_text(
@@ -403,7 +375,9 @@ async def myorders(
         )
 
         if confirmation_id:
-            text += f"Confirmation: {confirmation_id}\n"
+            text += (
+                f"Confirmation: {confirmation_id}\n"
+            )
 
         text += "\n"
 
@@ -416,7 +390,7 @@ async def myorders(
 
 async def admin(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     if update.effective_user.id != OWNER_ID:
@@ -425,26 +399,20 @@ async def admin(
         )
         return
 
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT id, user_id, amount, status
-        FROM orders
-        WHERE status = 'pending'
-        ORDER BY id DESC
-        LIMIT 20
-        """
-    )
-
-    orders = cur.fetchall()
-
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        orders = conn.execute(
+            """
+            SELECT id, user_id, amount, status
+            FROM orders
+            WHERE status = 'pending'
+            ORDER BY id DESC
+            LIMIT 20
+            """
+        ).fetchall()
 
     if not orders:
         await update.message.reply_text(
-            "No pending orders."
+            "✅ No pending orders."
         )
         return
 
@@ -470,9 +438,11 @@ def main():
 
     init_db()
 
-    app = Application.builder().token(
-        BOT_TOKEN
-    ).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
     app.add_handler(
         CommandHandler("start", start)
@@ -499,5 +469,7 @@ def main():
     app.run_polling()
 
 
-if name == "main":
+# IMPORTANT:
+# This was the error in your original code.
+if __name__ == "__main__":
     main()
