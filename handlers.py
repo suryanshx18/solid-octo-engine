@@ -119,7 +119,7 @@ async def cb_profile(callback: CallbackQuery):
         if not user:
             await callback.answer("User not found.", show_alert=True)
             return
-        text = "Profile
+        text = "Profile"
 ID: " + str(user.tg_id) + "
 Name: " + (user.first_name or "") + " " + (user.last_name or "") + "
 Username: @" + (user.username or "N/A") + "
