@@ -32,6 +32,16 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
+def NL() -> str:
+    """
+    Return a newline character.
+    Kept as a function so handlers.py never needs literal '
+' strings.
+    """
+    return "
+"
+
+
 # ============================================================
 # LOGGING
 # ============================================================
