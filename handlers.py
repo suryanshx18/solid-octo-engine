@@ -1,581 +1,1656 @@
-from aiogram import Router, F, Bot
+from datetime import datetime, timedelta
+
+from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select
+
 from database import (
-    async_session_maker, User, Admin, Category, Account,
-    DepositRequest, RequiredChannel, Coupon, BotSetting, LogEntry, Purchase, Transaction
+    async_session_maker,
+    User,
+    Category,
+    Account,
+    DepositRequest,
+    Purchase,
+    Transaction,
 )
+
 from keyboards import (
-    main_menu_keyboard, categories_keyboard, accounts_keyboard,
-    force_join_keyboard, admin_panel_keyboard, approve_deposit_keyboard,
-    back_home_keyboard, deposit_amount_keyboard
+    main_menu_keyboard,
+    categories_keyboard,
+    accounts_keyboard,
+    force_join_keyboard,
+    admin_panel_keyboard,
+    approve_deposit_keyboard,
+    back_home_keyboard,
+    deposit_amount_keyboard,
 )
+
 from services import (
-    get_required_channels, check_force_join, grant_referral_reward,
-    apply_coupon, reserve_and_buy_account, complete_purchase, fail_purchase,
-    expire_pending_deposits, log_event, send_log_message,
-    add_balance, remove_balance, get_setting, set_setting, get_user_role
+    get_required_channels,
+    check_force_join,
+    grant_referral_reward,
+    reserve_and_buy_account,
+    complete_purchase,
+    fail_purchase,
+    log_event,
+    send_log_message,
+    add_balance,
+    get_user_role,
 )
-from config import OWNER_ID, MAINTENANCE_MODE, LOG_CHANNEL_ID
-from datetime import datetime, timedelta
+
+from config import MAINTENANCE_MODE, LOG_CHANNEL_ID
+
 
 router = Router()
 
+
+# ============================================================
+# FSM
+# ============================================================
 
 class DepositState(StatesGroup):
     amount = State()
     utr = State()
 
 
+# ============================================================
+# HELPERS
+# ============================================================
+
 async def check_maintenance(message: Message) -> bool:
-    if MAINTENANCE_MODE:
-        async with async_session_maker() as session:
-            role = await get_user_role(session, message.from_user.id)
-            if role not in ("superadmin", "owner"):
-                await message.answer("Bot is in maintenance mode. Try later.")
-                return True
+    """
+    Returns True when the bot is in maintenance mode and
+    the user is not allowed to continue.
+    """
+
+    if not MAINTENANCE_MODE:
+        return False
+
+    async with async_session_maker() as session:
+        role = await get_user_role(
+            session,
+            message.from_user.id
+        )
+
+        if role not in ("superadmin", "owner"):
+            await message.answer(
+                "🔧 Bot is currently in maintenance mode.\n"
+                "Please try again later."
+            )
+            return True
+
     return False
 
+
+async def get_user(session, tg_id: int):
+    result = await session.execute(
+        select(User).where(User.tg_id == tg_id)
+    )
+    return result.scalar_one_or_none()
+
+
+# ============================================================
+# START
+# ============================================================
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     if await check_maintenance(message):
         return
-    args = message.text.split(maxsplit=1)
-    ref_code = args[1] if len(args) > 1 else None
+
+    args = message.text.split(maxsplit=1) if message.text else []
+    ref_code = args[1].strip() if len(args) > 1 else None
+
     async with async_session_maker() as session:
-        stmt = select(User).where(User.tg_id == message.from_user.id)
-        res = await session.execute(stmt)
-        user = res.scalar_one_or_none()
+
+        user = await get_user(
+            session,
+            message.from_user.id
+        )
+
+        # ----------------------------------------------------
+        # CREATE USER
+        # ----------------------------------------------------
+
         if not user:
+
+            referred_by = None
+
+            if ref_code and ref_code.isdigit():
+                referred_by = int(ref_code)
+
+                # Prevent self-referral
+                if referred_by == message.from_user.id:
+                    referred_by = None
+
             user = User(
                 tg_id=message.from_user.id,
                 username=message.from_user.username,
                 first_name=message.from_user.first_name,
                 last_name=message.from_user.last_name,
-                referred_by=int(ref_code) if ref_code and ref_code.isdigit() else None,
+                referred_by=referred_by,
             )
-            session.add(user)
-            await session.commit()
-            await log_event(session, "user_registered", user.tg_id, None, "new user")
-            await send_log_message(message.bot, "New user: " + str(user.tg_id))
-        channels = await get_required_channels(session)
-        if channels:
-            joined, missing = await check_force_join(message.bot, message.from_user.id, channels)
-            if not joined:
-                kb = force_join_keyboard(missing)
-                await message.answer("Welcome! Please join all required channels and press Verify.", reply_markup=kb)
-                return
-        if user.referred_by and not user.referral_rewarded:
-            await grant_referral_reward(session, user)
-            await send_log_message(message.bot, "Referral reward for " + str(user.tg_id))
-        await message.answer("Welcome back! Use the menu below.", reply_markup=main_menu_keyboard())
-        await log_event(session, "user_started", user.tg_id, None, None)
 
+            session.add(user)
+
+            await session.flush()
+
+            await log_event(
+                session,
+                "user_registered",
+                user.tg_id,
+                None,
+                "new user",
+            )
+
+            await session.commit()
+
+            await send_log_message(
+                message.bot,
+                f"🆕 New user: {user.tg_id}"
+            )
+
+        # ----------------------------------------------------
+        # FORCE JOIN
+        # ----------------------------------------------------
+
+        channels = await get_required_channels(session)
+
+        if channels:
+
+            joined, missing = await check_force_join(
+                message.bot,
+                message.from_user.id,
+                channels,
+            )
+
+            if not joined:
+
+                await message.answer(
+                    "👋 Welcome!\n\n"
+                    "Please join all required channels "
+                    "and then press Verify.",
+                    reply_markup=force_join_keyboard(missing),
+                )
+
+                return
+
+        # ----------------------------------------------------
+        # REFERRAL REWARD
+        # ----------------------------------------------------
+
+        if (
+            user.referred_by
+            and not user.referral_rewarded
+        ):
+
+            await grant_referral_reward(
+                session,
+                user
+            )
+
+            await session.commit()
+
+            await send_log_message(
+                message.bot,
+                f"🎁 Referral reward for {user.tg_id}"
+            )
+
+        # ----------------------------------------------------
+        # MAIN MENU
+        # ----------------------------------------------------
+
+        await message.answer(
+            "🏠 Welcome back!\n\n"
+            "Use the menu below.",
+            reply_markup=main_menu_keyboard(),
+        )
+
+        await log_event(
+            session,
+            "user_started",
+            user.tg_id,
+            None,
+            None,
+        )
+
+        await session.commit()
+
+
+# ============================================================
+# FORCE JOIN VERIFY
+# ============================================================
 
 @router.callback_query(F.data == "force_verify")
 async def cb_force_verify(callback: CallbackQuery):
-    async with async_session_maker() as session:
-        stmt = select(User).where(User.tg_id == callback.from_user.id)
-        res = await session.execute(stmt)
-        user = res.scalar_one_or_none()
-        if not user:
-            await callback.answer("User not found.", show_alert=True)
-            return
-        channels = await get_required_channels(session)
-        if not channels:
-            await callback.answer("No required channels.", show_alert=True)
-            await callback.message.edit_text("All channels verified. Use the menu below.", reply_markup=main_menu_keyboard())
-            return
-        joined, missing = await check_force_join(callback.bot, callback.from_user.id, channels)
-        if not joined:
-            kb = force_join_keyboard(missing)
-            await callback.message.edit_text("You haven't joined all channels yet.", reply_markup=kb)
-            return
-        if user.referred_by and not user.referral_rewarded:
-            await grant_referral_reward(session, user)
-            await send_log_message(callback.bot, "Referral reward for " + str(user.tg_id))
-        await callback.message.edit_text("Verification successful! Use the menu below.", reply_markup=main_menu_keyboard())
 
+    async with async_session_maker() as session:
+
+        user = await get_user(
+            session,
+            callback.from_user.id
+        )
+
+        if not user:
+
+            await callback.answer(
+                "User not found.",
+                show_alert=True,
+            )
+
+            return
+
+        channels = await get_required_channels(session)
+
+        if not channels:
+
+            await callback.answer(
+                "No required channels.",
+                show_alert=True,
+            )
+
+            await callback.message.edit_text(
+                "✅ All channels verified.\n\n"
+                "Use the menu below.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+            return
+
+        joined, missing = await check_force_join(
+            callback.bot,
+            callback.from_user.id,
+            channels,
+        )
+
+        if not joined:
+
+            await callback.answer(
+                "You have not joined all required channels.",
+                show_alert=True,
+            )
+
+            await callback.message.edit_text(
+                "❌ You haven't joined all required channels yet.",
+                reply_markup=force_join_keyboard(missing),
+            )
+
+            return
+
+        if (
+            user.referred_by
+            and not user.referral_rewarded
+        ):
+
+            await grant_referral_reward(
+                session,
+                user
+            )
+
+            await session.commit()
+
+            await send_log_message(
+                callback.bot,
+                f"🎁 Referral reward for {user.tg_id}"
+            )
+
+        await callback.answer(
+            "Verification successful!"
+        )
+
+        await callback.message.edit_text(
+            "✅ Verification successful!\n\n"
+            "Use the menu below.",
+            reply_markup=main_menu_keyboard(),
+        )
+
+
+# ============================================================
+# HOME
+# ============================================================
 
 @router.callback_query(F.data == "menu_home")
 async def cb_home(callback: CallbackQuery):
-    await callback.message.edit_text("Main menu:", reply_markup=main_menu_keyboard())
 
+    await callback.answer()
+
+    await callback.message.edit_text(
+        "🏠 Main menu:",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+# ============================================================
+# PROFILE
+# ============================================================
 
 @router.callback_query(F.data == "user_profile")
 async def cb_profile(callback: CallbackQuery):
+
     async with async_session_maker() as session:
-        stmt = select(User).where(User.tg_id == callback.from_user.id)
-        res = await session.execute(stmt)
-        user = res.scalar_one_or_none()
+
+        user = await get_user(
+            session,
+            callback.from_user.id
+        )
+
         if not user:
-            await callback.answer("User not found.", show_alert=True)
+
+            await callback.answer(
+                "User not found.",
+                show_alert=True,
+            )
+
             return
 
-        NL = "
-"
-        p1 = "Profile" + NL
-        p2 = "ID: " + str(user.tg_id) + NL
-        p3 = "Name: "
-        if user.first_name:
-            p3 += user.first_name
-        if user.last_name:
-            p3 += " " + user.last_name
-        p3 += NL
-        p4 = "Username: @"
-        if user.username:
-            p4 += user.username
-        else:
-            p4 += "N/A"
-        p4 += NL
-        p5 = "Balance: " + str(user.balance) + NL
-        p6 = "Referred by: "
-        if user.referred_by:
-            p6 += str(user.referred_by)
-        else:
-            p6 += "None"
+        name = " ".join(
+            x
+            for x in (
+                user.first_name,
+                user.last_name,
+            )
+            if x
+        ) or "N/A"
 
-        text = p1 + p2 + p3 + p4 + p5 + p6
+        username = (
+            f"@{user.username}"
+            if user.username
+            else "N/A"
+        )
 
-        await callback.message.edit_text(text, reply_markup=back_home_keyboard())
+        text = (
+            "👤 PROFILE\n\n"
+            f"🆔 ID: {user.tg_id}\n"
+            f"👤 Name: {name}\n"
+            f"🔗 Username: {username}\n"
+            f"💰 Balance: {user.balance}\n"
+            f"👥 Referred by: "
+            f"{user.referred_by or 'None'}"
+        )
 
+        await callback.answer()
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=back_home_keyboard(),
+        )
+
+
+# ============================================================
+# BALANCE
+# ============================================================
 
 @router.callback_query(F.data == "user_balance")
 async def cb_balance(callback: CallbackQuery):
-    async with async_session_maker() as session:
-        stmt = select(User).where(User.tg_id == callback.from_user.id)
-        res = await session.execute(stmt)
-        user = res.scalar_one_or_none()
-        if not user:
-            await callback.answer("User not found.", show_alert=True)
-            return
-        await callback.message.edit_text("Your balance: " + str(user.balance), reply_markup=back_home_keyboard())
 
+    async with async_session_maker() as session:
+
+        user = await get_user(
+            session,
+            callback.from_user.id
+        )
+
+        if not user:
+
+            await callback.answer(
+                "User not found.",
+                show_alert=True,
+            )
+
+            return
+
+        await callback.answer()
+
+        await callback.message.edit_text(
+            f"💰 Your balance: {user.balance}",
+            reply_markup=back_home_keyboard(),
+        )
+
+
+# ============================================================
+# PRODUCTS
+# ============================================================
 
 @router.callback_query(F.data == "user_products")
 async def cb_products(callback: CallbackQuery):
-    async with async_session_maker() as session:
-        stmt = select(Category).where(Category.is_active == True)
-        res = await session.execute(stmt)
-        cats = res.scalars().all()
-        await callback.message.edit_text("Choose a category:", reply_markup=categories_keyboard(cats))
 
+    async with async_session_maker() as session:
+
+        result = await session.execute(
+            select(Category).where(
+                Category.is_active.is_(True)
+            )
+        )
+
+        categories = result.scalars().all()
+
+        await callback.answer()
+
+        await callback.message.edit_text(
+            "🛍 Choose a category:",
+            reply_markup=categories_keyboard(categories),
+        )
+
+
+# ============================================================
+# CATEGORY
+# ============================================================
 
 @router.callback_query(F.data.startswith("cat_"))
 async def cb_category(callback: CallbackQuery):
-    cat_id = int(callback.data.split("_")[1])
-    async with async_session_maker() as session:
-        stmt = select(Account).where(Account.category_id == cat_id, Account.status == "available")
-        res = await session.execute(stmt)
-        accs = res.scalars().all()
-        if not accs:
-            await callback.answer("No accounts available.", show_alert=True)
-            return
-        kb = accounts_keyboard(accs)
-        await callback.message.edit_text("Select an account to buy:", reply_markup=kb)
 
+    try:
+        cat_id = int(
+            callback.data[len("cat_"):]
+        )
+
+    except (ValueError, TypeError):
+
+        await callback.answer(
+            "Invalid category.",
+            show_alert=True,
+        )
+
+        return
+
+    async with async_session_maker() as session:
+
+        result = await session.execute(
+            select(Account).where(
+                Account.category_id == cat_id,
+                Account.status == "available",
+            )
+        )
+
+        accounts = result.scalars().all()
+
+        if not accounts:
+
+            await callback.answer(
+                "No accounts available.",
+                show_alert=True,
+            )
+
+            return
+
+        await callback.answer()
+
+        await callback.message.edit_text(
+            "🛒 Select an account to buy:",
+            reply_markup=accounts_keyboard(accounts),
+        )
+
+
+# ============================================================
+# BUY ACCOUNT
+# ============================================================
 
 @router.callback_query(F.data.startswith("buy_acc_"))
 async def cb_buy_account(callback: CallbackQuery):
-    acc_id = int(callback.data.split("_")[3])
-    async with async_session_maker() as session:
-        stmt = select(User).where(User.tg_id == callback.from_user.id)
-        res = await session.execute(stmt)
-        user = res.scalar_one_or_none()
-        if not user:
-            await callback.answer("User not found.", show_alert=True)
-            return
-        stmt = select(Account).where(Account.id == acc_id)
-        res = await session.execute(stmt)
-        account = res.scalar_one_or_none()
-        if not account or account.status != "available":
-            await callback.answer("Account no longer available.", show_alert=True)
-            return
-        ok, msg, price = await reserve_and_buy_account(session, user, account)
-        if not ok:
-            await fail_purchase(session, user, account, price if price else 0.0)
-            await callback.answer(msg, show_alert=True)
-            return
-        await complete_purchase(session, user, account, price)
-        await session.commit()
-        t1 = "Purchase successful! Account #"
-        t2 = str(account.id)
-        t3 = " bought for "
-        t4 = str(price)
-        t5 = ". Phone: "
-        t6 = str(account.phone)
-        text = t1 + t2 + t3 + t4 + t5 + t6
-        await callback.message.edit_text(text, reply_markup=back_home_keyboard())
-        await send_log_message(callback.bot, "Purchase: user " + str(user.tg_id) + " account #" + str(account.id))
 
+    try:
+        acc_id = int(
+            callback.data[len("buy_acc_"):]
+        )
+
+    except (ValueError, TypeError):
+
+        await callback.answer(
+            "Invalid account.",
+            show_alert=True,
+        )
+
+        return
+
+    async with async_session_maker() as session:
+
+        user = await get_user(
+            session,
+            callback.from_user.id
+        )
+
+        if not user:
+
+            await callback.answer(
+                "User not found.",
+                show_alert=True,
+            )
+
+            return
+
+        account = await session.get(
+            Account,
+            acc_id
+        )
+
+        if not account:
+
+            await callback.answer(
+                "Account not found.",
+                show_alert=True,
+            )
+
+            return
+
+        if account.status != "available":
+
+            await callback.answer(
+                "Account is no longer available.",
+                show_alert=True,
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # RESERVE + BUY
+        # ----------------------------------------------------
+
+        ok, msg, price = await reserve_and_buy_account(
+            session,
+            user,
+            account,
+        )
+
+        if not ok:
+
+            await fail_purchase(
+                session,
+                user,
+                account,
+                price or 0.0,
+            )
+
+            await session.commit()
+
+            await callback.answer(
+                msg,
+                show_alert=True,
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # COMPLETE PURCHASE
+        # ----------------------------------------------------
+
+        await complete_purchase(
+            session,
+            user,
+            account,
+            price,
+        )
+
+        await session.commit()
+
+        await callback.answer(
+            "Purchase successful!"
+        )
+
+        await callback.message.edit_text(
+            "✅ PURCHASE SUCCESSFUL\n\n"
+            f"🆔 Account: #{account.id}\n"
+            f"💰 Price: {price}\n"
+            f"📱 Phone: {account.phone}",
+            reply_markup=back_home_keyboard(),
+        )
+
+        await send_log_message(
+            callback.bot,
+            f"🛒 Purchase: user "
+            f"{user.tg_id} "
+            f"account #{account.id}"
+        )
+
+
+# ============================================================
+# DEPOSIT MENU
+# ============================================================
 
 @router.callback_query(F.data == "user_deposit")
 async def cb_deposit_menu(callback: CallbackQuery):
-    await callback.message.edit_text("Deposit" + "
-" + "Enter amount to deposit:", reply_markup=deposit_amount_keyboard())
 
+    await callback.answer()
+
+    await callback.message.edit_text(
+        "💳 DEPOSIT\n\n"
+        "Enter amount to deposit:",
+        reply_markup=deposit_amount_keyboard(),
+    )
+
+
+# ============================================================
+# /deposit
+# ============================================================
 
 @router.message(Command("deposit"))
-async def cmd_deposit(message: Message):
+async def cmd_deposit(
+    message: Message,
+    state: FSMContext,
+):
+
     if await check_maintenance(message):
         return
-    NL = "
-"
-    await message.answer("Deposit" + NL + "Enter amount to deposit:")
-    await message.state.set_state(DepositState.amount)
+
+    await message.answer(
+        "💳 DEPOSIT\n\n"
+        "Enter amount to deposit:"
+    )
+
+    await state.set_state(
+        DepositState.amount
+    )
 
 
-@router.message(StateFilter(DepositState.amount))
-async def deposit_amount(message: Message, state: FSMContext):
+# ============================================================
+# DEPOSIT AMOUNT
+# ============================================================
+
+@router.message(
+    StateFilter(DepositState.amount)
+)
+async def deposit_amount(
+    message: Message,
+    state: FSMContext,
+):
+
     try:
-        amount = float(message.text.strip())
-        if amount <= 0:
-            await message.answer("Invalid amount. Send a positive number.")
-            return
-    except ValueError:
-        await message.answer("Invalid amount. Send a number.")
-        return
-    await state.update_data(amount=amount)
-    await message.answer("Send UTR number for this deposit:")
-    await message.state.set_state(DepositState.utr)
 
-
-@router.message(StateFilter(DepositState.utr))
-async def deposit_utr(message: Message, state: FSMContext):
-    utr = message.text.strip()
-    if not utr:
-        await message.answer("UTR cannot be empty.")
-        return
-    data = await state.get_data()
-    amount = data["amount"]
-    async with async_session_maker() as session:
-        stmt = select(DepositRequest).where(
-            DepositRequest.user_tg_id == message.from_user.id,
-            DepositRequest.status == "pending"
+        amount = float(
+            (message.text or "").strip()
         )
-        res = await session.execute(stmt)
-        pending = res.scalars().all()
+
+    except (ValueError, TypeError):
+
+        await message.answer(
+            "❌ Invalid amount.\n"
+            "Send a valid number."
+        )
+
+        return
+
+    if amount <= 0:
+
+        await message.answer(
+            "❌ Amount must be greater than 0."
+        )
+
+        return
+
+    await state.update_data(
+        amount=amount
+    )
+
+    await message.answer(
+        "🔢 Send the UTR number for this deposit:"
+    )
+
+    await state.set_state(
+        DepositState.utr
+    )
+
+
+# ============================================================
+# DEPOSIT UTR
+# ============================================================
+
+@router.message(
+    StateFilter(DepositState.utr)
+)
+async def deposit_utr(
+    message: Message,
+    state: FSMContext,
+):
+
+    utr = (message.text or "").strip()
+
+    if not utr:
+
+        await message.answer(
+            "❌ UTR cannot be empty."
+        )
+
+        return
+
+    data = await state.get_data()
+
+    amount = data.get("amount")
+
+    if amount is None:
+
+        await state.clear()
+
+        await message.answer(
+            "❌ Deposit session expired.\n"
+            "Please use /deposit again."
+        )
+
+        return
+
+    async with async_session_maker() as session:
+
+        result = await session.execute(
+            select(DepositRequest).where(
+                DepositRequest.user_tg_id
+                == message.from_user.id,
+                DepositRequest.status
+                == "pending",
+            )
+        )
+
+        pending = result.scalars().all()
+
         if len(pending) >= 5:
-            await message.answer("You already have 5 pending deposits.")
+
+            await message.answer(
+                "⚠️ You already have 5 pending deposits."
+            )
+
             await state.clear()
+
             return
-        expires_at = datetime.utcnow() + timedelta(minutes=30)
-        dep = DepositRequest(
+
+        # ----------------------------------------------------
+        # CREATE DEPOSIT
+        # ----------------------------------------------------
+
+        expires_at = (
+            datetime.utcnow()
+            + timedelta(minutes=30)
+        )
+
+        deposit = DepositRequest(
             user_tg_id=message.from_user.id,
             amount=amount,
             utr=utr,
-            expires_at=expires_at
+            expires_at=expires_at,
+            status="pending",
         )
-        session.add(dep)
+
+        session.add(deposit)
+
         await session.commit()
-        m1 = "Deposit request created: "
-        m2 = str(amount)
-        m3 = ", UTR: "
-        m4 = utr
-        m5 = ". Waiting for approval."
-        await message.answer(m1 + m2 + m3 + m4 + m5)
-        kb = approve_deposit_keyboard(dep.id)
-        log1 = "Deposit request: user "
-        log2 = str(message.from_user.id)
-        log3 = ", "
-        log4 = str(amount)
-        log5 = ", UTR: "
-        log6 = utr
-        await send_log_message(message.bot, log1 + log2 + log3 + log4 + log5 + log6)
+
+        await message.answer(
+            "✅ Deposit request created.\n\n"
+            f"💰 Amount: {amount}\n"
+            f"🔢 UTR: {utr}\n\n"
+            "⏳ Waiting for admin approval."
+        )
+
+        keyboard = approve_deposit_keyboard(
+            deposit.id
+        )
+
+        await send_log_message(
+            message.bot,
+            f"💳 Deposit request\n"
+            f"User: {message.from_user.id}\n"
+            f"Amount: {amount}\n"
+            f"UTR: {utr}"
+        )
+
         if LOG_CHANNEL_ID:
+
             try:
-                d1 = "Deposit request" + "
-"
-                d2 = "User: "
-                d3 = str(message.from_user.id)
-                d4 = "
-"
-                d5 = "Amount: "
-                d6 = str(amount)
-                d7 = "
-"
-                d8 = "UTR: "
-                d9 = utr
-                full = d1 + d2 + d3 + d4 + d5 + d6 + d7 + d8 + d9
+
                 await message.bot.send_message(
                     LOG_CHANNEL_ID,
-                    full,
-                    reply_markup=kb
+                    "💳 DEPOSIT REQUEST\n\n"
+                    f"👤 User: {message.from_user.id}\n"
+                    f"💰 Amount: {amount}\n"
+                    f"🔢 UTR: {utr}",
+                    reply_markup=keyboard,
                 )
-            except Exception:
-                pass
+
+            except Exception as exc:
+
+                print(
+                    "Could not send deposit log:",
+                    exc
+                )
+
         await state.clear()
 
 
-@router.callback_query(F.data.startswith("deposit_approve_"))
-async def cb_deposit_approve(callback: CallbackQuery):
-    dep_id = int(callback.data.split("_")[3])
+# ============================================================
+# APPROVE DEPOSIT
+# ============================================================
+
+@router.callback_query(
+    F.data.startswith("deposit_approve_")
+)
+async def cb_deposit_approve(
+    callback: CallbackQuery,
+):
+
+    try:
+
+        dep_id = int(
+            callback.data[
+                len("deposit_approve_"):
+            ]
+        )
+
+    except (ValueError, TypeError):
+
+        await callback.answer(
+            "Invalid deposit.",
+            show_alert=True,
+        )
+
+        return
+
     async with async_session_maker() as session:
-        role = await get_user_role(session, callback.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await callback.answer("Access denied.", show_alert=True)
+
+        role = await get_user_role(
+            session,
+            callback.from_user.id
+        )
+
+        if role not in (
+            "admin",
+            "superadmin",
+            "owner",
+        ):
+
+            await callback.answer(
+                "Access denied.",
+                show_alert=True,
+            )
+
             return
-        dep = await session.get(DepositRequest, dep_id)
-        if not dep or dep.status != "pending":
-            await callback.answer("Invalid or expired deposit.", show_alert=True)
+
+        deposit = await session.get(
+            DepositRequest,
+            dep_id
+        )
+
+        if not deposit:
+
+            await callback.answer(
+                "Deposit not found.",
+                show_alert=True,
+            )
+
             return
-        user = await session.get(User, dep.user_tg_id)
+
+        if deposit.status != "pending":
+
+            await callback.answer(
+                "Deposit is already processed.",
+                show_alert=True,
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # EXPIRATION
+        # ----------------------------------------------------
+
+        if (
+            deposit.expires_at
+            and deposit.expires_at <= datetime.utcnow()
+        ):
+
+            deposit.status = "expired"
+
+            await session.commit()
+
+            await callback.answer(
+                "Deposit expired.",
+                show_alert=True,
+            )
+
+            return
+
+        user = await session.get(
+            User,
+            deposit.user_tg_id
+        )
+
         if not user:
-            await callback.answer("User not found.", show_alert=True)
+
+            await callback.answer(
+                "User not found.",
+                show_alert=True,
+            )
+
             return
-        user.balance += dep.amount
-        dep.status = "approved"
-        dep.approved_by = callback.from_user.id
-        txn = Transaction(user_tg_id=user.tg_id, amount=dep.amount, type="deposit", description="Deposit approved: UTR " + dep.utr)
-        session.add(txn)
+
+        # ----------------------------------------------------
+        # APPROVE
+        # ----------------------------------------------------
+
+        user.balance += deposit.amount
+
+        deposit.status = "approved"
+
+        deposit.approved_by = (
+            callback.from_user.id
+        )
+
+        transaction = Transaction(
+            user_tg_id=user.tg_id,
+            amount=deposit.amount,
+            type="deposit",
+            description=(
+                f"Deposit approved: "
+                f"UTR {deposit.utr}"
+            ),
+        )
+
+        session.add(transaction)
+
         await session.commit()
-        r1 = "Deposit approved: "
-        r2 = str(dep.amount)
-        r3 = " added to user "
-        r4 = str(user.tg_id)
-        r5 = "."
-        await callback.message.edit_text(r1 + r2 + r3 + r4 + r5)
-        l1 = "Deposit approved: user "
-        l2 = str(user.tg_id)
-        l3 = ", "
-        l4 = str(dep.amount)
-        l5 = ", by "
-        l6 = str(callback.from_user.id)
-        await send_log_message(callback.bot, l1 + l2 + l3 + l4 + l5 + l6)
+
+        await callback.answer(
+            "Deposit approved!"
+        )
+
         try:
-            n1 = "Your deposit of "
-            n2 = str(dep.amount)
-            n3 = " (UTR: "
-            n4 = dep.utr
-            n5 = ") has been approved."
-            await callback.bot.send_message(user.tg_id, n1 + n2 + n3 + n4 + n5)
+
+            await callback.message.edit_text(
+                "✅ DEPOSIT APPROVED\n\n"
+                f"💰 Amount: {deposit.amount}\n"
+                f"👤 User: {user.tg_id}\n"
+                f"👮 Approved by: "
+                f"{callback.from_user.id}"
+            )
+
         except Exception:
             pass
 
+        await send_log_message(
+            callback.bot,
+            f"✅ Deposit approved\n"
+            f"User: {user.tg_id}\n"
+            f"Amount: {deposit.amount}\n"
+            f"By: {callback.from_user.id}"
+        )
 
-@router.callback_query(F.data.startswith("deposit_reject_"))
-async def cb_deposit_reject(callback: CallbackQuery):
-    dep_id = int(callback.data.split("_")[3])
+        try:
+
+            await callback.bot.send_message(
+                user.tg_id,
+                "✅ Your deposit has been approved!\n\n"
+                f"💰 Amount: {deposit.amount}\n"
+                f"🔢 UTR: {deposit.utr}"
+            )
+
+        except Exception as exc:
+
+            print(
+                "Could not notify deposit user:",
+                exc
+            )
+
+
+# ============================================================
+# REJECT DEPOSIT
+# ============================================================
+
+@router.callback_query(
+    F.data.startswith("deposit_reject_")
+)
+async def cb_deposit_reject(
+    callback: CallbackQuery,
+):
+
+    try:
+
+        dep_id = int(
+            callback.data[
+                len("deposit_reject_"):
+            ]
+        )
+
+    except (ValueError, TypeError):
+
+        await callback.answer(
+            "Invalid deposit.",
+            show_alert=True,
+        )
+
+        return
+
     async with async_session_maker() as session:
-        role = await get_user_role(session, callback.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await callback.answer("Access denied.", show_alert=True)
+
+        role = await get_user_role(
+            session,
+            callback.from_user.id
+        )
+
+        if role not in (
+            "admin",
+            "superadmin",
+            "owner",
+        ):
+
+            await callback.answer(
+                "Access denied.",
+                show_alert=True,
+            )
+
             return
-        dep = await session.get(DepositRequest, dep_id)
-        if not dep or dep.status != "pending":
-            await callback.answer("Invalid or expired deposit.", show_alert=True)
+
+        deposit = await session.get(
+            DepositRequest,
+            dep_id
+        )
+
+        if not deposit:
+
+            await callback.answer(
+                "Deposit not found.",
+                show_alert=True,
+            )
+
             return
-        user = await session.get(User, dep.user_tg_id)
-        dep.status = "rejected"
-        dep.approved_by = callback.from_user.id
+
+        if deposit.status != "pending":
+
+            await callback.answer(
+                "Deposit is already processed.",
+                show_alert=True,
+            )
+
+            return
+
+        if (
+            deposit.expires_at
+            and deposit.expires_at <= datetime.utcnow()
+        ):
+
+            deposit.status = "expired"
+
+            await session.commit()
+
+            await callback.answer(
+                "Deposit expired.",
+                show_alert=True,
+            )
+
+            return
+
+        user = await session.get(
+            User,
+            deposit.user_tg_id
+        )
+
+        if not user:
+
+            await callback.answer(
+                "User not found.",
+                show_alert=True,
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # REJECT
+        # ----------------------------------------------------
+
+        deposit.status = "rejected"
+
+        deposit.approved_by = (
+            callback.from_user.id
+        )
+
         await session.commit()
-        j1 = "Deposit rejected: "
-        j2 = str(dep.amount)
-        j3 = " for user "
-        j4 = str(user.tg_id)
-        j5 = "."
-        await callback.message.edit_text(j1 + j2 + j3 + j4 + j5)
-        k1 = "Deposit rejected: user "
-        k2 = str(user.tg_id)
-        k3 = ", "
-        k4 = str(dep.amount)
-        k5 = ", by "
-        k6 = str(callback.from_user.id)
-        await send_log_message(callback.bot, k1 + k2 + k3 + k4 + k5 + k6)
+
+        await callback.answer(
+            "Deposit rejected."
+        )
+
         try:
-            q1 = "Your deposit of "
-            q2 = str(dep.amount)
-            q3 = " (UTR: "
-            q4 = dep.utr
-            q5 = ") has been rejected."
-            await callback.bot.send_message(user.tg_id, q1 + q2 + q3 + q4 + q5)
+
+            await callback.message.edit_text(
+                "❌ DEPOSIT REJECTED\n\n"
+                f"💰 Amount: {deposit.amount}\n"
+                f"👤 User: {user.tg_id}\n"
+                f"👮 Rejected by: "
+                f"{callback.from_user.id}"
+            )
+
         except Exception:
             pass
 
+        await send_log_message(
+            callback.bot,
+            f"❌ Deposit rejected\n"
+            f"User: {user.tg_id}\n"
+            f"Amount: {deposit.amount}\n"
+            f"By: {callback.from_user.id}"
+        )
+
+        try:
+
+            await callback.bot.send_message(
+                user.tg_id,
+                "❌ Your deposit has been rejected.\n\n"
+                f"💰 Amount: {deposit.amount}\n"
+                f"🔢 UTR: {deposit.utr}"
+            )
+
+        except Exception as exc:
+
+            print(
+                "Could not notify rejected deposit user:",
+                exc
+            )
+
+
+# ============================================================
+# ADMIN PANEL
+# ============================================================
 
 @router.callback_query(F.data == "admin_panel")
-async def cb_admin_panel(callback: CallbackQuery):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, callback.from_user.id)
-        if role not in ("admin", "superadmin", "owner"):
-            await callback.answer("Access denied.", show_alert=True)
-            return
-        await callback.message.edit_text("Admin panel:", reply_markup=admin_panel_keyboard())
+async def cb_admin_panel(
+    callback: CallbackQuery,
+):
 
+    async with async_session_maker() as session:
+
+        role = await get_user_role(
+            session,
+            callback.from_user.id
+        )
+
+        if role not in (
+            "admin",
+            "superadmin",
+            "owner",
+        ):
+
+            await callback.answer(
+                "Access denied.",
+                show_alert=True,
+            )
+
+            return
+
+        await callback.answer()
+
+        await callback.message.edit_text(
+            "🛠 ADMIN PANEL",
+            reply_markup=admin_panel_keyboard(),
+        )
+
+
+# ============================================================
+# /admin
+# ============================================================
 
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
+
     if await check_maintenance(message):
         return
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("admin", "superadmin", "owner"):
-            await message.answer("Access denied.")
-            return
-        await message.answer("Admin panel:", reply_markup=admin_panel_keyboard())
 
+    async with async_session_maker() as session:
+
+        role = await get_user_role(
+            session,
+            message.from_user.id
+        )
+
+        if role not in (
+            "admin",
+            "superadmin",
+            "owner",
+        ):
+
+            await message.answer(
+                "❌ Access denied."
+            )
+
+            return
+
+        await message.answer(
+            "🛠 ADMIN PANEL",
+            reply_markup=admin_panel_keyboard(),
+        )
+
+
+# ============================================================
+# /dfchat
+# ============================================================
 
 @router.message(Command("dfchat"))
 async def cmd_dfchat(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner"):
-            await message.answer("Access denied.")
-            return
-    text = "Superadmin and Owner Commands: /addadmin, /removeadmin, /addsuperadmin, /removesuperadmin (owner only), /addbalance, /removebalance, /ban, /unban, /broadcast, /addcategory, /editcategory, /deletecategory, /addaccount, /editaccount, /deleteaccount, /addchannel, /removechannel, /addcoupon, /editcoupon, /deletecoupon, /stats, /coinslist, /maintenance"
-    await message.answer(text)
 
+    async with async_session_maker() as session:
+
+        role = await get_user_role(
+            session,
+            message.from_user.id
+        )
+
+        if role not in (
+            "superadmin",
+            "owner",
+        ):
+
+            await message.answer(
+                "❌ Access denied."
+            )
+
+            return
+
+    await message.answer(
+        "👑 SUPERADMIN / OWNER COMMANDS\n\n"
+
+        "👮 Admin:\n"
+        "/addadmin\n"
+        "/removeadmin\n"
+        "/addsuperadmin\n"
+        "/removesuperadmin\n\n"
+
+        "💰 Balance:\n"
+        "/addbalance\n"
+        "/removebalance\n\n"
+
+        "🚫 Users:\n"
+        "/ban\n"
+        "/unban\n\n"
+
+        "📢 System:\n"
+        "/broadcast\n"
+        "/maintenance\n\n"
+
+        "🛍 Products:\n"
+        "/addcategory\n"
+        "/editcategory\n"
+        "/deletecategory\n"
+        "/addaccount\n"
+        "/editaccount\n"
+        "/deleteaccount\n\n"
+
+        "📢 Channels:\n"
+        "/addchannel\n"
+        "/removechannel\n\n"
+
+        "🎟 Coupons:\n"
+        "/addcoupon\n"
+        "/editcoupon\n"
+        "/deletecoupon\n\n"
+
+        "📊 Statistics:\n"
+        "/stats\n"
+        "/coinslist"
+    )
+
+
+# ============================================================
+# /addbalance
+# ============================================================
 
 @router.message(Command("addbalance"))
 async def cmd_addbalance(message: Message):
+
     async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner"):
-            await message.answer("Access denied.")
+
+        role = await get_user_role(
+            session,
+            message.from_user.id
+        )
+
+        if role not in (
+            "superadmin",
+            "owner",
+        ):
+
+            await message.answer(
+                "❌ Access denied."
+            )
+
             return
-    args = message.text.split()
+
+    args = (
+        message.text.split()
+        if message.text
+        else []
+    )
+
     if len(args) != 3:
-        await message.answer("Usage: /addbalance <user_id> <amount>")
+
+        await message.answer(
+            "Usage:\n"
+            "/addbalance <user_id> <amount>"
+        )
+
         return
+
     try:
+
         user_id = int(args[1])
         amount = float(args[2])
-    except ValueError:
-        await message.answer("Invalid user_id or amount.")
-        return
-    async with async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            await message.answer("User not found.")
-            return
-        await add_balance(session, user.tg_id, amount, "Added by " + str(message.from_user.id))
-        await session.commit()
-        new_bal = user.balance + amount
-        a1 = "Added "
-        a2 = str(amount)
-        a3 = " to user "
-        a4 = str(user.tg_id)
-        a5 = ". New balance: "
-        a6 = str(new_bal)
-        await message.answer(a1 + a2 + a3 + a4 + a5 + a6)
-        b1 = "Add balance: user "
-        b2 = str(user.tg_id)
-        b3 = " +"
-        b4 = str(amount)
-        b5 = " by "
-        b6 = str(message.from_user.id)
-        await send_log_message(message.bot, b1 + b2 + b3 + b4 + b5 + b6)
 
+    except ValueError:
+
+        await message.answer(
+            "❌ Invalid user ID or amount."
+        )
+
+        return
+
+    if amount <= 0:
+
+        await message.answer(
+            "❌ Amount must be greater than 0."
+        )
+
+        return
+
+    async with async_session_maker() as session:
+
+        user = await session.get(
+            User,
+            user_id
+        )
+
+        if not user:
+
+            await message.answer(
+                "❌ User not found."
+            )
+
+            return
+
+        old_balance = user.balance
+
+        await add_balance(
+            session,
+            user.tg_id,
+            amount,
+            f"Added by {message.from_user.id}",
+        )
+
+        await session.commit()
+
+        await message.answer(
+            f"✅ Added {amount}.\n"
+            f"👤 User: {user.tg_id}\n"
+            f"💰 Previous balance: {old_balance}\n"
+            f"💰 New balance: {old_balance + amount}"
+        )
+
+        await send_log_message(
+            message.bot,
+            f"💰 Balance added\n"
+            f"User: {user.tg_id}\n"
+            f"Amount: +{amount}\n"
+            f"By: {message.from_user.id}"
+        )
+
+
+# ============================================================
+# /ban
+# ============================================================
 
 @router.message(Command("ban"))
 async def cmd_ban(message: Message):
+
     async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
+
+        role = await get_user_role(
+            session,
+            message.from_user.id
+        )
+
+        if role not in (
+            "admin",
+            "superadmin",
+            "owner",
+        ):
+
+            await message.answer(
+                "❌ Access denied."
+            )
+
             return
-    args = message.text.split()
+
+    args = (
+        message.text.split()
+        if message.text
+        else []
+    )
+
     if len(args) < 2:
-        await message.answer("Usage: /ban <user_id> [reason]")
+
+        await message.answer(
+            "Usage:\n"
+            "/ban <user_id> [reason]"
+        )
+
         return
+
     try:
+
         user_id = int(args[1])
+
     except ValueError:
-        await message.answer("Invalid user_id.")
+
+        await message.answer(
+            "❌ Invalid user ID."
+        )
+
         return
-    reason = " ".join(args[2:]) if len(args) > 2 else "No reason"
+
+    reason = (
+        " ".join(args[2:])
+        if len(args) > 2
+        else "No reason"
+    )
+
     async with async_session_maker() as session:
-        user = await session.get(User, user_id)
+
+        user = await session.get(
+            User,
+            user_id
+        )
+
         if not user:
-            await message.answer("User not found.")
+
+            await message.answer(
+                "❌ User not found."
+            )
+
             return
+
         user.is_banned = True
         user.ban_reason = reason
         user.ban_until = None
-        await session.commit()
-        c1 = "Banned user "
-        c2 = str(user.tg_id)
-        c3 = ". Reason: "
-        c4 = reason
-        await message.answer(c1 + c2 + c3 + c4)
-        d1 = "Ban: user "
-        d2 = str(user.tg_id)
-        d3 = " by "
-        d4 = str(message.from_user.id)
-        d5 = ", reason: "
-        d6 = reason
-        await send_log_message(message.bot, d1 + d2 + d3 + d4 + d5 + d6)
 
+        await session.commit()
+
+        await message.answer(
+            f"🚫 User banned.\n\n"
+            f"User: {user.tg_id}\n"
+            f"Reason: {reason}"
+        )
+
+        await send_log_message(
+            message.bot,
+            f"🚫 Ban\n"
+            f"User: {user.tg_id}\n"
+            f"By: {message.from_user.id}\n"
+            f"Reason: {reason}"
+        )
+
+
+# ============================================================
+# /unban
+# ============================================================
 
 @router.message(Command("unban"))
 async def cmd_unban(message: Message):
+
     async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
+
+        role = await get_user_role(
+            session,
+            message.from_user.id
+        )
+
+        if role not in (
+            "admin",
+            "superadmin",
+            "owner",
+        ):
+
+            await message.answer(
+                "❌ Access denied."
+            )
+
             return
-    args = message.text.split()
+
+    args = (
+        message.text.split()
+        if message.text
+        else []
+    )
+
     if len(args) != 2:
-        await message.answer("Usage: /unban <user_id>")
+
+        await message.answer(
+            "Usage:\n"
+            "/unban <user_id>"
+        )
+
         return
+
     try:
+
         user_id = int(args[1])
+
     except ValueError:
-        await message.answer("Invalid user_id.")
+
+        await message.answer(
+            "❌ Invalid user ID."
+        )
+
         return
+
     async with async_session_maker() as session:
-        user = await session.get(User, user_id)
+
+        user = await session.get(
+            User,
+            user_id
+        )
+
         if not user:
-            await message.answer("User not found.")
+
+            await message.answer(
+                "❌ User not found."
+            )
+
             return
+
         user.is_banned = False
         user.ban_reason = None
         user.ban_until = None
-        await session.commit()
-        e1 = "Unbanned user "
-        e2 = str(user.tg_id)
-        e3 = "."
-        await message.answer(e1 + e2 + e3)
-        f1 = "Unban: user "
-        f2 = str(user.tg_id)
-        f3 = " by "
-        f4 = str(message.from_user.id)
-        await send_log_message(message.bot, f1 + f2 + f3 + f4)
 
+        await session.commit()
+
+        await message.answer(
+            f"✅ User {user.tg_id} has been unbanned."
+        )
+
+        await send_log_message(
+            message.bot,
+            f"✅ Unban\n"
+            f"User: {user.tg_id}\n"
+            f"By: {message.from_user.id}"
+        )
+
+
+# ============================================================
+# /stats
+# ============================================================
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
-            return
-        total_users = len((await session.execute(select(User))).scalars().all())
-        total_deposits = len((await session.execute(select(DepositRequest))).scalars().all())
-        total_purchases = len((await session.execute(select(Purchase))).scalars().all())
-        available_accounts = len((await session.execute(select(Account).where(Account.status == "available"))).scalars().all())
-        banned_users = len((await session.execute(select(User).where(User.is_banned == True))).scalars().all())
-        NL = "
-"
-        s1 = "Stats" + NL
-        s2 = "Total users: "
-        s3 = str(total_users)
-        s4 = NL + "Total deposits: "
-        s5 = str(total_deposits)
-        s6 = NL + "Total purchases: "
-        s7 = str(total_purchases)
-        s8 = NL + "Available accounts: "
-        s9 = str(available_accounts)
-        s10 = NL + "Banned users: "
-        s11 = str(banned_users)
-        text = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11
-        await message.answer(text)
 
+    async with async_session_maker() as session:
+
+        role = await get_user_role(
+            session,
+            message.from_user.id
+        )
+
+        if role not in (
+            "admin",
+            "superadmin",
+            "owner",
+        ):
+
+            await message.answer(
+                "❌ Access denied."
+            )
+
+            return
+
+        users = (
+            await session.execute(
+                select(User)
+            )
+        ).scalars().all()
+
+        deposits = (
+            await session.execute(
+                select(DepositRequest)
+            )
+        ).scalars().all()
+
+        purchases = (
+            await session.execute(
+                select(Purchase)
+            )
+        ).scalars().all()
+
+        accounts = (
+            await session.execute(
+                select(Account).where(
+                    Account.status == "available"
+                )
+            )
+        ).scalars().all()
+
+        banned_users = (
+            await session.execute(
+                select(User).where(
+                    User.is_banned.is_(True)
+                )
+            )
+        ).scalars().all()
+
+        await message.answer(
+            "📊 BOT STATISTICS\n\n"
+            f"👥 Total users: {len(users)}\n"
+            f"💳 Total deposits: {len(deposits)}\n"
+            f"🛒 Total purchases: {len(purchases)}\n"
+            f"📦 Available accounts: {len(accounts)}\n"
+            f"🚫 Banned users: {len(banned_users)}"
+        )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
 
 @router.errors()
-async def error_handler(event, exception):
-    print("Error:", exception)
+async def error_handler(
+    event,
+    exception,
+):
+
+    print(
+        f"[BOT ERROR] {type(exception).__name__}: "
+        f"{exception}"
+    )
+
+    return True
