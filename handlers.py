@@ -417,8 +417,67 @@ async def cmd_dfchat(message: Message):
         if role not in ("superadmin", "owner"):
             await message.answer("Access denied.")
             return
-    text = "Superadmin and Owner Commands: /addadmin, /removeadmin, /addsuperadmin, /removesuperadmin (owner only), /addbalance, /removebalance, /ban, /unban, /broadcast, /addcategory, /editcategory, /deletecategory, /addaccount, /editaccount, /deleteaccount, /addchannel, /removechannel, /addcoupon, /editcoupon, /deletecoupon, /stats, /coinslist, /maintenance"
+
+    NL_CH = "
+"
+    lines = []
+    lines.append("Commands")
+    lines.append("")
+    lines.append("User:")
+    lines.append("/start – Start bot & open menu")
+    lines.append("/deposit – Create a deposit request")
+    lines.append("/admin – Open admin panel (if you are admin)")
+    lines.append("")
+    lines.append("Admin / Owner:")
+    lines.append("/addbalance <user_id> <amount> – Add balance")
+    lines.append("/ban <user_id> [reason] – Ban user")
+    lines.append("/unban <user_id> – Unban user")
+    lines.append("/stats – Bot statistics")
+    lines.append("/addadmin, /removeadmin – Manage admins")
+    lines.append("/addsuperadmin, /removesuperadmin – Manage superadmins (owner only)")
+    lines.append("/broadcast – Broadcast message")
+    lines.append("/addcategory, /editcategory, /deletecategory – Manage categories")
+    lines.append("/addaccount, /editaccount, /deleteaccount – Manage accounts")
+    lines.append("/addchannel, /removechannel – Manage required channels")
+    lines.append("/addcoupon, /editcoupon, /deletecoupon – Manage coupons")
+    lines.append("/coinslist – List coins / products")
+    lines.append("/maintenance – Toggle maintenance mode")
+
+    text = NL_CH.join(lines)
     await message.answer(text)
+
+
+@router.message(Command("makeowner"))
+async def cmd_makeowner(message: Message):
+    # ONE-TIME OWNER MAKER – after using once, remove or guard this command
+    async with async_session_maker() as session:
+        tg_id = message.from_user.id
+
+        result = await session.execute(
+            select(Admin).where(Admin.tg_id == tg_id)
+        )
+        admin = result.scalar_one_or_none()
+
+        if admin:
+            admin.role = "owner"
+            if hasattr(admin, "is_owner"):
+                admin.is_owner = True
+            if hasattr(admin, "is_superadmin"):
+                admin.is_superadmin = False
+        else:
+            admin = Admin(
+                tg_id=tg_id,
+                role="owner",
+            )
+            if hasattr(admin, "is_owner"):
+                admin.is_owner = True
+            if hasattr(admin, "is_superadmin"):
+                admin.is_superadmin = False
+            session.add(admin)
+
+        await session.commit()
+
+    await message.answer("You are now owner.")
 
 
 @router.message(Command("addbalance"))
@@ -536,39 +595,6 @@ async def cmd_unban(message: Message):
         f3 = " by "
         f4 = str(message.from_user.id)
         await send_log_message(message.bot, f1 + f2 + f3 + f4)
-
-
-@router.message(Command("makeowner"))
-async def cmd_makeowner(message: Message):
-    # ONE-TIME OWNER MAKER – remove or guard this after first use
-    async with async_session_maker() as session:
-        tg_id = message.from_user.id
-
-        result = await session.execute(
-            select(Admin).where(Admin.tg_id == tg_id)
-        )
-        admin = result.scalar_one_or_none()
-
-        if admin:
-            admin.role = "owner"
-            if hasattr(admin, "is_owner"):
-                admin.is_owner = True
-            if hasattr(admin, "is_superadmin"):
-                admin.is_superadmin = False
-        else:
-            admin = Admin(
-                tg_id=tg_id,
-                role="owner",
-            )
-            if hasattr(admin, "is_owner"):
-                admin.is_owner = True
-            if hasattr(admin, "is_superadmin"):
-                admin.is_superadmin = False
-            session.add(admin)
-
-        await session.commit()
-
-    await message.answer("You are now owner.")
 
 
 @router.message(Command("stats"))
