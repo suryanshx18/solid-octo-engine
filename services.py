@@ -34,12 +34,9 @@ def utc_now():
 
 def NL() -> str:
     """
-    Return a newline character.
-    Kept as a function so handlers.py never needs literal '
-' strings.
+    Return a newline character without using a literal newline in source.
     """
-    return "
-"
+    return chr(10)
 
 
 # ============================================================
@@ -119,7 +116,6 @@ async def add_balance(
     if not user:
         return False
 
-    # Make sure balance is usable even if NULL somehow exists.
     if user.balance is None:
         user.balance = 0.0
 
@@ -289,8 +285,8 @@ async def grant_referral_reward(
         amount=reward,
         type="referral",
         description=(
-            f"Referral reward for "
-            f"user {referred_user.tg_id}"
+            "Referral reward for "
+            "user " + str(referred_user.tg_id)
         ),
     )
 
@@ -384,14 +380,14 @@ async def apply_coupon(
         user_tg_id=user.tg_id,
         amount=bonus,
         type="coupon",
-        description=f"Coupon {code}",
+        description="Coupon " + code,
     )
 
     session.add(transaction)
 
     await session.flush()
 
-    return True, f"Added ₹{bonus} to your balance."
+    return True, "Added INR " + str(bonus) + " to your balance."
 
 
 # ============================================================
@@ -431,10 +427,8 @@ async def reserve_and_buy_account(
     if user.balance < price:
         return False, "Insufficient balance.", price
 
-    # Reserve account.
     account.status = "reserved"
 
-    # Deduct balance.
     user.balance -= price
 
     await session.flush()
@@ -448,10 +442,6 @@ async def complete_purchase(
     account: Account,
     price: float,
 ):
-    """
-    Convert reserved account into completed/sold purchase.
-    """
-
     account.status = "sold"
     account.sold_at = utc_now()
 
@@ -467,9 +457,7 @@ async def complete_purchase(
         user_tg_id=user.tg_id,
         amount=-price,
         type="purchase",
-        description=(
-            f"Purchase account #{account.id}"
-        ),
+        description="Purchase account #" + str(account.id),
     )
 
     session.add(transaction)
@@ -483,10 +471,6 @@ async def fail_purchase(
     account: Account,
     price: float,
 ):
-    """
-    Release a reserved account and refund the user.
-    """
-
     if account.status != "reserved":
         return
 
@@ -585,7 +569,6 @@ async def get_user_role(
     user_tg_id: int,
 ) -> str:
 
-    # Owner/superadmin/admin lookup.
     result = await session.execute(
         select(Admin).where(
             Admin.tg_id == user_tg_id
@@ -597,7 +580,6 @@ async def get_user_role(
     if not admin:
         return "user"
 
-    # Support common role names.
     role = getattr(
         admin,
         "role",
@@ -607,7 +589,6 @@ async def get_user_role(
     if role:
         return str(role).lower()
 
-    # Fallback if the Admin model uses flags.
     if getattr(admin, "is_owner", False):
         return "owner"
 
