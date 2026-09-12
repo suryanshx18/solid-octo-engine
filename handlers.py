@@ -116,26 +116,23 @@ async def cb_profile(callback: CallbackQuery):
             await callback.answer("User not found.", show_alert=True)
             return
 
-        p1 = "Profile
+        NL = "
 "
-        p2 = "ID: " + str(user.tg_id) + "
-"
+        p1 = "Profile" + NL
+        p2 = "ID: " + str(user.tg_id) + NL
         p3 = "Name: "
         if user.first_name:
             p3 += user.first_name
         if user.last_name:
             p3 += " " + user.last_name
-        p3 += "
-"
+        p3 += NL
         p4 = "Username: @"
         if user.username:
             p4 += user.username
         else:
             p4 += "N/A"
-        p4 += "
-"
-        p5 = "Balance: " + str(user.balance) + "
-"
+        p4 += NL
+        p5 = "Balance: " + str(user.balance) + NL
         p6 = "Referred by: "
         if user.referred_by:
             p6 += str(user.referred_by)
@@ -218,16 +215,17 @@ async def cb_buy_account(callback: CallbackQuery):
 
 @router.callback_query(F.data == "user_deposit")
 async def cb_deposit_menu(callback: CallbackQuery):
-    await callback.message.edit_text("Deposit
-Enter amount to deposit:", reply_markup=deposit_amount_keyboard())
+    await callback.message.edit_text("Deposit" + "
+" + "Enter amount to deposit:", reply_markup=deposit_amount_keyboard())
 
 
 @router.message(Command("deposit"))
 async def cmd_deposit(message: Message):
     if await check_maintenance(message):
         return
-    await message.answer("Deposit
-Enter amount to deposit:")
+    NL = "
+"
+    await message.answer("Deposit" + NL + "Enter amount to deposit:")
     await message.state.set_state(DepositState.amount)
 
 
@@ -243,7 +241,7 @@ async def deposit_amount(message: Message, state: FSMContext):
         return
     await state.update_data(amount=amount)
     await message.answer("Send UTR number for this deposit:")
-    await state.set_state(DepositState.utr)
+    await message.state.set_state(DepositState.utr)
 
 
 @router.message(StateFilter(DepositState.utr))
@@ -290,18 +288,22 @@ async def deposit_utr(message: Message, state: FSMContext):
         await send_log_message(message.bot, log1 + log2 + log3 + log4 + log5 + log6)
         if LOG_CHANNEL_ID:
             try:
-                d1 = "Deposit request
-User: "
-                d2 = str(message.from_user.id)
-                d3 = "
-Amount: "
-                d4 = str(amount)
-                d5 = "
-UTR: "
-                d6 = utr
+                d1 = "Deposit request" + "
+"
+                d2 = "User: "
+                d3 = str(message.from_user.id)
+                d4 = "
+"
+                d5 = "Amount: "
+                d6 = str(amount)
+                d7 = "
+"
+                d8 = "UTR: "
+                d9 = utr
+                full = d1 + d2 + d3 + d4 + d5 + d6 + d7 + d8 + d9
                 await message.bot.send_message(
                     LOG_CHANNEL_ID,
-                    d1 + d2 + d3 + d4 + d5 + d6,
+                    full,
                     reply_markup=kb
                 )
             except Exception:
@@ -557,21 +559,18 @@ async def cmd_stats(message: Message):
         total_purchases = len((await session.execute(select(Purchase))).scalars().all())
         available_accounts = len((await session.execute(select(Account).where(Account.status == "available"))).scalars().all())
         banned_users = len((await session.execute(select(User).where(User.is_banned == True))).scalars().all())
-        s1 = "Stats
+        NL = "
 "
+        s1 = "Stats" + NL
         s2 = "Total users: "
         s3 = str(total_users)
-        s4 = "
-Total deposits: "
+        s4 = NL + "Total deposits: "
         s5 = str(total_deposits)
-        s6 = "
-Total purchases: "
+        s6 = NL + "Total purchases: "
         s7 = str(total_purchases)
-        s8 = "
-Available accounts: "
+        s8 = NL + "Available accounts: "
         s9 = str(available_accounts)
-        s10 = "
-Banned users: "
+        s10 = NL + "Banned users: "
         s11 = str(banned_users)
         text = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11
         await message.answer(text)
