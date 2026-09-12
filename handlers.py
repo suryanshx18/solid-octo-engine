@@ -3,7 +3,7 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from sqlalchemy import select, update, delete
+from sqlalchemy import select
 from database import (
     async_session_maker, User, Admin, Category, Account,
     DepositRequest, RequiredChannel, Coupon, BotSetting, LogEntry, Purchase, Transaction
@@ -28,10 +28,6 @@ router = Router()
 class DepositState(StatesGroup):
     amount = State()
     utr = State()
-
-
-class BroadcastState(StatesGroup):
-    text = State()
 
 
 async def check_maintenance(message: Message) -> bool:
@@ -120,24 +116,26 @@ async def cb_profile(callback: CallbackQuery):
             await callback.answer("User not found.", show_alert=True)
             return
 
-        line1 = "Profile"
-        line2 = "ID: " + str(user.tg_id)
-        line3 = "Name: " + (user.first_name or "") + " " + (user.last_name or "")
-        line4 = "Username: @" + (user.username or "N/A")
-        line5 = "Balance: " + str(user.balance)
-        line6 = "Referred by: "
+        parts = []
+        parts.append("Profile")
+        parts.append("ID: " + str(user.tg_id))
+        name_part = "Name: "
+        if user.first_name:
+            name_part += user.first_name
+        if user.last_name:
+            name_part += " " + user.last_name
+        parts.append(name_part)
+        parts.append("Username: @" + (user.username or "N/A"))
+        parts.append("Balance: " + str(user.balance))
+        ref_part = "Referred by: "
         if user.referred_by:
-            line6 += str(user.referred_by)
+            ref_part += str(user.referred_by)
         else:
-            line6 += "None"
+            ref_part += "None"
+        parts.append(ref_part)
 
-        text = line1 + "
-" + line2 + "
-" + line3 + "
-" + line4 + "
-" + line5 + "
-" + line6
-
+        text = "
+".join(parts)
         await callback.message.edit_text(text, reply_markup=back_home_keyboard())
 
 
@@ -367,25 +365,6 @@ async def cmd_dfchat(message: Message):
     await message.answer(text)
 
 
-@router.message(Command("coinslist"))
-async def cmd_coinslist(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner"):
-            await message.answer("Access denied.")
-            return
-    stmt = select(User).where(User.balance >= 2.0).order_by(User.balance.desc())
-    res = await session.execute(stmt)
-    users = res.scalars().all()
-    lines = []
-    for u in users:
-        lines.append("ID: " + str(u.tg_id) + ", Balance: " + str(u.balance) + ", @" + (u.username or "N/A"))
-    text = "Users with balance >= 2:
-" + ("
-".join(lines) if lines else "No users.")
-    await message.answer(text)
-
-
 @router.message(Command("addbalance"))
 async def cmd_addbalance(message: Message):
     async with async_session_maker() as session:
@@ -413,38 +392,6 @@ async def cmd_addbalance(message: Message):
         new_bal = user.balance + amount
         await message.answer("Added " + str(amount) + " to user " + str(user.tg_id) + ". New balance: " + str(new_bal))
         await send_log_message(message.bot, "Add balance: user " + str(user.tg_id) + " +" + str(amount) + " by " + str(message.from_user.id))
-
-
-@router.message(Command("removebalance"))
-async def cmd_removebalance(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) != 3:
-        await message.answer("Usage: /removebalance <user_id> <amount>")
-        return
-    try:
-        user_id = int(args[1])
-        amount = float(args[2])
-    except ValueError:
-        await message.answer("Invalid user_id or amount.")
-        return
-    async with async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            await message.answer("User not found.")
-            return
-        try:
-            await remove_balance(session, user.tg_id, amount, "Removed by " + str(message.from_user.id))
-            await session.commit()
-            new_bal = user.balance - amount
-            await message.answer("Removed " + str(amount) + " from user " + str(user.tg_id) + ". New balance: " + str(new_bal))
-            await send_log_message(message.bot, "Remove balance: user " + str(user.tg_id) + " -" + str(amount) + " by " + str(message.from_user.id))
-        except ValueError as e:
-            await message.answer(str(e))
 
 
 @router.message(Command("ban"))
@@ -506,332 +453,6 @@ async def cmd_unban(message: Message):
         await send_log_message(message.bot, "Unban: user " + str(user.tg_id) + " by " + str(message.from_user.id))
 
 
-@router.message(Command("broadcast"))
-async def cmd_broadcast(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner"):
-            await message.answer("Access denied.")
-            return
-    await message.answer("Send the broadcast message text:")
-    await message.state.set_state(BroadcastState.text)
-
-
-@router.message(StateFilter(BroadcastState.text))
-async def broadcast_text(message: Message, state: FSMContext):
-    text = message.text
-    async with async_session_maker() as session:
-        stmt = select(User.tg_id)
-        res = await session.execute(stmt)
-        user_ids = [r[0] for r in res.all()]
-    sent = 0
-    failed = 0
-    for uid in user_ids:
-        try:
-            await message.bot.send_message(uid, text)
-            sent += 1
-        except Exception:
-            failed += 1
-    await message.answer("Broadcast done: sent=" + str(sent) + ", failed=" + str(failed))
-    await send_log_message(message.bot, "Broadcast: sent=" + str(sent) + ", failed=" + str(failed) + " by " + str(message.from_user.id))
-    await state.clear()
-
-
-@router.message(Command("addcategory"))
-async def cmd_addcategory(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) != 3:
-        await message.answer("Usage: /addcategory <name> <rate>")
-        return
-    name = args[1]
-    try:
-        rate = float(args[2])
-    except ValueError:
-        await message.answer("Invalid rate.")
-        return
-    async with async_session_maker() as session:
-        existing = await session.execute(select(Category).where(Category.name == name))
-        if existing.scalar_one_or_none():
-            await message.answer("Category name already exists.")
-            return
-        cat = Category(name=name, rate=rate)
-        session.add(cat)
-        await session.commit()
-        await message.answer("Category added: " + name + " rate " + str(rate))
-        await send_log_message(message.bot, "Add category: " + name + " rate " + str(rate) + " by " + str(message.from_user.id))
-
-
-@router.message(Command("editcategory"))
-async def cmd_editcategory(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) != 3:
-        await message.answer("Usage: /editcategory <name> <new_rate>")
-        return
-    name = args[1]
-    try:
-        new_rate = float(args[2])
-    except ValueError:
-        await message.answer("Invalid rate.")
-        return
-    async with async_session_maker() as session:
-        stmt = select(Category).where(Category.name == name)
-        res = await session.execute(stmt)
-        cat = res.scalar_one_or_none()
-        if not cat:
-            await message.answer("Category not found.")
-            return
-        cat.rate = new_rate
-        await session.commit()
-        await message.answer("Category updated: " + name + " rate " + str(new_rate))
-        await send_log_message(message.bot, "Edit category: " + name + " rate " + str(new_rate) + " by " + str(message.from_user.id))
-
-
-@router.message(Command("deletecategory"))
-async def cmd_deletecategory(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Usage: /deletecategory <name>")
-        return
-    name = args[1]
-    async with async_session_maker() as session:
-        stmt = select(Category).where(Category.name == name)
-        res = await session.execute(stmt)
-        cat = res.scalar_one_or_none()
-        if not cat:
-            await message.answer("Category not found.")
-            return
-        acc_stmt = select(Account).where(Account.category_id == cat.id)
-        acc_res = await session.execute(acc_stmt)
-        if acc_res.scalars().first():
-            await message.answer("Cannot delete category with existing accounts. Delete accounts first.")
-            return
-        await session.delete(cat)
-        await session.commit()
-        await message.answer("Category deleted: " + name)
-        await send_log_message(message.bot, "Delete category: " + name + " by " + str(message.from_user.id))
-
-
-@router.message(Command("addaccount"))
-async def cmd_addaccount(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) != 3:
-        await message.answer("Usage: /addaccount <category_id> <phone>")
-        return
-    try:
-        cat_id = int(args[1])
-    except ValueError:
-        await message.answer("Invalid category_id.")
-        return
-    phone = args[2]
-    async with async_session_maker() as session:
-        cat = await session.get(Category, cat_id)
-        if not cat:
-            await message.answer("Category not found.")
-            return
-        session_data = "placeholder_session"
-        acc = Account(category_id=cat_id, phone=phone, session_data=session_data, added_by=message.from_user.id)
-        session.add(acc)
-        await session.commit()
-        await message.answer("Account added: ID " + str(acc.id) + ", category " + cat.name + ", phone " + phone)
-        await send_log_message(message.bot, "Add account: ID " + str(acc.id) + ", category " + cat.name + " by " + str(message.from_user.id))
-
-
-@router.message(Command("deleteaccount"))
-async def cmd_deleteaccount(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Usage: /deleteaccount <account_id>")
-        return
-    try:
-        acc_id = int(args[1])
-    except ValueError:
-        await message.answer("Invalid account_id.")
-        return
-    async with async_session_maker() as session:
-        acc = await session.get(Account, acc_id)
-        if not acc:
-            await message.answer("Account not found.")
-            return
-        if acc.status != "available":
-            await message.answer("Account is not available (already sold/reserved).")
-            return
-        await session.delete(acc)
-        await session.commit()
-        await message.answer("Account deleted: " + str(acc_id))
-        await send_log_message(message.bot, "Delete account: " + str(acc_id) + " by " + str(message.from_user.id))
-
-
-@router.message(Command("addchannel"))
-async def cmd_addchannel(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Usage: /addchannel <channel_id> [@username] [label]")
-        return
-    try:
-        channel_id = int(args[1])
-    except ValueError:
-        await message.answer("Invalid channel_id.")
-        return
-    username = args[2] if len(args) > 2 else None
-    label = args[3] if len(args) > 3 else None
-    async with async_session_maker() as session:
-        existing = await session.execute(select(RequiredChannel).where(RequiredChannel.channel_id == channel_id))
-        if existing.scalar_one_or_none():
-            await message.answer("Channel already exists.")
-            return
-        ch = RequiredChannel(channel_id=channel_id, channel_username=username, label=label)
-        session.add(ch)
-        await session.commit()
-        await message.answer("Channel added: " + str(channel_id))
-        await send_log_message(message.bot, "Add channel: " + str(channel_id) + " by " + str(message.from_user.id))
-
-
-@router.message(Command("removechannel"))
-async def cmd_removechannel(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Usage: /removechannel <channel_id>")
-        return
-    try:
-        channel_id = int(args[1])
-    except ValueError:
-        await message.answer("Invalid channel_id.")
-        return
-    async with async_session_maker() as session:
-        stmt = select(RequiredChannel).where(RequiredChannel.channel_id == channel_id)
-        res = await session.execute(stmt)
-        ch = res.scalar_one_or_none()
-        if not ch:
-            await message.answer("Channel not found.")
-            return
-        await session.delete(ch)
-        await session.commit()
-        await message.answer("Channel removed: " + str(channel_id))
-        await send_log_message(message.bot, "Remove channel: " + str(channel_id) + " by " + str(message.from_user.id))
-
-
-@router.message(Command("addcoupon"))
-async def cmd_addcoupon(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) != 4:
-        await message.answer("Usage: /addcoupon <code> <amount> <max_uses>")
-        return
-    code, amount_str, max_str = args[1], args[2], args[3]
-    try:
-        amount = float(amount_str)
-        max_uses = int(max_str)
-    except ValueError:
-        await message.answer("Invalid amount or max_uses.")
-        return
-    async with async_session_maker() as session:
-        existing = await session.execute(select(Coupon).where(Coupon.code == code))
-        if existing.scalar_one_or_none():
-            await message.answer("Coupon code already exists.")
-            return
-        coupon = Coupon(code=code, bonus_amount=amount, max_uses=max_uses)
-        session.add(coupon)
-        await session.commit()
-        await message.answer("Coupon added: " + code + " amount " + str(amount) + " max_uses " + str(max_uses))
-        await send_log_message(message.bot, "Add coupon: " + code + " by " + str(message.from_user.id))
-
-
-@router.message(Command("editcoupon"))
-async def cmd_editcoupon(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) != 4:
-        await message.answer("Usage: /editcoupon <code> <new_amount> <new_max_uses>")
-        return
-    code, amount_str, max_str = args[1], args[2], args[3]
-    try:
-        amount = float(amount_str)
-        max_uses = int(max_str)
-    except ValueError:
-        await message.answer("Invalid amount or max_uses.")
-        return
-    async with async_session_maker() as session:
-        stmt = select(Coupon).where(Coupon.code == code)
-        res = await session.execute(stmt)
-        coupon = res.scalar_one_or_none()
-        if not coupon:
-            await message.answer("Coupon not found.")
-            return
-        coupon.bonus_amount = amount
-        coupon.max_uses = max_uses
-        await session.commit()
-        await message.answer("Coupon updated: " + code + " amount " + str(amount) + " max_uses " + str(max_uses))
-        await send_log_message(message.bot, "Edit coupon: " + code + " by " + str(message.from_user.id))
-
-
-@router.message(Command("deletecoupon"))
-async def cmd_deletecoupon(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Usage: /deletecoupon <code>")
-        return
-    code = args[1]
-    async with async_session_maker() as session:
-        stmt = select(Coupon).where(Coupon.code == code)
-        res = await session.execute(stmt)
-        coupon = res.scalar_one_or_none()
-        if not coupon:
-            await message.answer("Coupon not found.")
-            return
-        await session.delete(coupon)
-        await session.commit()
-        await message.answer("Coupon deleted: " + code)
-        await send_log_message(message.bot, "Delete coupon: " + code + " by " + str(message.from_user.id))
-
-
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
     async with async_session_maker() as session:
@@ -844,317 +465,16 @@ async def cmd_stats(message: Message):
         total_purchases = len((await session.execute(select(Purchase))).scalars().all())
         available_accounts = len((await session.execute(select(Account).where(Account.status == "available"))).scalars().all())
         banned_users = len((await session.execute(select(User).where(User.is_banned == True))).scalars().all())
-        text = "Stats
-Total users: " + str(total_users) + "
-Total deposits: " + str(total_deposits) + "
-Total purchases: " + str(total_purchases) + "
-Available accounts: " + str(available_accounts) + "
-Banned users: " + str(banned_users)
+        parts = []
+        parts.append("Stats")
+        parts.append("Total users: " + str(total_users))
+        parts.append("Total deposits: " + str(total_deposits))
+        parts.append("Total purchases: " + str(total_purchases))
+        parts.append("Available accounts: " + str(available_accounts))
+        parts.append("Banned users: " + str(banned_users))
+        text = "
+".join(parts)
         await message.answer(text)
-
-
-@router.message(Command("maintenance"))
-async def cmd_maintenance(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner"):
-            await message.answer("Access denied.")
-            return
-    from config import MAINTENANCE_MODE
-    await message.answer("Maintenance mode toggle requested. Current env MAINTENANCE_MODE=" + str(MAINTENANCE_MODE) + ". To change, update env and restart bot.")
-    await send_log_message(message.bot, "Maintenance toggle requested by " + str(message.from_user.id))
-
-
-@router.message(Command("addadmin"))
-async def cmd_addadmin(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Usage: /addadmin <user_id>")
-        return
-    try:
-        user_id = int(args[1])
-    except ValueError:
-        await message.answer("Invalid user_id.")
-        return
-    async with async_session_maker() as session:
-        existing = await session.execute(select(Admin).where(Admin.tg_id == user_id))
-        if existing.scalar_one_or_none():
-            await message.answer("User is already an admin.")
-            return
-        admin = Admin(tg_id=user_id, role="admin", added_by=message.from_user.id)
-        session.add(admin)
-        await session.commit()
-        await message.answer("User " + str(user_id) + " promoted to admin.")
-        await send_log_message(message.bot, "Add admin: " + str(user_id) + " by " + str(message.from_user.id))
-
-
-@router.message(Command("removeadmin"))
-async def cmd_removeadmin(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner"):
-            await message.answer("Access denied.")
-            return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Usage: /removeadmin <user_id>")
-        return
-    try:
-        user_id = int(args[1])
-    except ValueError:
-        await message.answer("Invalid user_id.")
-        return
-    async with async_session_maker() as session:
-        stmt = select(Admin).where(Admin.tg_id == user_id)
-        res = await session.execute(stmt)
-        admin = res.scalar_one_or_none()
-        if not admin:
-            await message.answer("User is not an admin.")
-            return
-        await session.delete(admin)
-        await session.commit()
-        await message.answer("User " + str(user_id) + " removed from admins.")
-        await send_log_message(message.bot, "Remove admin: " + str(user_id) + " by " + str(message.from_user.id))
-
-
-@router.message(Command("addsuperadmin"))
-async def cmd_addsuperadmin(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role != "owner":
-            await message.answer("Only owner can add superadmins.")
-            return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Usage: /addsuperadmin <user_id>")
-        return
-    try:
-        user_id = int(args[1])
-    except ValueError:
-        await message.answer("Invalid user_id.")
-        return
-    async with async_session_maker() as session:
-        stmt = select(Admin).where(Admin.tg_id == user_id)
-        res = await session.execute(stmt)
-        admin = res.scalar_one_or_none()
-        if admin:
-            admin.role = "superadmin"
-        else:
-            admin = Admin(tg_id=user_id, role="superadmin", added_by=message.from_user.id)
-            session.add(admin)
-        await session.commit()
-        await message.answer("User " + str(user_id) + " promoted to superadmin.")
-        await send_log_message(message.bot, "Add superadmin: " + str(user_id) + " by " + str(message.from_user.id))
-
-
-@router.message(Command("removesuperadmin"))
-async def cmd_removesuperadmin(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role != "owner":
-            await message.answer("Only owner can remove superadmins.")
-            return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Usage: /removesuperadmin <user_id>")
-        return
-    try:
-        user_id = int(args[1])
-    except ValueError:
-        await message.answer("Invalid user_id.")
-        return
-    async with async_session_maker() as session:
-        stmt = select(Admin).where(Admin.tg_id == user_id)
-        res = await session.execute(stmt)
-        admin = res.scalar_one_or_none()
-        if not admin or admin.role != "superadmin":
-            await message.answer("User is not a superadmin.")
-            return
-        admin.role = "admin"
-        await session.commit()
-        await message.answer("User " + str(user_id) + " demoted from superadmin to admin.")
-        await send_log_message(message.bot, "Remove superadmin: " + str(user_id) + " by " + str(message.from_user.id))
-
-
-@router.callback_query(F.data == "user_referral")
-async def cb_referral(callback: CallbackQuery):
-    async with async_session_maker() as session:
-        stmt = select(User).where(User.tg_id == callback.from_user.id)
-        res = await session.execute(stmt)
-        user = res.scalar_one_or_none()
-        if not user:
-            await callback.answer("User not found.", show_alert=True)
-            return
-        ref_link = "https://t.me/" + callback.bot.username + "?start=" + str(callback.from_user.id)
-        text = "Referral
-Your referral link:
-" + ref_link + "
-Reward: 1 for each user who joins via your link and verifies channels."
-        await callback.message.edit_text(text, reply_markup=back_home_keyboard())
-
-
-@router.callback_query(F.data == "user_coupon")
-async def cb_coupon(callback: CallbackQuery):
-    await callback.message.edit_text("Send /coupon <code> to apply a coupon.", reply_markup=back_home_keyboard())
-
-
-@router.message(Command("coupon"))
-async def cmd_coupon(message: Message):
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Usage: /coupon <code>")
-        return
-    code = args[1]
-    async with async_session_maker() as session:
-        stmt = select(User).where(User.tg_id == message.from_user.id)
-        res = await session.execute(stmt)
-        user = res.scalar_one_or_none()
-        if not user:
-            await message.answer("User not found.")
-            return
-        ok, msg = await apply_coupon(session, user, code)
-        await session.commit()
-        await message.answer(msg)
-        await send_log_message(message.bot, "Coupon: user " + str(user.tg_id) + ", code " + code + ", success=" + str(ok))
-
-
-@router.callback_query(F.data == "user_support")
-async def cb_support(callback: CallbackQuery):
-    from config import SUPPORT_USERNAME
-    text = "Support
-Contact: @" + SUPPORT_USERNAME
-    await callback.message.edit_text(text, reply_markup=back_home_keyboard())
-
-
-@router.callback_query(F.data == "user_help")
-async def cb_help(callback: CallbackQuery):
-    text = "Help
-Use the menu buttons to navigate.
-For more info, contact support."
-    await callback.message.edit_text(text, reply_markup=back_home_keyboard())
-
-
-@router.message(Command("menu"))
-async def cmd_menu(message: Message):
-    if await check_maintenance(message):
-        return
-    await message.answer("Main menu:", reply_markup=main_menu_keyboard())
-
-
-@router.message(Command("profile"))
-async def cmd_profile(message: Message):
-    if await check_maintenance(message):
-        return
-    async with async_session_maker() as session:
-        stmt = select(User).where(User.tg_id == message.from_user.id)
-        res = await session.execute(stmt)
-        user = res.scalar_one_or_none()
-        if not user:
-            await message.answer("User not found.")
-            return
-
-        line1 = "Profile"
-        line2 = "ID: " + str(user.tg_id)
-        line3 = "Name: " + (user.first_name or "") + " " + (user.last_name or "")
-        line4 = "Username: @" + (user.username or "N/A")
-        line5 = "Balance: " + str(user.balance)
-        line6 = "Referred by: "
-        if user.referred_by:
-            line6 += str(user.referred_by)
-        else:
-            line6 += "None"
-
-        text = line1 + "
-" + line2 + "
-" + line3 + "
-" + line4 + "
-" + line5 + "
-" + line6
-
-        await message.answer(text, reply_markup=back_home_keyboard())
-
-
-@router.message(Command("purchases"))
-async def cmd_purchases(message: Message):
-    if await check_maintenance(message):
-        return
-    async with async_session_maker() as session:
-        stmt = select(Purchase).where(Purchase.user_tg_id == message.from_user.id).limit(10)
-        res = await session.execute(stmt)
-        purchases = res.scalars().all()
-        if not purchases:
-            await message.answer("No purchases yet.", reply_markup=back_home_keyboard())
-            return
-        lines = []
-        for p in purchases:
-            lines.append("Account #" + str(p.account_id) + " - " + str(p.price) + " - " + str(p.created_at))
-        text = "Your purchases:
-" + "
-".join(lines)
-        await message.answer(text, reply_markup=back_home_keyboard())
-
-
-@router.message(Command("transactions"))
-async def cmd_transactions(message: Message):
-    if await check_maintenance(message):
-        return
-    async with async_session_maker() as session:
-        stmt = select(Transaction).where(Transaction.user_tg_id == message.from_user.id).limit(10)
-        res = await session.execute(stmt)
-        txns = res.scalars().all()
-        if not txns:
-            await message.answer("No transactions yet.", reply_markup=back_home_keyboard())
-            return
-        lines = []
-        for t in txns:
-            sign = "+" if t.amount > 0 else ""
-            lines.append(t.type + ": " + sign + str(t.amount) + " - " + (t.description or "") + " - " + str(t.created_at))
-        text = "Your transactions:
-" + "
-".join(lines)
-        await message.answer(text, reply_markup=back_home_keyboard())
-
-
-@router.callback_query(F.data == "user_purchases")
-async def cb_user_purchases(callback: CallbackQuery):
-    async with async_session_maker() as session:
-        stmt = select(Purchase).where(Purchase.user_tg_id == callback.from_user.id).limit(10)
-        res = await session.execute(stmt)
-        purchases = res.scalars().all()
-        if not purchases:
-            await callback.message.edit_text("No purchases yet.", reply_markup=back_home_keyboard())
-            return
-        lines = []
-        for p in purchases:
-            lines.append("Account #" + str(p.account_id) + " - " + str(p.price))
-        text = "Your purchases:
-" + "
-".join(lines)
-        await callback.message.edit_text(text, reply_markup=back_home_keyboard())
-
-
-@router.callback_query(F.data == "user_transactions")
-async def cb_user_transactions(callback: CallbackQuery):
-    async with async_session_maker() as session:
-        stmt = select(Transaction).where(Transaction.user_tg_id == callback.from_user.id).limit(10)
-        res = await session.execute(stmt)
-        txns = res.scalars().all()
-        if not txns:
-            await callback.message.edit_text("No transactions yet.", reply_markup=back_home_keyboard())
-            return
-        lines = []
-        for t in txns:
-            sign = "+" if t.amount > 0 else ""
-            lines.append(t.type + ": " + sign + str(t.amount))
-        text = "Your transactions:
-" + "
-".join(lines)
-        await callback.message.edit_text(text, reply_markup=back_home_keyboard())
 
 
 @router.errors()
