@@ -116,26 +116,34 @@ async def cb_profile(callback: CallbackQuery):
             await callback.answer("User not found.", show_alert=True)
             return
 
-        parts = []
-        parts.append("Profile")
-        parts.append("ID: " + str(user.tg_id))
-        name_part = "Name: "
+        p1 = "Profile
+"
+        p2 = "ID: " + str(user.tg_id) + "
+"
+        p3 = "Name: "
         if user.first_name:
-            name_part += user.first_name
+            p3 += user.first_name
         if user.last_name:
-            name_part += " " + user.last_name
-        parts.append(name_part)
-        parts.append("Username: @" + (user.username or "N/A"))
-        parts.append("Balance: " + str(user.balance))
-        ref_part = "Referred by: "
-        if user.referred_by:
-            ref_part += str(user.referred_by)
+            p3 += " " + user.last_name
+        p3 += "
+"
+        p4 = "Username: @"
+        if user.username:
+            p4 += user.username
         else:
-            ref_part += "None"
-        parts.append(ref_part)
+            p4 += "N/A"
+        p4 += "
+"
+        p5 = "Balance: " + str(user.balance) + "
+"
+        p6 = "Referred by: "
+        if user.referred_by:
+            p6 += str(user.referred_by)
+        else:
+            p6 += "None"
 
-        text = "
-".join(parts)
+        text = p1 + p2 + p3 + p4 + p5 + p6
+
         await callback.message.edit_text(text, reply_markup=back_home_keyboard())
 
 
@@ -197,7 +205,13 @@ async def cb_buy_account(callback: CallbackQuery):
             return
         await complete_purchase(session, user, account, price)
         await session.commit()
-        text = "Purchase successful! Account #" + str(account.id) + " bought for " + str(price) + ". Phone: " + str(account.phone)
+        t1 = "Purchase successful! Account #"
+        t2 = str(account.id)
+        t3 = " bought for "
+        t4 = str(price)
+        t5 = ". Phone: "
+        t6 = str(account.phone)
+        text = t1 + t2 + t3 + t4 + t5 + t6
         await callback.message.edit_text(text, reply_markup=back_home_keyboard())
         await send_log_message(callback.bot, "Purchase: user " + str(user.tg_id) + " account #" + str(account.id))
 
@@ -260,17 +274,34 @@ async def deposit_utr(message: Message, state: FSMContext):
         )
         session.add(dep)
         await session.commit()
-        await message.answer("Deposit request created: " + str(amount) + ", UTR: " + utr + ". Waiting for approval.")
+        m1 = "Deposit request created: "
+        m2 = str(amount)
+        m3 = ", UTR: "
+        m4 = utr
+        m5 = ". Waiting for approval."
+        await message.answer(m1 + m2 + m3 + m4 + m5)
         kb = approve_deposit_keyboard(dep.id)
-        await send_log_message(message.bot, "Deposit request: user " + str(message.from_user.id) + ", " + str(amount) + ", UTR: " + utr)
+        log1 = "Deposit request: user "
+        log2 = str(message.from_user.id)
+        log3 = ", "
+        log4 = str(amount)
+        log5 = ", UTR: "
+        log6 = utr
+        await send_log_message(message.bot, log1 + log2 + log3 + log4 + log5 + log6)
         if LOG_CHANNEL_ID:
             try:
+                d1 = "Deposit request
+User: "
+                d2 = str(message.from_user.id)
+                d3 = "
+Amount: "
+                d4 = str(amount)
+                d5 = "
+UTR: "
+                d6 = utr
                 await message.bot.send_message(
                     LOG_CHANNEL_ID,
-                    "Deposit request
-User: " + str(message.from_user.id) + "
-Amount: " + str(amount) + "
-UTR: " + utr,
+                    d1 + d2 + d3 + d4 + d5 + d6,
                     reply_markup=kb
                 )
             except Exception:
@@ -300,10 +331,26 @@ async def cb_deposit_approve(callback: CallbackQuery):
         txn = Transaction(user_tg_id=user.tg_id, amount=dep.amount, type="deposit", description="Deposit approved: UTR " + dep.utr)
         session.add(txn)
         await session.commit()
-        await callback.message.edit_text("Deposit approved: " + str(dep.amount) + " added to user " + str(user.tg_id) + ".")
-        await send_log_message(callback.bot, "Deposit approved: user " + str(user.tg_id) + ", " + str(dep.amount) + ", by " + str(callback.from_user.id))
+        r1 = "Deposit approved: "
+        r2 = str(dep.amount)
+        r3 = " added to user "
+        r4 = str(user.tg_id)
+        r5 = "."
+        await callback.message.edit_text(r1 + r2 + r3 + r4 + r5)
+        l1 = "Deposit approved: user "
+        l2 = str(user.tg_id)
+        l3 = ", "
+        l4 = str(dep.amount)
+        l5 = ", by "
+        l6 = str(callback.from_user.id)
+        await send_log_message(callback.bot, l1 + l2 + l3 + l4 + l5 + l6)
         try:
-            await callback.bot.send_message(user.tg_id, "Your deposit of " + str(dep.amount) + " (UTR: " + dep.utr + ") has been approved.")
+            n1 = "Your deposit of "
+            n2 = str(dep.amount)
+            n3 = " (UTR: "
+            n4 = dep.utr
+            n5 = ") has been approved."
+            await callback.bot.send_message(user.tg_id, n1 + n2 + n3 + n4 + n5)
         except Exception:
             pass
 
@@ -324,10 +371,26 @@ async def cb_deposit_reject(callback: CallbackQuery):
         dep.status = "rejected"
         dep.approved_by = callback.from_user.id
         await session.commit()
-        await callback.message.edit_text("Deposit rejected: " + str(dep.amount) + " for user " + str(user.tg_id) + ".")
-        await send_log_message(callback.bot, "Deposit rejected: user " + str(user.tg_id) + ", " + str(dep.amount) + ", by " + str(callback.from_user.id))
+        j1 = "Deposit rejected: "
+        j2 = str(dep.amount)
+        j3 = " for user "
+        j4 = str(user.tg_id)
+        j5 = "."
+        await callback.message.edit_text(j1 + j2 + j3 + j4 + j5)
+        k1 = "Deposit rejected: user "
+        k2 = str(user.tg_id)
+        k3 = ", "
+        k4 = str(dep.amount)
+        k5 = ", by "
+        k6 = str(callback.from_user.id)
+        await send_log_message(callback.bot, k1 + k2 + k3 + k4 + k5 + k6)
         try:
-            await callback.bot.send_message(user.tg_id, "Your deposit of " + str(dep.amount) + " (UTR: " + dep.utr + ") has been rejected.")
+            q1 = "Your deposit of "
+            q2 = str(dep.amount)
+            q3 = " (UTR: "
+            q4 = dep.utr
+            q5 = ") has been rejected."
+            await callback.bot.send_message(user.tg_id, q1 + q2 + q3 + q4 + q5)
         except Exception:
             pass
 
@@ -390,8 +453,20 @@ async def cmd_addbalance(message: Message):
         await add_balance(session, user.tg_id, amount, "Added by " + str(message.from_user.id))
         await session.commit()
         new_bal = user.balance + amount
-        await message.answer("Added " + str(amount) + " to user " + str(user.tg_id) + ". New balance: " + str(new_bal))
-        await send_log_message(message.bot, "Add balance: user " + str(user.tg_id) + " +" + str(amount) + " by " + str(message.from_user.id))
+        a1 = "Added "
+        a2 = str(amount)
+        a3 = " to user "
+        a4 = str(user.tg_id)
+        a5 = ". New balance: "
+        a6 = str(new_bal)
+        await message.answer(a1 + a2 + a3 + a4 + a5 + a6)
+        b1 = "Add balance: user "
+        b2 = str(user.tg_id)
+        b3 = " +"
+        b4 = str(amount)
+        b5 = " by "
+        b6 = str(message.from_user.id)
+        await send_log_message(message.bot, b1 + b2 + b3 + b4 + b5 + b6)
 
 
 @router.message(Command("ban"))
@@ -420,8 +495,18 @@ async def cmd_ban(message: Message):
         user.ban_reason = reason
         user.ban_until = None
         await session.commit()
-        await message.answer("Banned user " + str(user.tg_id) + ". Reason: " + reason)
-        await send_log_message(message.bot, "Ban: user " + str(user.tg_id) + " by " + str(message.from_user.id) + ", reason: " + reason)
+        c1 = "Banned user "
+        c2 = str(user.tg_id)
+        c3 = ". Reason: "
+        c4 = reason
+        await message.answer(c1 + c2 + c3 + c4)
+        d1 = "Ban: user "
+        d2 = str(user.tg_id)
+        d3 = " by "
+        d4 = str(message.from_user.id)
+        d5 = ", reason: "
+        d6 = reason
+        await send_log_message(message.bot, d1 + d2 + d3 + d4 + d5 + d6)
 
 
 @router.message(Command("unban"))
@@ -449,8 +534,15 @@ async def cmd_unban(message: Message):
         user.ban_reason = None
         user.ban_until = None
         await session.commit()
-        await message.answer("Unbanned user " + str(user.tg_id) + ".")
-        await send_log_message(message.bot, "Unban: user " + str(user.tg_id) + " by " + str(message.from_user.id))
+        e1 = "Unbanned user "
+        e2 = str(user.tg_id)
+        e3 = "."
+        await message.answer(e1 + e2 + e3)
+        f1 = "Unban: user "
+        f2 = str(user.tg_id)
+        f3 = " by "
+        f4 = str(message.from_user.id)
+        await send_log_message(message.bot, f1 + f2 + f3 + f4)
 
 
 @router.message(Command("stats"))
@@ -465,15 +557,23 @@ async def cmd_stats(message: Message):
         total_purchases = len((await session.execute(select(Purchase))).scalars().all())
         available_accounts = len((await session.execute(select(Account).where(Account.status == "available"))).scalars().all())
         banned_users = len((await session.execute(select(User).where(User.is_banned == True))).scalars().all())
-        parts = []
-        parts.append("Stats")
-        parts.append("Total users: " + str(total_users))
-        parts.append("Total deposits: " + str(total_deposits))
-        parts.append("Total purchases: " + str(total_purchases))
-        parts.append("Available accounts: " + str(available_accounts))
-        parts.append("Banned users: " + str(banned_users))
-        text = "
-".join(parts)
+        s1 = "Stats
+"
+        s2 = "Total users: "
+        s3 = str(total_users)
+        s4 = "
+Total deposits: "
+        s5 = str(total_deposits)
+        s6 = "
+Total purchases: "
+        s7 = str(total_purchases)
+        s8 = "
+Available accounts: "
+        s9 = str(available_accounts)
+        s10 = "
+Banned users: "
+        s11 = str(banned_users)
+        text = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11
         await message.answer(text)
 
 
