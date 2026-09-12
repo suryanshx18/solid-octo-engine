@@ -538,6 +538,39 @@ async def cmd_unban(message: Message):
         await send_log_message(message.bot, f1 + f2 + f3 + f4)
 
 
+@router.message(Command("makeowner"))
+async def cmd_makeowner(message: Message):
+    # ONE-TIME OWNER MAKER – remove or guard this after first use
+    async with async_session_maker() as session:
+        tg_id = message.from_user.id
+
+        result = await session.execute(
+            select(Admin).where(Admin.tg_id == tg_id)
+        )
+        admin = result.scalar_one_or_none()
+
+        if admin:
+            admin.role = "owner"
+            if hasattr(admin, "is_owner"):
+                admin.is_owner = True
+            if hasattr(admin, "is_superadmin"):
+                admin.is_superadmin = False
+        else:
+            admin = Admin(
+                tg_id=tg_id,
+                role="owner",
+            )
+            if hasattr(admin, "is_owner"):
+                admin.is_owner = True
+            if hasattr(admin, "is_superadmin"):
+                admin.is_superadmin = False
+            session.add(admin)
+
+        await session.commit()
+
+    await message.answer("You are now owner.")
+
+
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
     async with async_session_maker() as session:
