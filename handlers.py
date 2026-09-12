@@ -372,16 +372,16 @@ async def cmd_coinslist(message: Message):
         if role not in ("superadmin", "owner"):
             await message.answer("Access denied.")
             return
-        stmt = select(User).where(User.balance >= 2.0).order_by(User.balance.desc())
-        res = await session.execute(stmt)
-        users = res.scalars().all()
-        lines = []
-        for u in users:
-            lines.append("ID: " + str(u.tg_id) + ", Balance: " + str(u.balance) + ", @" + (u.username or "N/A"))
-        text = "Users with balance >= 2:
+    stmt = select(User).where(User.balance >= 2.0).order_by(User.balance.desc())
+    res = await session.execute(stmt)
+    users = res.scalars().all()
+    lines = []
+    for u in users:
+        lines.append("ID: " + str(u.tg_id) + ", Balance: " + str(u.balance) + ", @" + (u.username or "N/A"))
+    text = "Users with balance >= 2:
 " + ("
 ".join(lines) if lines else "No users.")
-        await message.answer(text)
+    await message.answer(text)
 
 
 @router.message(Command("addbalance"))
