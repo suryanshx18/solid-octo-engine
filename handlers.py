@@ -125,7 +125,11 @@ async def cb_profile(callback: CallbackQuery):
         line3 = "Name: " + (user.first_name or "") + " " + (user.last_name or "")
         line4 = "Username: @" + (user.username or "N/A")
         line5 = "Balance: " + str(user.balance)
-        line6 = "Referred by: " + (str(user.referred_by) if user.referred_by else "None")
+        line6 = "Referred by: "
+        if user.referred_by:
+            line6 += str(user.referred_by)
+        else:
+            line6 += "None"
 
         text = line1 + "
 " + line2 + "
@@ -359,18 +363,7 @@ async def cmd_dfchat(message: Message):
         if role not in ("superadmin", "owner"):
             await message.answer("Access denied.")
             return
-    text = "Superadmin & Owner Commands:
-/addadmin, /removeadmin
-/addsuperadmin, /removesuperadmin (owner only)
-/addbalance, /removebalance
-/ban, /unban
-/broadcast
-/addcategory, /editcategory, /deletecategory
-/addaccount, /editaccount, /deleteaccount
-/addchannel, /removechannel
-/addcoupon, /editcoupon, /deletecoupon
-/stats, /coinslist
-/maintenance"
+    text = "Superadmin and Owner Commands: /addadmin, /removeadmin, /addsuperadmin, /removesuperadmin (owner only), /addbalance, /removebalance, /ban, /unban, /broadcast, /addcategory, /editcategory, /deletecategory, /addaccount, /editaccount, /deleteaccount, /addchannel, /removechannel, /addcoupon, /editcoupon, /deletecoupon, /stats, /coinslist, /maintenance"
     await message.answer(text)
 
 
@@ -1070,7 +1063,11 @@ async def cmd_profile(message: Message):
         line3 = "Name: " + (user.first_name or "") + " " + (user.last_name or "")
         line4 = "Username: @" + (user.username or "N/A")
         line5 = "Balance: " + str(user.balance)
-        line6 = "Referred by: " + (str(user.referred_by) if user.referred_by else "None")
+        line6 = "Referred by: "
+        if user.referred_by:
+            line6 += str(user.referred_by)
+        else:
+            line6 += "None"
 
         text = line1 + "
 " + line2 + "
