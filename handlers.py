@@ -19,7 +19,7 @@ from services import (
     expire_pending_deposits, log_event, send_log_message,
     add_balance, remove_balance, get_setting, set_setting, get_user_role
 )
-from config import OWNER_ID, MAINTENANCE_MODE
+from config import OWNER_ID, MAINTENANCE_MODE, LOG_CHANNEL_ID
 from datetime import datetime, timedelta
 
 router = Router()
@@ -73,8 +73,8 @@ async def cmd_start(message: Message):
             )
             session.add(user)
             await session.commit()
-            await log_event(session, "user_registered", user.tg_id, None, f"username={user.username}")
-            await send_log_message(message.bot, f"👤 New user: {user.tg_id} @{user.username or 'N/A'}")
+            await log_event(session, "user_registered", user.tg_id, None, "username=" + str(user.username or ""))
+            await send_log_message(message.bot, "👤 New user: " + str(user.tg_id) + " @" + str(user.username or "N/A"))
 
         channels = await get_required_channels(session)
         if channels:
@@ -86,7 +86,7 @@ async def cmd_start(message: Message):
 
         if user.referred_by and not user.referral_rewarded:
             await grant_referral_reward(session, user)
-            await send_log_message(message.bot, f"🎁 Referral reward granted to {user.referred_by} for user {user.tg_id}")
+            await send_log_message(message.bot, "🎁 Referral reward granted to " + str(user.referred_by) + " for user " + str(user.tg_id))
 
         await message.answer("Welcome back! Use the menu below.", reply_markup=main_menu_keyboard())
         await log_event(session, "user_started", user.tg_id, None, None)
@@ -116,7 +116,7 @@ async def cb_force_verify(callback: CallbackQuery):
 
         if user.referred_by and not user.referral_rewarded:
             await grant_referral_reward(session, user)
-            await send_log_message(callback.bot, f"🎁 Referral reward granted to {user.referred_by} for user {user.tg_id}")
+            await send_log_message(callback.bot, "🎁 Referral reward granted to " + str(user.referred_by) + " for user " + str(user.tg_id))
 
         await callback.message.edit_text("Verification successful! Use the menu below.", reply_markup=main_menu_keyboard())
 
@@ -137,18 +137,19 @@ async def cb_profile(callback: CallbackQuery):
         if not user:
             await callback.answer("User not found.", show_alert=True)
             return
+
         text = (
-            f"👤 Profile
+            "👤 Profile
 "
-            f"ID: {user.tg_id}
+            "ID: " + str(user.tg_id) + "
 "
-            f"Name: {user.first_name or ''} {user.last_name or ''}
+            "Name: " + (user.first_name or "") + " " + (user.last_name or "") + "
 "
-            f"Username: @{user.username or 'N/A'}
+            "Username: @" + (user.username or "N/A") + "
 "
-            f"Balance: ₹{user.balance:.2f}
+            "Balance: ₹" + f"{user.balance:.2f}" + "
 "
-            f"Referred by: {user.referred_by or 'None'}
+            "Referred by: " + (str(user.referred_by) if user.referred_by else "None") + "
 "
         )
         await callback.message.edit_text(text, reply_markup=back_home_keyboard())
@@ -163,7 +164,7 @@ async def cb_balance(callback: CallbackQuery):
         if not user:
             await callback.answer("User not found.", show_alert=True)
             return
-        await callback.message.edit_text(f"💰 Your balance: ₹{user.balance:.2f}", reply_markup=back_home_keyboard())
+        await callback.message.edit_text("💰 Your balance: ₹" + f"{user.balance:.2f}", reply_markup=back_home_keyboard())
 
 
 # ---------- User: products ----------
@@ -218,15 +219,17 @@ async def cb_buy_account(callback: CallbackQuery):
         await complete_purchase(session, user, account, price)
         await session.commit()
 
-        await callback.message.edit_text(
-            f"✅ Purchase successful!
-Account #{account.id} bought for ₹{price}.
+        text = (
+            "✅ Purchase successful!
 "
-            f"Phone: {account.phone}
-Session delivered (simplified).",
-            reply_markup=back_home_keyboard()
+            "Account #" + str(account.id) + " bought for ₹" + f"{price}" + ".
+"
+            "Phone: " + str(account.phone) + "
+"
+            "Session delivered (simplified)."
         )
-        await send_log_message(callback.bot, f"🛒 Purchase: user {user.tg_id} bought account #{account.id} for ₹{price}")
+        await callback.message.edit_text(text, reply_markup=back_home_keyboard())
+        await send_log_message(callback.bot, "🛒 Purchase: user " + str(user.tg_id) + " bought account #" + str(account.id) + " for ₹" + f"{price}")
 
 
 # ---------- User: deposit ----------
@@ -294,20 +297,20 @@ async def deposit_utr(message: Message, state: FSMContext):
         session.add(dep)
         await session.commit()
 
-        await message.answer(f"Deposit request created: ₹{amount}, UTR: {utr}. Waiting for approval.")
+        await message.answer("Deposit request created: ₹" + f"{amount}" + ", UTR: " + utr + ". Waiting for approval.")
         kb = approve_deposit_keyboard(dep.id)
         await send_log_message(
             message.bot,
-            f"💰 Deposit request: user {message.from_user.id}, ₹{amount}, UTR: {utr}",
+            "💰 Deposit request: user " + str(message.from_user.id) + ", ₹" + f"{amount}" + ", UTR: " + utr,
         )
         if LOG_CHANNEL_ID:
             try:
                 await message.bot.send_message(
                     LOG_CHANNEL_ID,
-                    f"💰 Deposit request
-User: {message.from_user.id}
-Amount: ₹{amount}
-UTR: {utr}",
+                    "💰 Deposit request
+User: " + str(message.from_user.id) + "
+Amount: ₹" + f"{amount}" + "
+UTR: " + utr,
                     reply_markup=kb
                 )
             except Exception:
@@ -337,14 +340,14 @@ async def cb_deposit_approve(callback: CallbackQuery):
         user.balance += dep.amount
         dep.status = "approved"
         dep.approved_by = callback.from_user.id
-        txn = Transaction(user_tg_id=user.tg_id, amount=dep.amount, type="deposit", description=f"Deposit approved: UTR {dep.utr}")
+        txn = Transaction(user_tg_id=user.tg_id, amount=dep.amount, type="deposit", description="Deposit approved: UTR " + dep.utr)
         session.add(txn)
         await session.commit()
 
-        await callback.message.edit_text(f"✅ Deposit approved: ₹{dep.amount} added to user {user.tg_id}.")
-        await send_log_message(callback.bot, f"✅ Deposit approved: user {user.tg_id}, ₹{dep.amount}, by {callback.from_user.id}")
+        await callback.message.edit_text("✅ Deposit approved: ₹" + f"{dep.amount}" + " added to user " + str(user.tg_id) + ".")
+        await send_log_message(callback.bot, "✅ Deposit approved: user " + str(user.tg_id) + ", ₹" + f"{dep.amount}" + ", by " + str(callback.from_user.id))
         try:
-            await callback.bot.send_message(user.tg_id, f"✅ Your deposit of ₹{dep.amount} (UTR: {dep.utr}) has been approved.")
+            await callback.bot.send_message(user.tg_id, "✅ Your deposit of ₹" + f"{dep.amount}" + " (UTR: " + dep.utr + ") has been approved.")
         except Exception:
             pass
 
@@ -368,10 +371,10 @@ async def cb_deposit_reject(callback: CallbackQuery):
         dep.approved_by = callback.from_user.id
         await session.commit()
 
-        await callback.message.edit_text(f"❌ Deposit rejected: ₹{dep.amount} for user {user.tg_id}.")
-        await send_log_message(callback.bot, f"❌ Deposit rejected: user {user.tg_id}, ₹{dep.amount}, by {callback.from_user.id}")
+        await callback.message.edit_text("❌ Deposit rejected: ₹" + f"{dep.amount}" + " for user " + str(user.tg_id) + ".")
+        await send_log_message(callback.bot, "❌ Deposit rejected: user " + str(user.tg_id) + ", ₹" + f"{dep.amount}" + ", by " + str(callback.from_user.id))
         try:
-            await callback.bot.send_message(user.tg_id, f"❌ Your deposit of ₹{dep.amount} (UTR: {dep.utr}) has been rejected.")
+            await callback.bot.send_message(user.tg_id, "❌ Your deposit of ₹" + f"{dep.amount}" + " (UTR: " + dep.utr + ") has been rejected.")
         except Exception:
             pass
 
@@ -448,10 +451,10 @@ async def cmd_coinslist(message: Message):
         stmt = select(User).where(User.balance >= 2.0).order_by(User.balance.desc())
         res = await session.execute(stmt)
         users = res.scalars().all()
-        lines = [f"ID: {u.tg_id}, Balance: ₹{u.balance:.2f}, @{u.username or 'N/A'}" for u in users]
+        lines = ["ID: " + str(u.tg_id) + ", Balance: ₹" + f"{u.balance:.2f}" + ", @" + (u.username or "N/A") for u in users]
         text = "💰 Users with balance ≥ ₹2:
-" + "
-".join(lines) if lines else "No users."
+" + ("
+".join(lines) if lines else "No users.")
         await message.answer(text)
 
 
@@ -482,10 +485,11 @@ async def cmd_addbalance(message: Message):
         if not user:
             await message.answer("User not found.")
             return
-        await add_balance(session, user.tg_id, amount, f"Added by {message.from_user.id}")
+        await add_balance(session, user.tg_id, amount, "Added by " + str(message.from_user.id))
         await session.commit()
-        await message.answer(f"✅ Added ₹{amount} to user {user.tg_id}. New balance: ₹{user.balance + amount:.2f}")
-        await send_log_message(message.bot, f"💰 Add balance: user {user.tg_id} +₹{amount} by {message.from_user.id}")
+        new_bal = user.balance + amount
+        await message.answer("✅ Added ₹" + f"{amount}" + " to user " + str(user.tg_id) + ". New balance: ₹" + f"{new_bal:.2f}")
+        await send_log_message(message.bot, "💰 Add balance: user " + str(user.tg_id) + " +₹" + f"{amount}" + " by " + str(message.from_user.id))
 
 
 @router.message(Command("removebalance"))
@@ -514,10 +518,11 @@ async def cmd_removebalance(message: Message):
             await message.answer("User not found.")
             return
         try:
-            await remove_balance(session, user.tg_id, amount, f"Removed by {message.from_user.id}")
+            await remove_balance(session, user.tg_id, amount, "Removed by " + str(message.from_user.id))
             await session.commit()
-            await message.answer(f"✅ Removed ₹{amount} from user {user.tg_id}. New balance: ₹{user.balance - amount:.2f}")
-            await send_log_message(message.bot, f"💰 Remove balance: user {user.tg_id} -₹{amount} by {message.from_user.id}")
+            new_bal = user.balance - amount
+            await message.answer("✅ Removed ₹" + f"{amount}" + " from user " + str(user.tg_id) + ". New balance: ₹" + f"{new_bal:.2f}")
+            await send_log_message(message.bot, "💰 Remove balance: user " + str(user.tg_id) + " -₹" + f"{amount}" + " by " + str(message.from_user.id))
         except ValueError as e:
             await message.answer(str(e))
 
@@ -554,8 +559,8 @@ async def cmd_ban(message: Message):
         user.ban_reason = reason
         user.ban_until = None
         await session.commit()
-        await message.answer(f"✅ Banned user {user.tg_id}. Reason: {reason}")
-        await send_log_message(message.bot, f"🚫 Ban: user {user.tg_id} by {message.from_user.id}, reason: {reason}")
+        await message.answer("✅ Banned user " + str(user.tg_id) + ". Reason: " + reason)
+        await send_log_message(message.bot, "🚫 Ban: user " + str(user.tg_id) + " by " + str(message.from_user.id) + ", reason: " + reason)
 
 
 @router.message(Command("unban"))
@@ -586,8 +591,8 @@ async def cmd_unban(message: Message):
         user.ban_reason = None
         user.ban_until = None
         await session.commit()
-        await message.answer(f"✅ Unbanned user {user.tg_id}.")
-        await send_log_message(message.bot, f"✅ Unban: user {user.tg_id} by {message.from_user.id}")
+        await message.answer("✅ Unbanned user " + str(user.tg_id) + ".")
+        await send_log_message(message.bot, "✅ Unban: user " + str(user.tg_id) + " by " + str(message.from_user.id))
 
 
 # ---------- Broadcast (superadmin+owner only) ----------
@@ -621,8 +626,8 @@ async def broadcast_text(message: Message, state: FSMContext):
         except Exception:
             failed += 1
 
-    await message.answer(f"Broadcast done: sent={sent}, failed={failed}")
-    await send_log_message(message.bot, f"📢 Broadcast: sent={sent}, failed={failed} by {message.from_user.id}")
+    await message.answer("Broadcast done: sent=" + str(sent) + ", failed=" + str(failed))
+    await send_log_message(message.bot, "📢 Broadcast: sent=" + str(sent) + ", failed=" + str(failed) + " by " + str(message.from_user.id))
     await state.clear()
 
 
@@ -656,8 +661,8 @@ async def cmd_addcategory(message: Message):
         cat = Category(name=name, rate=rate)
         session.add(cat)
         await session.commit()
-        await message.answer(f"✅ Category added: {name} – ₹{rate}")
-        await send_log_message(message.bot, f"📦 Add category: {name} – ₹{rate} by {message.from_user.id}")
+        await message.answer("✅ Category added: " + name + " – ₹" + f"{rate}")
+        await send_log_message(message.bot, "📦 Add category: " + name + " – ₹" + f"{rate} by " + str(message.from_user.id))
 
 
 @router.message(Command("editcategory"))
@@ -689,8 +694,8 @@ async def cmd_editcategory(message: Message):
             return
         cat.rate = new_rate
         await session.commit()
-        await message.answer(f"✅ Category updated: {name} – ₹{new_rate}")
-        await send_log_message(message.bot, f"📦 Edit category: {name} – ₹{new_rate} by {message.from_user.id}")
+        await message.answer("✅ Category updated: " + name + " – ₹" + f"{new_rate}")
+        await send_log_message(message.bot, "📦 Edit category: " + name + " – ₹" + f"{new_rate} by " + str(message.from_user.id))
 
 
 @router.message(Command("deletecategory"))
@@ -724,8 +729,8 @@ async def cmd_deletecategory(message: Message):
 
         await session.delete(cat)
         await session.commit()
-        await message.answer(f"✅ Category deleted: {name}")
-        await send_log_message(message.bot, f"📦 Delete category: {name} by {message.from_user.id}")
+        await message.answer("✅ Category deleted: " + name)
+        await send_log_message(message.bot, "📦 Delete category: " + name + " by " + str(message.from_user.id))
 
 
 # ---------- Accounts (CRUD, simplified) ----------
@@ -767,8 +772,8 @@ async def cmd_addaccount(message: Message):
         )
         session.add(acc)
         await session.commit()
-        await message.answer(f"✅ Account added: ID {acc.id}, category {cat.name}, phone {phone}")
-        await send_log_message(message.bot, f"📱 Add account: ID {acc.id}, category {cat.name} by {message.from_user.id}")
+        await message.answer("✅ Account added: ID " + str(acc.id) + ", category " + cat.name + ", phone " + phone)
+        await send_log_message(message.bot, "📱 Add account: ID " + str(acc.id) + ", category " + cat.name + " by " + str(message.from_user.id))
 
 
 @router.message(Command("deleteaccount"))
@@ -800,8 +805,8 @@ async def cmd_deleteaccount(message: Message):
             return
         await session.delete(acc)
         await session.commit()
-        await message.answer(f"✅ Account deleted: {acc_id}")
-        await send_log_message(message.bot, f"📱 Delete account: {acc_id} by {message.from_user.id}")
+        await message.answer("✅ Account deleted: " + str(acc_id))
+        await send_log_message(message.bot, "📱 Delete account: " + str(acc_id) + " by " + str(message.from_user.id))
 
 
 # ---------- Channels (CRUD) ----------
@@ -836,8 +841,8 @@ async def cmd_addchannel(message: Message):
         ch = RequiredChannel(channel_id=channel_id, channel_username=username, label=label)
         session.add(ch)
         await session.commit()
-        await message.answer(f"✅ Channel added: {channel_id}")
-        await send_log_message(message.bot, f"📡 Add channel: {channel_id} by {message.from_user.id}")
+        await message.answer("✅ Channel added: " + str(channel_id))
+        await send_log_message(message.bot, "📡 Add channel: " + str(channel_id) + " by " + str(message.from_user.id))
 
 
 @router.message(Command("removechannel"))
@@ -868,8 +873,8 @@ async def cmd_removechannel(message: Message):
             return
         await session.delete(ch)
         await session.commit()
-        await message.answer(f"✅ Channel removed: {channel_id}")
-        await send_log_message(message.bot, f"📡 Remove channel: {channel_id} by {message.from_user.id}")
+        await message.answer("✅ Channel removed: " + str(channel_id))
+        await send_log_message(message.bot, "📡 Remove channel: " + str(channel_id) + " by " + str(message.from_user.id))
 
 
 # ---------- Coupons (CRUD) ----------
@@ -903,8 +908,8 @@ async def cmd_addcoupon(message: Message):
         coupon = Coupon(code=code, bonus_amount=amount, max_uses=max_uses)
         session.add(coupon)
         await session.commit()
-        await message.answer(f"✅ Coupon added: {code} – ₹{amount}, max_uses={max_uses}")
-        await send_log_message(message.bot, f"🎟 Add coupon: {code} by {message.from_user.id}")
+        await message.answer("✅ Coupon added: " + code + " – ₹" + f"{amount}" + ", max_uses=" + str(max_uses))
+        await send_log_message(message.bot, "🎟 Add coupon: " + code + " by " + str(message.from_user.id))
 
 
 @router.message(Command("editcoupon"))
@@ -938,8 +943,8 @@ async def cmd_editcoupon(message: Message):
         coupon.bonus_amount = amount
         coupon.max_uses = max_uses
         await session.commit()
-        await message.answer(f"✅ Coupon updated: {code} – ₹{amount}, max_uses={max_uses}")
-        await send_log_message(message.bot, f"🎟 Edit coupon: {code} by {message.from_user.id}")
+        await message.answer("✅ Coupon updated: " + code + " – ₹" + f"{amount}" + ", max_uses=" + str(max_uses))
+        await send_log_message(message.bot, "🎟 Edit coupon: " + code + " by " + str(message.from_user.id))
 
 
 @router.message(Command("deletecoupon"))
@@ -966,8 +971,8 @@ async def cmd_deletecoupon(message: Message):
             return
         await session.delete(coupon)
         await session.commit()
-        await message.answer(f"✅ Coupon deleted: {code}")
-        await send_log_message(message.bot, f"🎟 Delete coupon: {code} by {message.from_user.id}")
+        await message.answer("✅ Coupon deleted: " + code)
+        await send_log_message(message.bot, "🎟 Delete coupon: " + code + " by " + str(message.from_user.id))
 
 
 # ---------- Stats ----------
@@ -996,17 +1001,17 @@ async def cmd_stats(message: Message):
         banned_users = len(banned_users.scalars().all())
 
         text = (
-            f"📊 Stats
+            "📊 Stats
 "
-            f"Total users: {total_users}
+            "Total users: " + str(total_users) + "
 "
-            f"Total deposits: {total_deposits}
+            "Total deposits: " + str(total_deposits) + "
 "
-            f"Total purchases: {total_purchases}
+            "Total purchases: " + str(total_purchases) + "
 "
-            f"Available accounts: {available_accounts}
+            "Available accounts: " + str(available_accounts) + "
 "
-            f"Banned users: {banned_users}
+            "Banned users: " + str(banned_users) + "
 "
         )
         await message.answer(text)
@@ -1023,8 +1028,8 @@ async def cmd_maintenance(message: Message):
             return
 
     from config import MAINTENANCE_MODE
-    await message.answer(f"Maintenance mode toggle requested. Current env MAINTENANCE_MODE={MAINTENANCE_MODE}. To change, update env and restart bot.")
-    await send_log_message(message.bot, f"⚙️ Maintenance toggle requested by {message.from_user.id}")
+    await message.answer("Maintenance mode toggle requested. Current env MAINTENANCE_MODE=" + str(MAINTENANCE_MODE) + ". To change, update env and restart bot.")
+    await send_log_message(message.bot, "⚙️ Maintenance toggle requested by " + str(message.from_user.id))
 
 
 # ---------- Admins & Superadmins ----------
@@ -1056,8 +1061,8 @@ async def cmd_addadmin(message: Message):
         admin = Admin(tg_id=user_id, role="admin", added_by=message.from_user.id)
         session.add(admin)
         await session.commit()
-        await message.answer(f"✅ User {user_id} promoted to admin.")
-        await send_log_message(message.bot, f"🛡 Add admin: {user_id} by {message.from_user.id}")
+        await message.answer("✅ User " + str(user_id) + " promoted to admin.")
+        await send_log_message(message.bot, "🛡 Add admin: " + str(user_id) + " by " + str(message.from_user.id))
 
 
 @router.message(Command("removeadmin"))
@@ -1088,8 +1093,8 @@ async def cmd_removeadmin(message: Message):
             return
         await session.delete(admin)
         await session.commit()
-        await message.answer(f"✅ User {user_id} removed from admins.")
-        await send_log_message(message.bot, f"🛡 Remove admin: {user_id} by {message.from_user.id}")
+        await message.answer("✅ User " + str(user_id) + " removed from admins.")
+        await send_log_message(message.bot, "🛡 Remove admin: " + str(user_id) + " by " + str(message.from_user.id))
 
 
 @router.message(Command("addsuperadmin"))
@@ -1121,8 +1126,8 @@ async def cmd_addsuperadmin(message: Message):
             admin = Admin(tg_id=user_id, role="superadmin", added_by=message.from_user.id)
             session.add(admin)
         await session.commit()
-        await message.answer(f"✅ User {user_id} promoted to superadmin.")
-        await send_log_message(message.bot, f"🛡 Add superadmin: {user_id} by {message.from_user.id}")
+        await message.answer("✅ User " + str(user_id) + " promoted to superadmin.")
+        await send_log_message(message.bot, "🛡 Add superadmin: " + str(user_id) + " by " + str(message.from_user.id))
 
 
 @router.message(Command("removesuperadmin"))
@@ -1153,8 +1158,8 @@ async def cmd_removesuperadmin(message: Message):
             return
         admin.role = "admin"
         await session.commit()
-        await message.answer(f"✅ User {user_id} demoted from superadmin to admin.")
-        await send_log_message(message.bot, f"🛡 Remove superadmin: {user_id} by {message.from_user.id}")
+        await message.answer("✅ User " + str(user_id) + " demoted from superadmin to admin.")
+        await send_log_message(message.bot, "🛡 Remove superadmin: " + str(user_id) + " by " + str(message.from_user.id))
 
 
 # ---------- User: referral, coupon, support, help ----------
@@ -1168,15 +1173,15 @@ async def cb_referral(callback: CallbackQuery):
         if not user:
             await callback.answer("User not found.", show_alert=True)
             return
-        ref_link = f"https://t.me/{callback.bot.username}?start={callback.from_user.id}"
+        ref_link = "https://t.me/" + callback.bot.username + "?start=" + str(callback.from_user.id)
         text = (
-            f"🎁 Referral
+            "🎁 Referral
 "
-            f"Your referral link:
-{ref_link}
+            "Your referral link:
+" + ref_link + "
 
 "
-            f"Reward: ₹1 for each user who joins via your link and verifies channels."
+            "Reward: ₹1 for each user who joins via your link and verifies channels."
         )
         await callback.message.edit_text(text, reply_markup=back_home_keyboard())
 
@@ -1204,14 +1209,14 @@ async def cmd_coupon(message: Message):
         ok, msg = await apply_coupon(session, user, code)
         await session.commit()
         await message.answer(msg)
-        await send_log_message(message.bot, f"🎟 Coupon: user {user.tg_id}, code {code}, success={ok}")
+        await send_log_message(message.bot, "🎟 Coupon: user " + str(user.tg_id) + ", code " + code + ", success=" + str(ok))
 
 
 @router.callback_query(F.data == "user_support")
 async def cb_support(callback: CallbackQuery):
     from config import SUPPORT_USERNAME
-    text = f"📞 Support
-Contact: @{SUPPORT_USERNAME}"
+    text = "📞 Support
+Contact: @" + SUPPORT_USERNAME
     await callback.message.edit_text(text, reply_markup=back_home_keyboard())
 
 
@@ -1246,17 +1251,17 @@ async def cmd_profile(message: Message):
             await message.answer("User not found.")
             return
         text = (
-            f"👤 Profile
+            "👤 Profile
 "
-            f"ID: {user.tg_id}
+            "ID: " + str(user.tg_id) + "
 "
-            f"Name: {user.first_name or ''} {user.last_name or ''}
+            "Name: " + (user.first_name or "") + " " + (user.last_name or "") + "
 "
-            f"Username: @{user.username or 'N/A'}
+            "Username: @" + (user.username or "N/A") + "
 "
-            f"Balance: ₹{user.balance:.2f}
+            "Balance: ₹" + f"{user.balance:.2f}" + "
 "
-            f"Referred by: {user.referred_by or 'None'}
+            "Referred by: " + (str(user.referred_by) if user.referred_by else "None") + "
 "
         )
         await message.answer(text, reply_markup=back_home_keyboard())
@@ -1273,7 +1278,7 @@ async def cmd_purchases(message: Message):
         if not purchases:
             await message.answer("No purchases yet.", reply_markup=back_home_keyboard())
             return
-        lines = [f"Account #{p.account_id} – ₹{p.price} – {p.created_at}" for p in purchases]
+        lines = ["Account #" + str(p.account_id) + " – ₹" + f"{p.price}" + " – " + str(p.created_at) for p in purchases]
         text = "📜 Your purchases:
 " + "
 ".join(lines)
@@ -1291,7 +1296,7 @@ async def cmd_transactions(message: Message):
         if not txns:
             await message.answer("No transactions yet.", reply_markup=back_home_keyboard())
             return
-        lines = [f"{t.type}: {'+' if t.amount>0 else ''}{t.amount:.2f} – {t.description or ''} – {t.created_at}" for t in txns]
+        lines = [t.type + ": " + ("+" if t.amount > 0 else "") + f"{t.amount:.2f}" + " – " + (t.description or "") + " – " + str(t.created_at) for t in txns]
         text = "🧾 Your transactions:
 " + "
 ".join(lines)
@@ -1307,7 +1312,7 @@ async def cb_user_purchases(callback: CallbackQuery):
         if not purchases:
             await callback.message.edit_text("No purchases yet.", reply_markup=back_home_keyboard())
             return
-        lines = [f"Account #{p.account_id} – ₹{p.price}" for p in purchases]
+        lines = ["Account #" + str(p.account_id) + " – ₹" + f"{p.price}" for p in purchases]
         text = "📜 Your purchases:
 " + "
 ".join(lines)
@@ -1323,7 +1328,7 @@ async def cb_user_transactions(callback: CallbackQuery):
         if not txns:
             await callback.message.edit_text("No transactions yet.", reply_markup=back_home_keyboard())
             return
-        lines = [f"{t.type}: {'+' if t.amount>0 else ''}{t.amount:.2f}" for t in txns]
+        lines = [t.type + ": " + ("+" if t.amount > 0 else "") + f"{t.amount:.2f}" for t in txns]
         text = "🧾 Your transactions:
 " + "
 ".join(lines)
@@ -1334,4 +1339,4 @@ async def cb_user_transactions(callback: CallbackQuery):
 
 @router.errors()
 async def error_handler(event, exception):
-    print(f"Error: {exception}")
+    print("Error:", exception)
