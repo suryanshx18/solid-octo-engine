@@ -17,7 +17,8 @@ from services import (
     get_required_channels, check_force_join, grant_referral_reward,
     apply_coupon, reserve_and_buy_account, complete_purchase, fail_purchase,
     expire_pending_deposits, log_event, send_log_message,
-    add_balance, remove_balance, get_setting, set_setting, get_user_role
+    add_balance, remove_balance, get_setting, set_setting, get_user_role,
+    NL,
 )
 from config import OWNER_ID, MAINTENANCE_MODE, LOG_CHANNEL_ID
 from datetime import datetime, timedelta
@@ -116,8 +117,6 @@ async def cb_profile(callback: CallbackQuery):
             await callback.answer("User not found.", show_alert=True)
             return
 
-        NL = "
-"
         lines = []
         lines.append("Profile")
         lines.append("ID: " + str(user.tg_id))
@@ -133,7 +132,7 @@ async def cb_profile(callback: CallbackQuery):
         lines.append("Balance: " + str(user.balance))
         lines.append("Referred by: " + (str(user.referred_by) if user.referred_by else "None"))
 
-        text = NL.join(lines)
+        text = NL().join(lines)
 
         await callback.message.edit_text(text, reply_markup=back_home_keyboard())
 
@@ -209,9 +208,10 @@ async def cb_buy_account(callback: CallbackQuery):
 
 @router.callback_query(F.data == "user_deposit")
 async def cb_deposit_menu(callback: CallbackQuery):
-    NL = "
-"
-    text = "Deposit" + NL + "Enter amount to deposit:"
+    lines = []
+    lines.append("Deposit")
+    lines.append("Enter amount to deposit:")
+    text = NL().join(lines)
     await callback.message.edit_text(text, reply_markup=deposit_amount_keyboard())
 
 
@@ -219,9 +219,11 @@ async def cb_deposit_menu(callback: CallbackQuery):
 async def cmd_deposit(message: Message):
     if await check_maintenance(message):
         return
-    NL = "
-"
-    await message.answer("Deposit" + NL + "Enter amount to deposit:")
+    lines = []
+    lines.append("Deposit")
+    lines.append("Enter amount to deposit:")
+    text = NL().join(lines)
+    await message.answer(text)
     await message.state.set_state(DepositState.amount)
 
 
@@ -284,14 +286,12 @@ async def deposit_utr(message: Message, state: FSMContext):
         await send_log_message(message.bot, log1 + log2 + log3 + log4 + log5 + log6)
         if LOG_CHANNEL_ID:
             try:
-                NL = "
-"
                 lines = []
                 lines.append("Deposit request")
                 lines.append("User: " + str(message.from_user.id))
                 lines.append("Amount: " + str(amount))
                 lines.append("UTR: " + utr)
-                full = NL.join(lines)
+                full = NL().join(lines)
                 await message.bot.send_message(
                     LOG_CHANNEL_ID,
                     full,
@@ -550,8 +550,6 @@ async def cmd_stats(message: Message):
         total_purchases = len((await session.execute(select(Purchase))).scalars().all())
         available_accounts = len((await session.execute(select(Account).where(Account.status == "available"))).scalars().all())
         banned_users = len((await session.execute(select(User).where(User.is_banned == True))).scalars().all())
-        NL = "
-"
         lines = []
         lines.append("Stats")
         lines.append("Total users: " + str(total_users))
@@ -559,7 +557,7 @@ async def cmd_stats(message: Message):
         lines.append("Total purchases: " + str(total_purchases))
         lines.append("Available accounts: " + str(available_accounts))
         lines.append("Banned users: " + str(banned_users))
-        text = NL.join(lines)
+        text = NL().join(lines)
         await message.answer(text)
 
 
