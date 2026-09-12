@@ -31,8 +31,19 @@ class DepositState(StatesGroup):
     utr = State()
 
 
+def is_owner_id(tg_id: int) -> bool:
+    if not OWNER_ID:
+        return False
+    try:
+        return str(tg_id) == str(OWNER_ID).strip()
+    except Exception:
+        return False
+
+
 async def check_maintenance(message: Message) -> bool:
     if MAINTENANCE_MODE:
+        if is_owner_id(message.from_user.id):
+            return False
         async with async_session_maker() as session:
             role = await get_user_role(session, message.from_user.id)
             if role not in ("superadmin", "owner"):
@@ -307,7 +318,8 @@ async def cb_deposit_approve(callback: CallbackQuery):
     dep_id = int(callback.data.split("_")[3])
     async with async_session_maker() as session:
         role = await get_user_role(session, callback.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
+        is_own = is_owner_id(callback.from_user.id)
+        if role not in ("superadmin", "owner", "admin") and not is_own:
             await callback.answer("Access denied.", show_alert=True)
             return
         dep = await session.get(DepositRequest, dep_id)
@@ -353,7 +365,8 @@ async def cb_deposit_reject(callback: CallbackQuery):
     dep_id = int(callback.data.split("_")[3])
     async with async_session_maker() as session:
         role = await get_user_role(session, callback.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
+        is_own = is_owner_id(callback.from_user.id)
+        if role not in ("superadmin", "owner", "admin") and not is_own:
             await callback.answer("Access denied.", show_alert=True)
             return
         dep = await session.get(DepositRequest, dep_id)
@@ -392,7 +405,8 @@ async def cb_deposit_reject(callback: CallbackQuery):
 async def cb_admin_panel(callback: CallbackQuery):
     async with async_session_maker() as session:
         role = await get_user_role(session, callback.from_user.id)
-        if role not in ("admin", "superadmin", "owner"):
+        is_own = is_owner_id(callback.from_user.id)
+        if role not in ("admin", "superadmin", "owner") and not is_own:
             await callback.answer("Access denied.", show_alert=True)
             return
         await callback.message.edit_text("Admin panel:", reply_markup=admin_panel_keyboard())
@@ -402,9 +416,10 @@ async def cb_admin_panel(callback: CallbackQuery):
 async def cmd_admin(message: Message):
     if await check_maintenance(message):
         return
+    is_own = is_owner_id(message.from_user.id)
     async with async_session_maker() as session:
         role = await get_user_role(session, message.from_user.id)
-        if role not in ("admin", "superadmin", "owner"):
+        if role not in ("admin", "superadmin", "owner") and not is_own:
             await message.answer("Access denied.")
             return
         await message.answer("Admin panel:", reply_markup=admin_panel_keyboard())
@@ -412,14 +427,14 @@ async def cmd_admin(message: Message):
 
 @router.message(Command("dfchat"))
 async def cmd_dfchat(message: Message):
-    async with async_session_maker() as session:
-        role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner"):
-            await message.answer("Access denied.")
-            return
+    is_own = is_owner_id(message.from_user.id)
+    if not is_own:
+        async with async_session_maker() as session:
+            role = await get_user_role(session, message.from_user.id)
+            if role not in ("superadmin", "owner"):
+                await message.answer("Access denied.")
+                return
 
-    NL_CH = "
-"
     lines = []
     lines.append("Commands")
     lines.append("")
@@ -443,48 +458,16 @@ async def cmd_dfchat(message: Message):
     lines.append("/coinslist – List coins / products")
     lines.append("/maintenance – Toggle maintenance mode")
 
-    text = NL_CH.join(lines)
+    text = NL().join(lines)
     await message.answer(text)
-
-
-@router.message(Command("makeowner"))
-async def cmd_makeowner(message: Message):
-    # ONE-TIME OWNER MAKER – after using once, remove or guard this command
-    async with async_session_maker() as session:
-        tg_id = message.from_user.id
-
-        result = await session.execute(
-            select(Admin).where(Admin.tg_id == tg_id)
-        )
-        admin = result.scalar_one_or_none()
-
-        if admin:
-            admin.role = "owner"
-            if hasattr(admin, "is_owner"):
-                admin.is_owner = True
-            if hasattr(admin, "is_superadmin"):
-                admin.is_superadmin = False
-        else:
-            admin = Admin(
-                tg_id=tg_id,
-                role="owner",
-            )
-            if hasattr(admin, "is_owner"):
-                admin.is_owner = True
-            if hasattr(admin, "is_superadmin"):
-                admin.is_superadmin = False
-            session.add(admin)
-
-        await session.commit()
-
-    await message.answer("You are now owner.")
 
 
 @router.message(Command("addbalance"))
 async def cmd_addbalance(message: Message):
+    is_own = is_owner_id(message.from_user.id)
     async with async_session_maker() as session:
         role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner"):
+        if role not in ("superadmin", "owner") and not is_own:
             await message.answer("Access denied.")
             return
     args = message.text.split()
@@ -523,9 +506,10 @@ async def cmd_addbalance(message: Message):
 
 @router.message(Command("ban"))
 async def cmd_ban(message: Message):
+    is_own = is_owner_id(message.from_user.id)
     async with async_session_maker() as session:
         role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
+        if role not in ("superadmin", "owner", "admin") and not is_own:
             await message.answer("Access denied.")
             return
     args = message.text.split()
@@ -563,9 +547,10 @@ async def cmd_ban(message: Message):
 
 @router.message(Command("unban"))
 async def cmd_unban(message: Message):
+    is_own = is_owner_id(message.from_user.id)
     async with async_session_maker() as session:
         role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
+        if role not in ("superadmin", "owner", "admin") and not is_own:
             await message.answer("Access denied.")
             return
     args = message.text.split()
@@ -599,9 +584,10 @@ async def cmd_unban(message: Message):
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
+    is_own = is_owner_id(message.from_user.id)
     async with async_session_maker() as session:
         role = await get_user_role(session, message.from_user.id)
-        if role not in ("superadmin", "owner", "admin"):
+        if role not in ("superadmin", "owner", "admin") and not is_own:
             await message.answer("Access denied.")
             return
         total_users = len((await session.execute(select(User))).scalars().all())
