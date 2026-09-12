@@ -1,325 +1,1352 @@
-import asyncio, html, time, re
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
-from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
-from telegram.ext import CommandHandler, MessageHandler, CallbackQueryHandler, ChatMemberHandler, ChatJoinRequestHandler, filters
-import config, database, moderation
+from aiogram import Router, F, Bot
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from sqlalchemy import select, update, delete
+from database import (
+    async_session_maker, User, Admin, Category, Account,
+    DepositRequest, RequiredChannel, Coupon, BotSetting, LogEntry, Purchase, Transaction
+)
+from keyboards import (
+    main_menu_keyboard, categories_keyboard, accounts_keyboard,
+    force_join_keyboard, admin_panel_keyboard, approve_deposit_keyboard,
+    back_home_keyboard, deposit_amount_keyboard
+)
+from services import (
+    get_required_channels, check_force_join, grant_referral_reward,
+    apply_coupon, reserve_and_buy_account, complete_purchase, fail_purchase,
+    expire_pending_deposits, log_event, send_log_message,
+    add_balance, remove_balance, get_setting, set_setting, get_user_role
+)
+from config import OWNER_ID, MAINTENANCE_MODE
+from datetime import datetime, timedelta
 
-SETTING_GROUPS={
-'🛡 Protection':['antiflood','antilink','antispam','antiforward','anti_raid','anti_join_spam','anti_username','anti_service'],
-'🔒 Locks':['lock_links','lock_media','lock_stickers','lock_gifs','lock_polls','lock_files','lock_voice','lock_video','lock_audio','lock_forwards','lock_mentions','lock_bots','lock_contacts','lock_locations','lock_commands'],
-'👋 Members':['welcome','goodbye','verification','join_captcha','leave_ban_enabled','tag_enabled','force_rules','clean_welcome','clean_goodbye'],
-'📣 Channel':['channel_post_filter','channel_post_links','channel_post_media','channel_post_forward','channel_auto_delete','accept_requests'],
-'⚙️ Automation':['auto_delete','auto_warn','auto_mute','auto_ban','auto_pin_rules','admin_only_media','mention_lock','caps_lock','emoji_lock']}
-LABELS={k:k.replace('_',' ').title() for g in SETTING_GROUPS.values() for k in g}
+router = Router()
 
-def esc(x):return html.escape(str(x or ''))
-def kb_home():
-    return InlineKeyboardMarkup([[InlineKeyboardButton('⚙️ Settings',callback_data='settings:0'),InlineKeyboardButton('🛡 Moderation',callback_data='mod')],[InlineKeyboardButton('👋 Members',callback_data='members'),InlineKeyboardButton('📣 Channel',callback_data='channel')],[InlineKeyboardButton('📋 Logs',callback_data='logs'),InlineKeyboardButton('👮 Admins',callback_data='admins')],[InlineKeyboardButton('📊 Stats',callback_data='stats')]])
-def kb_settings(row,page=0):
-    groups=list(SETTING_GROUPS); name=list(SETTING_GROUPS)[page%len(groups)]; keys=SETTING_GROUPS[name]; rows=[]
-    for i in range(0,len(keys),2):
-        rows.append([InlineKeyboardButton(('✅ ' if row[k] else '❌ ')+LABELS[k],callback_data=f't:{k}') for k in keys[i:i+2]])
-    nav=[]
-    if page>0:nav.append(InlineKeyboardButton('◀️',callback_data=f'settings:{page-1}'))
-    nav.append(InlineKeyboardButton(f'{page+1}/{len(groups)}',callback_data='noop'))
-    if page<len(groups)-1:nav.append(InlineKeyboardButton('▶️',callback_data=f'settings:{page+1}'))
-    rows.append(nav); rows.append([InlineKeyboardButton('🔙 Home',callback_data='home')]); return InlineKeyboardMarkup(rows)
 
-async def start(update,context): await update.message.reply_text('🛡️ <b>GroupGuard V9999999 Ultra</b>\nAdd me as admin, then run /setup in your group or channel.',parse_mode=ParseMode.HTML)
-async def setup(update,context):
-    if update.effective_chat.type not in ('group','supergroup','channel'):return
-    database.ensure_chat(update.effective_chat.id,update.effective_chat.title or '',update.effective_chat.type)
-    await update.effective_message.reply_text('🛡️ <b>GroupGuard Ultra is ready.</b>\nOpen the control panel to configure everything.',parse_mode=ParseMode.HTML,reply_markup=kb_home())
-async def panel(update,context):
-    if await moderation.actor_is_mod(update,context): await update.effective_message.reply_text('🛡️ <b>Control Panel</b>',parse_mode=ParseMode.HTML,reply_markup=kb_home())
+# ---------- FSM States ----------
 
-async def callback(update,context):
-    q=update.callback_query
-    try:await q.answer()
-    except BadRequest:pass
-    if q.data=='noop':return
-    chat_id=q.message.chat.id
-    if not await moderation.actor_is_mod(update,context,q.from_user.id):return
-    row=database.get_chat(chat_id)
-    if not row:database.ensure_chat(chat_id,q.message.chat.title or '',q.message.chat.type);row=database.get_chat(chat_id)
-    if q.data=='home':await q.edit_message_text('🛡️ <b>GroupGuard Ultra</b>',parse_mode=ParseMode.HTML,reply_markup=kb_home());return
-    if q.data.startswith('settings:'):
-        page=int(q.data.split(':')[1]);await q.edit_message_text('⚙️ <b>All Settings</b>\nToggle protection and automation modules.',parse_mode=ParseMode.HTML,reply_markup=kb_settings(row,page));return
-    if q.data.startswith('t:'):
-        key=q.data[2:];database.set_setting(chat_id,key,0 if row[key] else 1);row=database.get_chat(chat_id);await q.edit_message_reply_markup(reply_markup=kb_settings(row,0));return
-    if q.data=='mod':text='🛡 <b>Moderation</b>\n/ban /unban /kick /mute /unmute /warn /unwarn /purge /pin /unpin /slowmode /lock /unlock';mark=kb_home()
-    elif q.data=='members':text='👋 /welcome /setwelcome /goodbye /setgoodbye /verify /setrules /rules /whitelist';mark=kb_home()
-    elif q.data=='channel':text='📣 /acceptreq CHAT /stopaccreq CHAT\n/linkleave GROUP CHANNEL\n/unlinkleave GROUP CHANNEL\n/channelstats';mark=kb_home()
-    elif q.data=='logs':
-        logs=database.recent_logs(chat_id,25);text='📋 <b>Recent Logs</b>\n'+('\n'.join(f"• {esc(x['action'])} → <code>{x['target_id']}</code> {esc(x['details'])}" for x in logs) or 'No logs yet.');mark=kb_home()
-    elif q.data=='admins':
-        try:a=await context.bot.get_chat_administrators(chat_id);text='👮 <b>Telegram Admins</b>\n'+'\n'.join(f'• {esc(x.user.first_name)} — <code>{x.user.id}</code>' for x in a)
-        except Exception:text='Unable to read admins.'
-        mark=kb_home()
-    elif q.data=='stats':
-        s=database.stats(chat_id);text=f"📊 <b>Stats</b>\nUsers seen: {s['users']}\nWarnings: {s['warnings']}\nFilters: {s['filters']}\nLogs: {s['logs']}\nCustom admins: {s['admins']}";mark=kb_home()
-    else:return
-    try:await q.edit_message_text(text,parse_mode=ParseMode.HTML,reply_markup=mark)
-    except BadRequest:pass
+class DepositState(StatesGroup):
+    amount = State()
+    utr = State()
 
-async def remember(update,context):
-    chat=update.effective_chat
-    if not chat or chat.type not in ('group','supergroup','channel'):return
-    database.ensure_chat(chat.id,chat.title or '',chat.type)
-    if update.effective_user:database.upsert_user(chat.id,update.effective_user)
 
-async def verification_cmd(update,context):
-    if not context.args:await update.message.reply_text('Usage: /verify CODE');return
-    if database.is_verified(update.effective_chat.id,update.effective_user.id) or len(context.args[0])<4:
-        token=context.args[0].upper()
-        with database.LOCK,database.connect() as c:
-            r=c.execute('SELECT token,expires_at FROM verification WHERE chat_id=? AND user_id=?',(update.effective_chat.id,update.effective_user.id)).fetchone()
-            if r and r['token']==token and r['expires_at']>int(time.time()):c.execute('UPDATE verification SET verified=1 WHERE chat_id=? AND user_id=?',(update.effective_chat.id,update.effective_user.id));c.commit()
-            else:r=None
-        if r:
-            try:await context.bot.restrict_chat_member(update.effective_chat.id,update.effective_user.id,permissions=ChatPermissions(can_send_messages=True,can_send_audios=True,can_send_documents=True,can_send_photos=True,can_send_videos=True,can_send_video_notes=True,can_send_voice_notes=True,can_send_polls=True,can_send_other_messages=True,can_add_web_page_previews=True))
-            except:pass
-            await update.message.reply_text('✅ Verification complete.');return
-    await update.message.reply_text('❌ Invalid or expired code.')
+class BroadcastState(StatesGroup):
+    text = State()
 
-async def moderation_message(update,context):
-    msg=update.effective_message;chat=update.effective_chat;user=update.effective_user
-    if not msg or not user or chat.type not in ('group','supergroup','channel'):return
-    database.ensure_chat(chat.id,chat.title or '',chat.type);database.upsert_user(chat.id,user)
-    if await moderation.actor_is_mod(update,context,user.id) or database.is_whitelisted(chat.id,user.id):return
-    row=database.get_chat(chat.id);text=msg.text or msg.caption or '';low=text.lower()
-    if chat.type=='channel':
-        if row['channel_post_links'] and moderation.URL_RE.search(text):
-            try:await msg.delete()
-            except:pass
-            database.add_log(chat.id,user.id,'channel_delete_link',user.id,'channel post');return
-        if row['channel_post_forward'] and msg.forward_origin:
-            try:await msg.delete()
-            except:pass
-            return
-    if row['verification'] and not database.is_verified(chat.id,user.id) and chat.type in ('group','supergroup'):
-        try:await msg.delete()
-        except:pass
-        token=moderation.random_token();database.set_verification(chat.id,user.id,token,int(time.time())+row['verify_timeout'])
-        try:
-            await context.bot.restrict_chat_member(chat.id,user.id,permissions=ChatPermissions(can_send_messages=False))
-            await chat.send_message(f'🧩 {moderation.mention(user)}\nVerify with <code>/verify {token}</code>',parse_mode=ParseMode.HTML)
-        except:pass
+
+class AddCategoryState(StatesGroup):
+    name = State()
+    rate = State()
+
+
+class AddAccountState(StatesGroup):
+    category_id = State()
+    phone = State()
+
+
+# ---------- Helpers ----------
+
+async def check_maintenance(message: Message) -> bool:
+    if MAINTENANCE_MODE:
+        async with async_session_maker() as session:
+            role = await get_user_role(session, message.from_user.id)
+            if role not in ("superadmin", "owner"):
+                await message.answer("Bot is in maintenance mode. Try later.")
+                return True
+    return False
+
+
+# ---------- User: start & force join ----------
+
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    if await check_maintenance(message):
         return
-    if row['antilink'] and moderation.URL_RE.search(text):await moderation.punish(context,update,'delete',user.id,'link');return
-    if row['antiforward'] and msg.forward_origin:await moderation.punish(context,update,'delete',user.id,'forward');return
-    if row['antiflood'] and moderation.flood_state(context,chat.id,user.id,row['flood_window'])>row['flood_limit']:await moderation.punish(context,update,'mute',user.id,'flood');return
-    if row['caps_lock'] and len(text)>15 and sum(1 for x in text if x.isalpha())>8 and sum(1 for x in text if x.isupper())/max(1,sum(1 for x in text if x.isalpha()))>.75:await moderation.punish(context,update,'delete',user.id,'caps');return
-    if row['mention_lock'] and '@' in text:await moderation.punish(context,update,'delete',user.id,'mentions');return
-    checks=[('lock_links',moderation.URL_RE.search(text)),('lock_media',bool(msg.effective_attachment)),('lock_stickers',bool(msg.sticker)),('lock_gifs',bool(msg.animation)),('lock_polls',bool(msg.poll or msg.poll_option_ids)),('lock_files',bool(msg.document)),('lock_voice',bool(msg.voice or msg.video_note)),('lock_video',bool(msg.video)),('lock_audio',bool(msg.audio)),('lock_forwards',bool(msg.forward_origin)),('lock_contacts',bool(msg.contact)),('lock_locations',bool(msg.location)),('lock_bots',bool(msg.via_bot))]
-    for key,hit in checks:
-        if row[key] and hit:await moderation.punish(context,update,'delete',user.id,key);return
-    for f in database.filters(chat.id):
-        if f['keyword'] in low:
-            if f['delete_message']:
-                try:await msg.delete()
-                except:pass
-            await chat.send_message(f['response'],reply_to_message_id=msg.id);database.add_log(chat.id,user.id,'filter',user.id,f['keyword']);return
-    if any(w in low for w in database.words(chat.id)):await moderation.punish(context,update,'delete',user.id,'banned word');return
 
-async def new_member(update,context):
-    cm=update.chat_member;chat=cm.chat;u=cm.new_chat_member.user;database.ensure_chat(chat.id,chat.title or '',chat.type);database.upsert_user(chat.id,u);row=database.get_chat(chat.id)
-    old,new=cm.old_chat_member.status,cm.new_chat_member.status
-    if new in ('member','administrator') and old in ('left','kicked'):
-        if row['anti_raid'] and moderation.raid_state(context,chat.id,row['raid_window'])>=row['raid_limit']:
-            database.set_raid(chat.id,1)
-            try:await context.bot.ban_chat_member(chat.id,u.id)
-            except:pass
+    args = message.text.split(maxsplit=1)
+    ref_code = args[1] if len(args) > 1 else None
+
+    async with async_session_maker() as session:
+        stmt = select(User).where(User.tg_id == message.from_user.id)
+        res = await session.execute(stmt)
+        user = res.scalar_one_or_none()
+
+        if not user:
+            user = User(
+                tg_id=message.from_user.id,
+                username=message.from_user.username,
+                first_name=message.from_user.first_name,
+                last_name=message.from_user.last_name,
+                referred_by=int(ref_code) if ref_code and ref_code.isdigit() else None,
+            )
+            session.add(user)
+            await session.commit()
+            await log_event(session, "user_registered", user.tg_id, None, f"username={user.username}")
+            await send_log_message(message.bot, f"👤 New user: {user.tg_id} @{user.username or 'N/A'}")
+
+        channels = await get_required_channels(session)
+        if channels:
+            joined, missing = await check_force_join(message.bot, message.from_user.id, channels)
+            if not joined:
+                kb = force_join_keyboard(missing)
+                await message.answer("Welcome! Please join all required channels and press Verify.", reply_markup=kb)
+                return
+
+        if user.referred_by and not user.referral_rewarded:
+            await grant_referral_reward(session, user)
+            await send_log_message(message.bot, f"🎁 Referral reward granted to {user.referred_by} for user {user.tg_id}")
+
+        await message.answer("Welcome back! Use the menu below.", reply_markup=main_menu_keyboard())
+        await log_event(session, "user_started", user.tg_id, None, None)
+
+
+@router.callback_query(F.data == "force_verify")
+async def cb_force_verify(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        stmt = select(User).where(User.tg_id == callback.from_user.id)
+        res = await session.execute(stmt)
+        user = res.scalar_one_or_none()
+        if not user:
+            await callback.answer("User not found.", show_alert=True)
             return
-        if row['welcome'] and chat.type in ('group','supergroup'):
+
+        channels = await get_required_channels(session)
+        if not channels:
+            await callback.answer("No required channels.", show_alert=True)
+            await callback.message.edit_text("All channels verified. Use the menu below.", reply_markup=main_menu_keyboard())
+            return
+
+        joined, missing = await check_force_join(callback.bot, callback.from_user.id, channels)
+        if not joined:
+            kb = force_join_keyboard(missing)
+            await callback.message.edit_text("You haven't joined all channels yet.", reply_markup=kb)
+            return
+
+        if user.referred_by and not user.referral_rewarded:
+            await grant_referral_reward(session, user)
+            await send_log_message(callback.bot, f"🎁 Referral reward granted to {user.referred_by} for user {user.tg_id}")
+
+        await callback.message.edit_text("Verification successful! Use the menu below.", reply_markup=main_menu_keyboard())
+
+
+# ---------- User: menu, profile, balance ----------
+
+@router.callback_query(F.data == "menu_home")
+async def cb_home(callback: CallbackQuery):
+    await callback.message.edit_text("Main menu:", reply_markup=main_menu_keyboard())
+
+
+@router.callback_query(F.data == "user_profile")
+async def cb_profile(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        stmt = select(User).where(User.tg_id == callback.from_user.id)
+        res = await session.execute(stmt)
+        user = res.scalar_one_or_none()
+        if not user:
+            await callback.answer("User not found.", show_alert=True)
+            return
+        text = (
+            f"👤 Profile
+"
+            f"ID: {user.tg_id}
+"
+            f"Name: {user.first_name or ''} {user.last_name or ''}
+"
+            f"Username: @{user.username or 'N/A'}
+"
+            f"Balance: ₹{user.balance:.2f}
+"
+            f"Referred by: {user.referred_by or 'None'}
+"
+        )
+        await callback.message.edit_text(text, reply_markup=back_home_keyboard())
+
+
+@router.callback_query(F.data == "user_balance")
+async def cb_balance(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        stmt = select(User).where(User.tg_id == callback.from_user.id)
+        res = await session.execute(stmt)
+        user = res.scalar_one_or_none()
+        if not user:
+            await callback.answer("User not found.", show_alert=True)
+            return
+        await callback.message.edit_text(f"💰 Your balance: ₹{user.balance:.2f}", reply_markup=back_home_keyboard())
+
+
+# ---------- User: products ----------
+
+@router.callback_query(F.data == "user_products")
+async def cb_products(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        stmt = select(Category).where(Category.is_active == True)
+        res = await session.execute(stmt)
+        cats = res.scalars().all()
+        await callback.message.edit_text("Choose a category:", reply_markup=categories_keyboard(cats))
+
+
+@router.callback_query(F.data.startswith("cat_"))
+async def cb_category(callback: CallbackQuery):
+    cat_id = int(callback.data.split("_")[1])
+    async with async_session_maker() as session:
+        stmt = select(Account).where(Account.category_id == cat_id, Account.status == "available")
+        res = await session.execute(stmt)
+        accs = res.scalars().all()
+        if not accs:
+            await callback.answer("No accounts available.", show_alert=True)
+            return
+        kb = accounts_keyboard(accs)
+        await callback.message.edit_text("Select an account to buy:", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("buy_acc_"))
+async def cb_buy_account(callback: CallbackQuery):
+    acc_id = int(callback.data.split("_")[3])
+    async with async_session_maker() as session:
+        stmt = select(User).where(User.tg_id == callback.from_user.id)
+        res = await session.execute(stmt)
+        user = res.scalar_one_or_none()
+        if not user:
+            await callback.answer("User not found.", show_alert=True)
+            return
+
+        stmt = select(Account).where(Account.id == acc_id)
+        res = await session.execute(stmt)
+        account = res.scalar_one_or_none()
+        if not account or account.status != "available":
+            await callback.answer("Account no longer available.", show_alert=True)
+            return
+
+        ok, msg, price = await reserve_and_buy_account(session, user, account)
+        if not ok:
+            await fail_purchase(session, user, account, price if price else 0.0)
+            await callback.answer(msg, show_alert=True)
+            return
+
+        # TODO: Integrate full MTProto OTP flow here.
+        # For now, complete purchase immediately.
+        await complete_purchase(session, user, account, price)
+        await session.commit()
+
+        await callback.message.edit_text(
+            f"✅ Purchase successful!
+Account #{account.id} bought for ₹{price}.
+"
+            f"Phone: {account.phone}
+Session delivered (simplified).",
+            reply_markup=back_home_keyboard()
+        )
+        await send_log_message(callback.bot, f"🛒 Purchase: user {user.tg_id} bought account #{account.id} for ₹{price}")
+
+
+# ---------- User: deposit ----------
+
+@router.callback_query(F.data == "user_deposit")
+async def cb_deposit_menu(callback: CallbackQuery):
+    await callback.message.edit_text("💰 Deposit
+Enter amount to deposit:", reply_markup=deposit_amount_keyboard())
+
+
+@router.message(Command("deposit"))
+async def cmd_deposit(message: Message):
+    if await check_maintenance(message):
+        return
+    await message.answer("💰 Deposit
+Enter amount to deposit:")
+    await message.state.set_state(DepositState.amount)
+
+
+@router.message(StateFilter(DepositState.amount))
+async def deposit_amount(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.strip())
+        if amount <= 0:
+            await message.answer("Invalid amount. Send a positive number.")
+            return
+    except ValueError:
+        await message.answer("Invalid amount. Send a number.")
+        return
+
+    await state.update_data(amount=amount)
+    await message.answer("Send UTR number for this deposit:")
+    await state.set_state(DepositState.utr)
+
+
+@router.message(StateFilter(DepositState.utr))
+async def deposit_utr(message: Message, state: FSMContext):
+    utr = message.text.strip()
+    if not utr:
+        await message.answer("UTR cannot be empty.")
+        return
+
+    data = await state.get_data()
+    amount = data["amount"]
+
+    async with async_session_maker() as session:
+        stmt = select(DepositRequest).where(
+            DepositRequest.user_tg_id == message.from_user.id,
+            DepositRequest.status == "pending"
+        )
+        res = await session.execute(stmt)
+        pending = res.scalars().all()
+        if len(pending) >= 5:
+            await message.answer("You already have 5 pending deposits.")
+            await state.clear()
+            return
+
+        expires_at = datetime.utcnow() + timedelta(minutes=30)
+        dep = DepositRequest(
+            user_tg_id=message.from_user.id,
+            amount=amount,
+            utr=utr,
+            expires_at=expires_at
+        )
+        session.add(dep)
+        await session.commit()
+
+        await message.answer(f"Deposit request created: ₹{amount}, UTR: {utr}. Waiting for approval.")
+        kb = approve_deposit_keyboard(dep.id)
+        await send_log_message(
+            message.bot,
+            f"💰 Deposit request: user {message.from_user.id}, ₹{amount}, UTR: {utr}",
+        )
+        # Send approval message to log channel with buttons
+        if LOG_CHANNEL_ID:
             try:
-                m=await chat.send_message(row['welcome_text'] or f'👋 Welcome {moderation.mention(u)}!',parse_mode=ParseMode.HTML)
-                if row['clean_welcome']:context.job_queue.run_once(delete_job,row['delete_seconds'],data=(chat.id,m.message_id))
-            except:pass
-    if new in ('left','kicked') and old in ('member','administrator'):
-        if row['goodbye'] and chat.type in ('group','supergroup'):
-            try:await chat.send_message(row['goodbye_text'] or f'🚪 {esc(u.first_name)} left.',parse_mode=ParseMode.HTML)
-            except:pass
-        if row['leave_ban_enabled']:
-            targets=[x['linked_chat_id'] for x in database.linked(chat.id,'leave_ban')]
-            for target in targets:
-                try:await context.bot.ban_chat_member(target,u.id);database.add_log(target,context.bot.id,'leave_ban',u.id,f'source={chat.id}')
-                except:pass
+                await message.bot.send_message(
+                    LOG_CHANNEL_ID,
+                    f"💰 Deposit request
+User: {message.from_user.id}
+Amount: ₹{amount}
+UTR: {utr}",
+                    reply_markup=kb
+                )
+            except Exception:
+                pass
+        await state.clear()
 
-async def join_request(update,context):
-    r=update.chat_join_request;database.ensure_chat(r.chat.id,r.chat.title or '',r.chat.type);database.add_request(r.chat.id,r.from_user)
-    row=database.get_chat(r.chat.id)
-    if row['accept_requests']:
-        try:await context.bot.approve_chat_join_request(r.chat.id,r.from_user.id);database.remove_request(r.chat.id,r.from_user.id);database.add_log(r.chat.id,context.bot.id,'accept_request',r.from_user.id,'auto')
-        except TelegramError:pass
 
-async def scheduled_worker(context):
-    for row in database.due_schedules():
-        try:await context.bot.send_message(row['chat_id'],row['text']);database.reschedule_or_deactivate(row)
-        except:database.reschedule_or_deactivate(row)
-async def delete_job(context):
-    chat_id,msg_id=context.job.data
-    try:await context.bot.delete_message(chat_id,msg_id)
-    except:pass
+@router.callback_query(F.data.startswith("deposit_approve_"))
+async def cb_deposit_approve(callback: CallbackQuery):
+    dep_id = int(callback.data.split("_")[3])
+    async with async_session_maker() as session:
+        role = await get_user_role(session, callback.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await callback.answer("Access denied.", show_alert=True)
+            return
 
-async def admin_cmd(update,context):
-    if update.effective_user.id!=config.OWNER_ID and not await moderation.actor_is_mod(update,context):return
-    if not context.args or not update.message:await update.message.reply_text('Usage: /admin USER_ID [role]');return
-    try:uid=int(context.args[0]);role=context.args[1] if len(context.args)>1 else 'mod';database.add_admin(update.effective_chat.id,uid,role,update.effective_user.id);await update.message.reply_text(f'✅ Added {uid} as {role}.')
-    except:await update.message.reply_text('❌ Invalid user ID.')
-async def unadmin(update,context):
-    if update.effective_user.id!=config.OWNER_ID:return
-    if context.args:database.remove_admin(update.effective_chat.id,int(context.args[0]));await update.message.reply_text('✅ Removed.')
-async def adminlist(update,context):
-    rows=database.list_admins(update.effective_chat.id);await update.message.reply_text('👮\n'+('\n'.join(f"• {x['user_id']} — {x['role']}" for x in rows) or 'No custom admins.'))
+        dep = await session.get(DepositRequest, dep_id)
+        if not dep or dep.status != "pending":
+            await callback.answer("Invalid or expired deposit.", show_alert=True)
+            return
 
-def target_from(update,context):
-    if update.message and update.message.reply_to_message:return update.message.reply_to_message.from_user
-    if context.args:
-        try:return type('U',(),{'id':int(context.args[0]),'first_name':str(context.args[0])})()
-        except:return None
-    return None
+        user = await session.get(User, dep.user_tg_id)
+        if not user:
+            await callback.answer("User not found.", show_alert=True)
+            return
 
-async def moderate_cmd(update,context):
-    if not await moderation.actor_is_mod(update,context):return
-    cmd=update.message.text.split()[0].split('@')[0][1:].lower();target=target_from(update,context)
-    if not target:await update.message.reply_text('Reply to a user or give a numeric USER_ID.');return
-    cid=update.effective_chat.id
+        user.balance += dep.amount
+        dep.status = "approved"
+        dep.approved_by = callback.from_user.id
+        txn = Transaction(user_tg_id=user.tg_id, amount=dep.amount, type="deposit", description=f"Deposit approved: UTR {dep.utr}")
+        session.add(txn)
+        await session.commit()
+
+        await callback.message.edit_text(f"✅ Deposit approved: ₹{dep.amount} added to user {user.tg_id}.")
+        await send_log_message(callback.bot, f"✅ Deposit approved: user {user.tg_id}, ₹{dep.amount}, by {callback.from_user.id}")
+        try:
+            await callback.bot.send_message(user.tg_id, f"✅ Your deposit of ₹{dep.amount} (UTR: {dep.utr}) has been approved.")
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("deposit_reject_"))
+async def cb_deposit_reject(callback: CallbackQuery):
+    dep_id = int(callback.data.split("_")[3])
+    async with async_session_maker() as session:
+        role = await get_user_role(session, callback.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await callback.answer("Access denied.", show_alert=True)
+            return
+
+        dep = await session.get(DepositRequest, dep_id)
+        if not dep or dep.status != "pending":
+            await callback.answer("Invalid or expired deposit.", show_alert=True)
+            return
+
+        user = await session.get(User, dep.user_tg_id)
+        dep.status = "rejected"
+        dep.approved_by = callback.from_user.id
+        await session.commit()
+
+        await callback.message.edit_text(f"❌ Deposit rejected: ₹{dep.amount} for user {user.tg_id}.")
+        await send_log_message(callback.bot, f"❌ Deposit rejected: user {user.tg_id}, ₹{dep.amount}, by {callback.from_user.id}")
+        try:
+            await callback.bot.send_message(user.tg_id, f"❌ Your deposit of ₹{dep.amount} (UTR: {dep.utr}) has been rejected.")
+        except Exception:
+            pass
+
+
+# ---------- Admin panel ----------
+
+@router.callback_query(F.data == "admin_panel")
+async def cb_admin_panel(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, callback.from_user.id)
+        if role not in ("admin", "superadmin", "owner"):
+            await callback.answer("Access denied.", show_alert=True)
+            return
+        await callback.message.edit_text("Admin panel:", reply_markup=admin_panel_keyboard())
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if await check_maintenance(message):
+        return
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("admin", "superadmin", "owner"):
+            await message.answer("Access denied.")
+            return
+        await message.answer("Admin panel:", reply_markup=admin_panel_keyboard())
+
+
+# ---------- /dfchat, /coinslist ----------
+
+@router.message(Command("dfchat"))
+async def cmd_dfchat(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner"):
+            await message.answer("Access denied.")
+            return
+        text = (
+            "📜 Superadmin & Owner Commands:
+"
+            "/addadmin, /removeadmin
+"
+            "/addsuperadmin, /removesuperadmin (owner only)
+"
+            "/addbalance, /removebalance
+"
+            "/ban, /unban
+"
+            "/broadcast
+"
+            "/addcategory, /editcategory, /deletecategory
+"
+            "/addaccount, /editaccount, /deleteaccount
+"
+            "/addchannel, /removechannel
+"
+            "/addcoupon, /editcoupon, /deletecoupon
+"
+            "/stats, /coinslist
+"
+            "/maintenance
+"
+        )
+        await message.answer(text)
+
+
+@router.message(Command("coinslist"))
+async def cmd_coinslist(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner"):
+            await message.answer("Access denied.")
+            return
+        stmt = select(User).where(User.balance >= 2.0).order_by(User.balance.desc())
+        res = await session.execute(stmt)
+        users = res.scalars().all()
+        lines = [f"ID: {u.tg_id}, Balance: ₹{u.balance:.2f}, @{u.username or 'N/A'}" for u in users]
+        text = "💰 Users with balance ≥ ₹2:
+" + "
+".join(lines) if lines else "No users."
+        await message.answer(text)
+
+
+# ---------- Add/Remove Balance ----------
+
+@router.message(Command("addbalance"))
+async def cmd_addbalance(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer("Usage: /addbalance <user_id> <amount>")
+        return
+
     try:
-        if cmd=='ban':await context.bot.ban_chat_member(cid,target.id);msg='banned'
-        elif cmd=='unban':await context.bot.unban_chat_member(cid,target.id,only_if_banned=True);msg='unbanned'
-        elif cmd=='kick':await context.bot.ban_chat_member(cid,target.id);await context.bot.unban_chat_member(cid,target.id);msg='kicked'
-        elif cmd=='mute':
-            mins=int(context.args[1]) if len(context.args)>1 and context.args[1].isdigit() else database.get_chat(cid)['mute_minutes'];await context.bot.restrict_chat_member(cid,target.id,permissions=ChatPermissions(can_send_messages=False),until_date=int(time.time())+mins*60);msg=f'muted {mins}m'
-        elif cmd=='unmute':await context.bot.restrict_chat_member(cid,target.id,permissions=ChatPermissions(can_send_messages=True,can_send_audios=True,can_send_documents=True,can_send_photos=True,can_send_videos=True,can_send_video_notes=True,can_send_voice_notes=True,can_send_polls=True,can_send_other_messages=True,can_add_web_page_previews=True));msg='unmuted'
-        elif cmd=='warn':
-            n=database.warn(cid,target.id);limit=database.get_chat(cid)['warn_limit'];msg=f'warning {n}/{limit}';
-            if n>=limit:await context.bot.ban_chat_member(cid,target.id);database.clear_warnings(cid,target.id);msg+=' — auto-banned'
-        elif cmd=='unwarn':database.clear_warnings(cid,target.id);msg='warnings cleared'
-        database.add_log(cid,update.effective_user.id,cmd,target.id,'manual');await update.message.reply_text(f'✅ {msg} — <code>{target.id}</code>',parse_mode=ParseMode.HTML)
-    except TelegramError as e:await update.message.reply_text(f'❌ {e}')
+        user_id = int(args[1])
+        amount = float(args[2])
+    except ValueError:
+        await message.answer("Invalid user_id or amount.")
+        return
 
-async def purge(update,context):
-    if not await moderation.actor_is_mod(update,context):return
-    n=int(context.args[0]) if context.args and context.args[0].isdigit() else 10;start=update.message.message_id
-    deleted=0
-    for mid in range(start,max(0,start-n),-1):
-        try:await context.bot.delete_message(update.effective_chat.id,mid);deleted+=1
-        except:pass
-    await update.message.reply_text(f'🧹 Deleted {deleted} messages.')
-async def pin(update,context):
-    if not await moderation.actor_is_mod(update,context):return
-    m=update.message.reply_to_message
-    if not m:return await update.message.reply_text('Reply to a message.')
-    try:await m.pin();await update.message.reply_text('📌 Pinned.')
-    except TelegramError as e:await update.message.reply_text(f'❌ {e}')
-async def unpin(update,context):
-    if not await moderation.actor_is_mod(update,context):return
-    try:await context.bot.unpin_chat_message(update.effective_chat.id);await update.message.reply_text('📍 Unpinned.')
-    except TelegramError as e:await update.message.reply_text(f'❌ {e}')
-async def slowmode(update,context):
-    if not await moderation.actor_is_mod(update,context):return
-    sec=int(context.args[0]) if context.args and context.args[0].isdigit() else 0
-    try:await context.bot.set_chat_permissions(update.effective_chat.id,ChatPermissions(can_send_messages=True,can_send_audios=True,can_send_documents=True,can_send_photos=True,can_send_videos=True,can_send_video_notes=True,can_send_voice_notes=True,can_send_polls=True,can_send_other_messages=True,can_add_web_page_previews=True));await update.message.reply_text(f'🐢 Slowmode command received: {sec}s (Telegram clients may expose slow mode separately).')
-    except TelegramError as e:await update.message.reply_text(f'❌ {e}')
-async def lock_cmd(update,context):
-    if not await moderation.actor_is_mod(update,context):return
-    key=context.args[0].lower() if context.args else 'links';mapping={'links':'lock_links','media':'lock_media','stickers':'lock_stickers','gifs':'lock_gifs','polls':'lock_polls','files':'lock_files','voice':'lock_voice','video':'lock_video','audio':'lock_audio','forwards':'lock_forwards','mentions':'lock_mentions','bots':'lock_bots','commands':'lock_commands'}
-    if key not in mapping:return await update.message.reply_text('Usage: /lock links|media|stickers|gifs|polls|files|voice|video|audio|forwards|mentions|bots|commands')
-    database.set_setting(update.effective_chat.id,mapping[key],1);await update.message.reply_text(f'🔒 {key} locked.')
-async def unlock_cmd(update,context):
-    if not await moderation.actor_is_mod(update,context):return
-    key=context.args[0].lower() if context.args else 'links';mapping={'links':'lock_links','media':'lock_media','stickers':'lock_stickers','gifs':'lock_gifs','polls':'lock_polls','files':'lock_files','voice':'lock_voice','video':'lock_video','audio':'lock_audio','forwards':'lock_forwards','mentions':'lock_mentions','bots':'lock_bots','commands':'lock_commands'}
-    if key in mapping:database.set_setting(update.effective_chat.id,mapping[key],0);await update.message.reply_text(f'🔓 {key} unlocked.')
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            await message.answer("User not found.")
+            return
+        await add_balance(session, user.tg_id, amount, f"Added by {message.from_user.id}")
+        await session.commit()
+        await message.answer(f"✅ Added ₹{amount} to user {user.tg_id}. New balance: ₹{user.balance + amount:.2f}")
+        await send_log_message(message.bot, f"💰 Add balance: user {user.tg_id} +₹{amount} by {message.from_user.id}")
 
-async def toggle(update,context):
-    if not await moderation.actor_is_mod(update,context):return
-    cmd=update.message.text.split()[0].split('@')[0][1:].lower();mapping={'welcome':'welcome','goodbye':'goodbye','verify':'verification','verification':'verification','antilink':'antilink','antiflood':'antiflood','antiforward':'antiforward','antispam':'antispam','antiraid':'anti_raid','leaveban':'leave_ban_enabled','acceptreq':'accept_requests','tagging':'tag_enabled'}
-    if cmd not in mapping:return
-    if not context.args:return await update.message.reply_text(f'Usage: /{cmd} on|off')
-    database.set_setting(update.effective_chat.id,mapping[cmd],int(context.args[0].lower() in ('on','yes','1','true')));await update.message.reply_text('✅ Updated.')
-async def set_text(update,context):
-    if not await moderation.actor_is_mod(update,context):return
-    cmd=update.message.text.split()[0].split('@')[0][1:];text=update.message.text.partition(' ')[2].strip();key={'setwelcome':'welcome_text','setgoodbye':'goodbye_text','setrules':'rules'}[cmd]
-    if not text:return await update.message.reply_text(f'Usage: /{cmd} TEXT')
-    database.set_setting(update.effective_chat.id,key,text);await update.message.reply_text('✅ Saved.')
-async def rules(update,context):
-    r=database.get_chat(update.effective_chat.id);await update.message.reply_text(r['rules'] or '📜 No rules configured.',parse_mode=ParseMode.HTML)
-async def filter_cmd(update,context):
-    if not await moderation.actor_is_mod(update,context) or len(context.args)<2:return await update.message.reply_text('Usage: /filter KEYWORD RESPONSE')
-    database.add_filter(update.effective_chat.id,context.args[0],' '.join(context.args[1:]));await update.message.reply_text('✅ Filter saved.')
-async def delfilter(update,context):
-    if not await moderation.actor_is_mod(update,context) or not context.args:return
-    await update.message.reply_text('✅ Deleted.' if database.del_filter(update.effective_chat.id,context.args[0]) else '❌ Not found.')
-async def badword(update,context):
-    if not await moderation.actor_is_mod(update,context) or len(context.args)<2:return await update.message.reply_text('Usage: /badword add|del WORD')
-    op,w=context.args[0].lower(),context.args[1];ok=False
-    if op=='add':database.add_word(update.effective_chat.id,w,update.effective_user.id);ok=True
-    elif op=='del':ok=database.del_word(update.effective_chat.id,w)
-    await update.message.reply_text('✅ Done.' if ok else '❌ Not found.')
-async def linkleave(update,context):
-    if not await moderation.actor_is_mod(update,context) or len(context.args)<2:return await update.message.reply_text('Usage: /linkleave GROUP_ID CHANNEL_ID')
-    try:
-        group=moderation.parse_target(context.args[0]);channel=moderation.parse_target(context.args[1]);g=await context.bot.get_chat(group);c=await context.bot.get_chat(channel);database.ensure_chat(g.id,g.title or '',g.type);database.ensure_chat(c.id,c.title or '',c.type);database.add_link(c.id,g.id,'leave_ban');database.set_setting(c.id,'leave_ban_enabled',1);await update.message.reply_text(f'🔗 If a user leaves {c.title}, the bot will ban them from {g.title}.')
-    except TelegramError as e:await update.message.reply_text(f'❌ {e}')
-async def unlinkleave(update,context):
-    if not await moderation.actor_is_mod(update,context) or len(context.args)<2:return await update.message.reply_text('Usage: /unlinkleave GROUP_ID CHANNEL_ID')
-    try:
-        g=moderation.parse_target(context.args[0]);c=moderation.parse_target(context.args[1]);g=await context.bot.get_chat(g);c=await context.bot.get_chat(c);database.del_link(c.id,g.id,'leave_ban');await update.message.reply_text('✅ Leave-ban link removed.')
-    except:pass
-async def acceptreq(update,context):
-    if not await moderation.actor_is_mod(update,context) or not context.args:return await update.message.reply_text('Usage: /acceptreq CHANNEL_LINK_OR_ID')
-    try:
-        target=await context.bot.get_chat(moderation.parse_target(context.args[0]));database.ensure_chat(target.id,target.title or '',target.type);database.set_setting(target.id,'accept_requests',1);await update.message.reply_text(f'✅ Auto-accept enabled for {target.title}.')
-    except TelegramError as e:await update.message.reply_text(f'❌ {e}')
-async def stopaccreq(update,context):
-    if not await moderation.actor_is_mod(update,context) or not context.args:return await update.message.reply_text('Usage: /stopaccreq CHANNEL_LINK_OR_ID')
-    try:
-        target=await context.bot.get_chat(moderation.parse_target(context.args[0]));database.ensure_chat(target.id,target.title or '',target.type);database.set_setting(target.id,'accept_requests',0);await update.message.reply_text(f'🛑 Auto-accept disabled for {target.title}.')
-    except TelegramError as e:await update.message.reply_text(f'❌ {e}')
-async def all_tag(update,context):
-    if not await moderation.actor_is_mod(update,context):return
-    users=database.known_users(update.effective_chat.id)
-    if not users:return await update.message.reply_text('No observed members yet.')
-    parts=[];cur='📣 <b>Everyone:</b> '
-    for u in users:
-        item=f'<a href="tg://user?id={u["user_id"]}">{esc(u["first_name"] or u["username"] or u["user_id"])}</a> '
-        if len(cur)+len(item)>3500:parts.append(cur);cur=item
-        else:cur+=item
-    parts.append(cur)
-    for p in parts:await update.message.reply_text(p,parse_mode=ParseMode.HTML);await asyncio.sleep(config.TAG_DELAY)
-async def gm(update,context):
-    if not await moderation.actor_is_mod(update,context):return
-    users=database.known_users(update.effective_chat.id)
-    if not users:return await update.message.reply_text('No observed members yet.')
-    text='🌅 <b>Good Morning!</b>\n'+' '.join(f'<a href="tg://user?id={u["user_id"]}">{esc(u["first_name"] or u["username"] or u["user_id"])}</a>' for u in users)
-    for i in range(0,len(text),3500):await update.message.reply_text(text[i:i+3500],parse_mode=ParseMode.HTML);await asyncio.sleep(config.TAG_DELAY)
-async def whitelist(update,context):
-    if not await moderation.actor_is_mod(update,context) or not context.args:return await update.message.reply_text('Usage: /whitelist add|del USER_ID [reason]')
-    op=context.args[0].lower();uid=int(context.args[1]);
-    if op=='add':database.add_whitelist(update.effective_chat.id,uid,' '.join(context.args[2:]),update.effective_user.id);await update.message.reply_text('✅ Whitelisted.')
-    elif op=='del':database.del_whitelist(update.effective_chat.id,uid);await update.message.reply_text('✅ Removed from whitelist.')
-async def schedule(update,context):
-    if not await moderation.actor_is_mod(update,context) or len(context.args)<2:return await update.message.reply_text('Usage: /schedule SECONDS MESSAGE')
-    sec=int(context.args[0]);text=' '.join(context.args[1:]);sid=database.add_schedule(update.effective_chat.id,text,int(time.time())+sec);await update.message.reply_text(f'⏰ Scheduled #{sid} in {sec}s.')
-async def unschedule(update,context):
-    if not await moderation.actor_is_mod(update,context) or not context.args:return
-    await update.message.reply_text('✅ Cancelled.' if database.cancel_schedule(update.effective_chat.id,int(context.args[0])) else '❌ Not found.')
-async def stats(update,context):
-    s=database.stats(update.effective_chat.id);await update.message.reply_text(f"📊 Users {s['users']} | Warnings {s['warnings']} | Filters {s['filters']} | Logs {s['logs']} | Admins {s['admins']}")
-async def help_cmd(update,context):
-    await update.message.reply_text('🛡️ <b>GroupGuard Ultra</b>\n\n<b>Moderation</b>: /ban /unban /kick /mute /unmute /warn /unwarn /purge /pin /unpin /slowmode /lock /unlock\n<b>Protection</b>: /filter /delfilter /badword /whitelist\n<b>Members</b>: /welcome /goodbye /verify /setwelcome /setgoodbye /setrules /rules /all /gm\n<b>Channel</b>: /acceptreq CHAT /stopaccreq CHAT /linkleave GROUP CHANNEL /unlinkleave GROUP CHANNEL\n<b>Automation</b>: /schedule SECONDS TEXT /unschedule ID\n<b>Panel</b>: /setup /panel /settings /stats /admin /unadmin /adminlist',parse_mode=ParseMode.HTML)
 
-def register(app):
-    for c,f in {'start':start,'help':help_cmd,'setup':setup,'panel':panel,'settings':panel,'verify':verification_cmd,'admin':admin_cmd,'unadmin':unadmin,'adminlist':adminlist,'purge':purge,'pin':pin,'unpin':unpin,'slowmode':slowmode,'lock':lock_cmd,'unlock':unlock_cmd,'filter':filter_cmd,'delfilter':delfilter,'badword':badword,'linkleave':linkleave,'unlinkleave':unlinkleave,'acceptreq':acceptreq,'stopaccreq':stopaccreq,'all':all_tag,'gm':gm,'whitelist':whitelist,'schedule':schedule,'unschedule':unschedule,'stats':stats,'rules':rules}.items():app.add_handler(CommandHandler(c,f))
-    for c in ('ban','unban','kick','mute','unmute','warn','unwarn'):app.add_handler(CommandHandler(c,moderate_cmd))
-    for c in ('welcome','goodbye','verification','verifyon','antilink','antiflood','antiforward','antispam','antiraid','leaveban','tagging'):app.add_handler(CommandHandler(c,toggle))
-    for c in ('setwelcome','setgoodbye','setrules'):app.add_handler(CommandHandler(c,set_text))
-    app.add_handler(CallbackQueryHandler(callback))
-    app.add_handler(ChatMemberHandler(new_member,ChatMemberHandler.CHAT_MEMBER))
-    app.add_handler(ChatJoinRequestHandler(join_request))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,moderation_message),group=10)
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,remember),group=20)
-    app.job_queue.run_repeating(scheduled_worker,interval=5,first=5)
+@router.message(Command("removebalance"))
+async def cmd_removebalance(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner"):
+            await message.answer("Access denied.")
+            return
 
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer("Usage: /removebalance <user_id> <amount>")
+        return
+
+    try:
+        user_id = int(args[1])
+        amount = float(args[2])
+    except ValueError:
+        await message.answer("Invalid user_id or amount.")
+        return
+
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            await message.answer("User not found.")
+            return
+        try:
+            await remove_balance(session, user.tg_id, amount, f"Removed by {message.from_user.id}")
+            await session.commit()
+            await message.answer(f"✅ Removed ₹{amount} from user {user.tg_id}. New balance: ₹{user.balance - amount:.2f}")
+            await send_log_message(message.bot, f"💰 Remove balance: user {user.tg_id} -₹{amount} by {message.from_user.id}")
+        except ValueError as e:
+            await message.answer(str(e))
+
+
+# ---------- Ban / Unban ----------
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Usage: /ban <user_id> [reason]")
+        return
+
+    try:
+        user_id = int(args[1])
+    except ValueError:
+        await message.answer("Invalid user_id.")
+        return
+
+    reason = " ".join(args[2:]) if len(args) > 2 else "No reason"
+
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            await message.answer("User not found.")
+            return
+        user.is_banned = True
+        user.ban_reason = reason
+        user.ban_until = None
+        await session.commit()
+        await message.answer(f"✅ Banned user {user.tg_id}. Reason: {reason}")
+        await send_log_message(message.bot, f"🚫 Ban: user {user.tg_id} by {message.from_user.id}, reason: {reason}")
+
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Usage: /unban <user_id>")
+        return
+
+    try:
+        user_id = int(args[1])
+    except ValueError:
+        await message.answer("Invalid user_id.")
+        return
+
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            await message.answer("User not found.")
+            return
+        user.is_banned = False
+        user.ban_reason = None
+        user.ban_until = None
+        await session.commit()
+        await message.answer(f"✅ Unbanned user {user.tg_id}.")
+        await send_log_message(message.bot, f"✅ Unban: user {user.tg_id} by {message.from_user.id}")
+
+
+# ---------- Broadcast (superadmin+owner only) ----------
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner"):
+            await message.answer("Access denied.")
+            return
+
+    await message.answer("Send the broadcast message text:")
+    await message.state.set_state(BroadcastState.text)
+
+
+@router.message(StateFilter(BroadcastState.text))
+async def broadcast_text(message: Message, state: FSMContext):
+    text = message.text
+    async with async_session_maker() as session:
+        stmt = select(User.tg_id)
+        res = await session.execute(stmt)
+        user_ids = [r[0] for r in res.all()]
+
+    sent = 0
+    failed = 0
+    for uid in user_ids:
+        try:
+            await message.bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await message.answer(f"Broadcast done: sent={sent}, failed={failed}")
+    await send_log_message(message.bot, f"📢 Broadcast: sent={sent}, failed={failed} by {message.from_user.id}")
+    await state.clear()
+
+
+# ---------- Categories (CRUD) ----------
+
+@router.message(Command("addcategory"))
+async def cmd_addcategory(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer("Usage: /addcategory <name> <rate>")
+        return
+
+    name = args[1]
+    try:
+        rate = float(args[2])
+    except ValueError:
+        await message.answer("Invalid rate.")
+        return
+
+    async with async_session_maker() as session:
+        existing = await session.execute(select(Category).where(Category.name == name))
+        if existing.scalar_one_or_none():
+            await message.answer("Category name already exists.")
+            return
+        cat = Category(name=name, rate=rate)
+        session.add(cat)
+        await session.commit()
+        await message.answer(f"✅ Category added: {name} – ₹{rate}")
+        await send_log_message(message.bot, f"📦 Add category: {name} – ₹{rate} by {message.from_user.id}")
+
+
+@router.message(Command("editcategory"))
+async def cmd_editcategory(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer("Usage: /editcategory <name> <new_rate>")
+        return
+
+    name = args[1]
+    try:
+        new_rate = float(args[2])
+    except ValueError:
+        await message.answer("Invalid rate.")
+        return
+
+    async with async_session_maker() as session:
+        stmt = select(Category).where(Category.name == name)
+        res = await session.execute(stmt)
+        cat = res.scalar_one_or_none()
+        if not cat:
+            await message.answer("Category not found.")
+            return
+        cat.rate = new_rate
+        await session.commit()
+        await message.answer(f"✅ Category updated: {name} – ₹{new_rate}")
+        await send_log_message(message.bot, f"📦 Edit category: {name} – ₹{new_rate} by {message.from_user.id}")
+
+
+@router.message(Command("deletecategory"))
+async def cmd_deletecategory(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Usage: /deletecategory <name>")
+        return
+
+    name = args[1]
+
+    async with async_session_maker() as session:
+        stmt = select(Category).where(Category.name == name)
+        res = await session.execute(stmt)
+        cat = res.scalar_one_or_none()
+        if not cat:
+            await message.answer("Category not found.")
+            return
+
+        acc_stmt = select(Account).where(Account.category_id == cat.id)
+        acc_res = await session.execute(acc_stmt)
+        if acc_res.scalars().first():
+            await message.answer("Cannot delete category with existing accounts. Delete accounts first.")
+            return
+
+        await session.delete(cat)
+        await session.commit()
+        await message.answer(f"✅ Category deleted: {name}")
+        await send_log_message(message.bot, f"📦 Delete category: {name} by {message.from_user.id}")
+
+
+# ---------- Accounts (CRUD, simplified) ----------
+
+@router.message(Command("addaccount"))
+async def cmd_addaccount(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer("Usage: /addaccount <category_id> <phone>")
+        return
+
+    try:
+        cat_id = int(args[1])
+    except ValueError:
+        await message.answer("Invalid category_id.")
+        return
+
+    phone = args[2]
+
+    async with async_session_maker() as session:
+        cat = await session.get(Category, cat_id)
+        if not cat:
+            await message.answer("Category not found.")
+            return
+
+        # Here you would run Pyrogram login flow and get session_data.
+        # For now, placeholder session_data.
+        session_data = "placeholder_session"
+
+        acc = Account(
+            category_id=cat_id,
+            phone=phone,
+            session_data=session_data,
+            added_by=message.from_user.id
+        )
+        session.add(acc)
+        await session.commit()
+        await message.answer(f"✅ Account added: ID {acc.id}, category {cat.name}, phone {phone}")
+        await send_log_message(message.bot, f"📱 Add account: ID {acc.id}, category {cat.name} by {message.from_user.id}")
+
+
+@router.message(Command("deleteaccount"))
+async def cmd_deleteaccount(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Usage: /deleteaccount <account_id>")
+        return
+
+    try:
+        acc_id = int(args[1])
+    except ValueError:
+        await message.answer("Invalid account_id.")
+        return
+
+    async with async_session_maker() as session:
+        acc = await session.get(Account, acc_id)
+        if not acc:
+            await message.answer("Account not found.")
+            return
+        if acc.status != "available":
+            await message.answer("Account is not available (already sold/reserved).")
+            return
+        await session.delete(acc)
+        await session.commit()
+        await message.answer(f"✅ Account deleted: {acc_id}")
+        await send_log_message(message.bot, f"📱 Delete account: {acc_id} by {message.from_user.id}")
+
+
+# ---------- Channels (CRUD) ----------
+
+@router.message(Command("addchannel"))
+async def cmd_addchannel(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Usage: /addchannel <channel_id> [@username] [label]")
+        return
+
+    try:
+        channel_id = int(args[1])
+    except ValueError:
+        await message.answer("Invalid channel_id.")
+        return
+
+    username = args[2] if len(args) > 2 else None
+    label = args[3] if len(args) > 3 else None
+
+    async with async_session_maker() as session:
+        existing = await session.execute(select(RequiredChannel).where(RequiredChannel.channel_id == channel_id))
+        if existing.scalar_one_or_none():
+            await message.answer("Channel already exists.")
+            return
+        ch = RequiredChannel(channel_id=channel_id, channel_username=username, label=label)
+        session.add(ch)
+        await session.commit()
+        await message.answer(f"✅ Channel added: {channel_id}")
+        await send_log_message(message.bot, f"📡 Add channel: {channel_id} by {message.from_user.id}")
+
+
+@router.message(Command("removechannel"))
+async def cmd_removechannel(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Usage: /removechannel <channel_id>")
+        return
+
+    try:
+        channel_id = int(args[1])
+    except ValueError:
+        await message.answer("Invalid channel_id.")
+        return
+
+    async with async_session_maker() as session:
+        stmt = select(RequiredChannel).where(RequiredChannel.channel_id == channel_id)
+        res = await session.execute(stmt)
+        ch = res.scalar_one_or_none()
+        if not ch:
+            await message.answer("Channel not found.")
+            return
+        await session.delete(ch)
+        await session.commit()
+        await message.answer(f"✅ Channel removed: {channel_id}")
+        await send_log_message(message.bot, f"📡 Remove channel: {channel_id} by {message.from_user.id}")
+
+
+# ---------- Coupons (CRUD) ----------
+
+@router.message(Command("addcoupon"))
+async def cmd_addcoupon(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 4:
+        await message.answer("Usage: /addcoupon <code> <amount> <max_uses>")
+        return
+
+    code, amount_str, max_str = args[1], args[2], args[3]
+    try:
+        amount = float(amount_str)
+        max_uses = int(max_str)
+    except ValueError:
+        await message.answer("Invalid amount or max_uses.")
+        return
+
+    async with async_session_maker() as session:
+        existing = await session.execute(select(Coupon).where(Coupon.code == code))
+        if existing.scalar_one_or_none():
+            await message.answer("Coupon code already exists.")
+            return
+        coupon = Coupon(code=code, bonus_amount=amount, max_uses=max_uses)
+        session.add(coupon)
+        await session.commit()
+        await message.answer(f"✅ Coupon added: {code} – ₹{amount}, max_uses={max_uses}")
+        await send_log_message(message.bot, f"🎟 Add coupon: {code} by {message.from_user.id}")
+
+
+@router.message(Command("editcoupon"))
+async def cmd_editcoupon(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 4:
+        await message.answer("Usage: /editcoupon <code> <new_amount> <new_max_uses>")
+        return
+
+    code, amount_str, max_str = args[1], args[2], args[3]
+    try:
+        amount = float(amount_str)
+        max_uses = int(max_str)
+    except ValueError:
+        await message.answer("Invalid amount or max_uses.")
+        return
+
+    async with async_session_maker() as session:
+        stmt = select(Coupon).where(Coupon.code == code)
+        res = await session.execute(stmt)
+        coupon = res.scalar_one_or_none()
+        if not coupon:
+            await message.answer("Coupon not found.")
+            return
+        coupon.bonus_amount = amount
+        coupon.max_uses = max_uses
+        await session.commit()
+        await message.answer(f"✅ Coupon updated: {code} – ₹{amount}, max_uses={max_uses}")
+        await send_log_message(message.bot, f"🎟 Edit coupon: {code} by {message.from_user.id}")
+
+
+@router.message(Command("deletecoupon"))
+async def cmd_deletecoupon(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Usage: /deletecoupon <code>")
+        return
+
+    code = args[1]
+
+    async with async_session_maker() as session:
+        stmt = select(Coupon).where(Coupon.code == code)
+        res = await session.execute(stmt)
+        coupon = res.scalar_one_or_none()
+        if not coupon:
+            await message.answer("Coupon not found.")
+            return
+        await session.delete(coupon)
+        await session.commit()
+        await message.answer(f"✅ Coupon deleted: {code}")
+        await send_log_message(message.bot, f"🎟 Delete coupon: {code} by {message.from_user.id}")
+
+
+# ---------- Stats ----------
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner", "admin"):
+            await message.answer("Access denied.")
+            return
+
+        total_users = await session.execute(select(User))
+        total_users = len(total_users.scalars().all())
+
+        total_deposits = await session.execute(select(DepositRequest))
+        total_deposits = len(total_deposits.scalars().all())
+
+        total_purchases = await session.execute(select(Purchase))
+        total_purchases = len(total_purchases.scalars().all())
+
+        available_accounts = await session.execute(select(Account).where(Account.status == "available"))
+        available_accounts = len(available_accounts.scalars().all())
+
+        banned_users = await session.execute(select(User).where(User.is_banned == True))
+        banned_users = len(banned_users.scalars().all())
+
+        text = (
+            f"📊 Stats
+"
+            f"Total users: {total_users}
+"
+            f"Total deposits: {total_deposits}
+"
+            f"Total purchases: {total_purchases}
+"
+            f"Available accounts: {available_accounts}
+"
+            f"Banned users: {banned_users}
+"
+        )
+        await message.answer(text)
+
+
+# ---------- Maintenance ----------
+
+@router.message(Command("maintenance"))
+async def cmd_maintenance(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner"):
+            await message.answer("Access denied.")
+            return
+
+    from config import MAINTENANCE_MODE
+    new_state = not MAINTENANCE_MODE
+    # Note: to truly toggle, you need to reload config or store in DB; here we just log.
+    await message.answer(f"Maintenance mode toggle requested. Current env MAINTENANCE_MODE={MAINTENANCE_MODE}. To change, update env and restart bot.")
+    await send_log_message(message.bot, f"⚙️ Maintenance toggle requested by {message.from_user.id}")
+
+
+# ---------- Admins & Superadmins ----------
+
+@router.message(Command("addadmin"))
+async def cmd_addadmin(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Usage: /addadmin <user_id>")
+        return
+
+    try:
+        user_id = int(args[1])
+    except ValueError:
+        await message.answer("Invalid user_id.")
+        return
+
+    async with async_session_maker() as session:
+        existing = await session.execute(select(Admin).where(Admin.tg_id == user_id))
+        if existing.scalar_one_or_none():
+            await message.answer("User is already an admin.")
+            return
+        admin = Admin(tg_id=user_id, role="admin", added_by=message.from_user.id)
+        session.add(admin)
+        await session.commit()
+        await message.answer(f"✅ User {user_id} promoted to admin.")
+        await send_log_message(message.bot, f"🛡 Add admin: {user_id} by {message.from_user.id}")
+
+
+@router.message(Command("removeadmin"))
+async def cmd_removeadmin(message: Message):
+    async with async_session_maker() as session:
+        role = await get_user_role(session, message.from_user.id)
+        if role not in ("superadmin", "owner"):
+            await message.answer("Access denied.")
+            return
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Usage: /removeadmin <user_id>")
+        return
+
+    try:
+        user_id = int(args[1])
+    except ValueError:
+        await message.answer("Invalid user_id.")
+        return
+
+    async with async_session_maker() as session:
+        stmt = select(Admin).where(Admin.tg_id == user_id)
+        res = await session.execute(stmt)
+        admin = res.scalar_one_or_none()
+        if not admin:
+            await message.answer("User is not an admin.")
+            return
+        await session.delete(admin)
+        await session.commit()
+        await message.answer(f"✅ User {user_id} removed from admins.")
+        await send_log_message(message.bot, f"🛡 Remove admin: {user_id} by {message.from_user.id}")
+
+
+@router.message(Command("addsuperadmin"))
+async def cmd_addsuperadmin(message: Message):
+    async with async_session_maker() as session:
+        if not await get_user_role(session, message.from_user.id) == "owner":
+            await message.answer("Only owner can add superadmins.")
+            return
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Usage: /addsuperadmin <user_id>")
+        return
+
+    try:
+        user_id = int(args[1])
+    except ValueError:
+        await message.answer("Invalid user_id.")
+        return
+
+    async with async_session_maker() as session:
+        stmt = select(Admin).where(Admin.tg_id == user_id)
+        res = await session.execute(stmt)
+        admin = res.scalar_one_or_none()
+        if admin:
+            admin.role = "superadmin"
+        else:
+            admin = Admin(tg_id=user_id, role="superadmin", added_by=message.from_user.id)
+            session.add(admin)
+        await session.commit()
+        await message.answer(f"✅ User {user_id} promoted to superadmin.")
+        await send_log_message(message.bot, f"🛡 Add superadmin: {user_id} by {message.from_user.id}")
+
+
+@router.message(Command("removesuperadmin"))
+async def cmd_removesuperadmin(message: Message):
+    async with async_session_maker() as session:
+        if not await get_user_role(session, message.from_user.id) == "owner":
+            await message.answer("Only owner can remove superadmins.")
+            return
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Usage: /removesuperadmin <user_id>")
+        return
+
+    try:
+        user_id = int(args[1])
+    except ValueError:
+        await message.answer("Invalid user_id.")
+        return
+
+    async with async_session_maker() as session:
+        stmt = select(Admin).where(Admin.tg_id == user_id)
+        res = await session.execute(stmt)
+        admin = res.scalar_one_or_none()
+        if not admin or admin.role != "superadmin":
+            await message.answer("User is not a superadmin.")
+            return
+        admin.role = "admin"
+        await session.commit()
+        await message.answer(f"✅ User {user_id} demoted from superadmin to admin.")
+        await send_log_message(message.bot, f"🛡 Remove superadmin: {user_id} by {message.from_user.id}")
+
+
+# ---------- User: referral, coupon, support, help (simple) ----------
+
+@router.callback_query(F.data == "user_referral")
+async def cb_referral(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        stmt = select(User).where(User.tg_id == callback.from_user.id)
+        res = await session.execute(stmt)
+        user = res.scalar_one_or_none()
+        if not user:
+            await callback.answer("User not found.", show_alert=True)
+            return
+        ref_link = f"https://t.me/{callback.bot.username}?start={callback.from_user.id}"
+        text = (
+            f"🎁 Referral
+"
+            f"Your referral link:
+{ref_link}
+
+"
+            f"Reward: ₹1 for each user who joins via your link and verifies channels."
+        )
+        await callback.message.edit_text(text, reply_markup=back_home_keyboard())
+
+
+@router.callback_query(F.data == "user_coupon")
+async def cb_coupon(callback: CallbackQuery):
+    await callback.message.edit_text("Send /coupon <code> to apply a coupon.", reply_markup=back_home_keyboard())
+
+
+@router.message(Command("coupon"))
+async def cmd_coupon(message: Message):
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Usage: /coupon <code>")
+        return
+    code = args[1]
+
+    async with async_session_maker() as session:
+        stmt = select(User).where(User.tg_id == message.from_user.id)
+        res = await session.execute(stmt)
+        user = res.scalar_one_or_none()
+        if not user:
+            await message.answer("User not found.")
+            return
+        ok, msg = await apply_coupon(session, user, code)
+        await session.commit()
+        await message.answer(msg)
+        await send_log_message(message.bot, f"🎟 Coupon: user {user.tg_id}, code {code}, success={ok}")
+
+
+@router.callback_query(F.data == "user_support")
+async def cb_support(callback: CallbackQuery):
+    from config import SUPPORT_USERNAME
+    text = f"📞 Support
+Contact: @{SUPPORT_USERNAME}"
+    await callback.message.edit_text(text, reply_markup=back_home_keyboard())
+
+
+@router.callback_query(F.data == "user_help")
+async def cb_help(callback: CallbackQuery):
+    text = (
+        "❓ Help
+"
+        "Use the menu buttons to navigate.
+"
+        "For more info, contact support."
+    )
+    await callback.message.edit_text(text, reply_markup=back_home_keyboard())
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message):
+    if await check_maintenance(message):
+        return
+    await message.answer("Main menu:", reply_markup=main_menu_keyboard())
+
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message):
+    if await check_maintenance(message):
+        return
+    async with async_session_maker() as session:
+        stmt = select(User).where(User.tg_id == message.from_user.id)
+        res = await session.execute(stmt)
+        user = res.scalar_one_or_none()
+        if not user:
+            await message.answer("User not found.")
+            return
+        text = (
+            f"👤 Profile
+"
+            f"ID: {user.tg_id}
+"
+            f"Name: {user.first_name or ''} {user.last_name or ''}
+"
+            f"Username: @{user.username or 'N/A'}
+"
+            f"Balance: ₹{user.balance:.2f}
+"
+            f"Referred by: {user.referred_by or 'None'}
+"
+        )
+        await message.answer(text, reply_markup=back_home_keyboard())
+
+
+@router.message(Command("purchases"))
+async def cmd_purchases(message: Message):
+    if await check_maintenance(message):
+        return
+    async with async_session_maker() as session:
+        stmt = select(Purchase).where(Purchase.user_tg_id == message.from_user.id).limit(10)
+        res = await session.execute(stmt)
+        purchases = res.scalars().all()
+        if not purchases:
+            await message.answer("No purchases yet.", reply_markup=back_home_keyboard())
+            return
+        lines = [f"Account #{p.account_id} – ₹{p.price} – {p.created_at}" for p in purchases]
+        text = "📜 Your purchases:
+" + "
+".join(lines)
+        await message.answer(text, reply_markup=back_home_keyboard())
+
+
+@router.message(Command("transactions"))
+async def cmd_transactions(message: Message):
+    if await check_maintenance(message):
+        return
+    async with async_session_maker() as session:
+        stmt = select(Transaction).where(Transaction.user_tg_id == message.from_user.id).limit(10)
+        res = await session.execute(stmt)
+        txns = res.scalars().all()
+        if not txns:
+            await message.answer("No transactions yet.", reply_markup=back_home_keyboard())
+            return
+        lines = [f"{t.type}: {'+' if t.amount>0 else ''}{t.amount:.2f} – {t.description or ''} – {t.created_at}" for t in txns]
+        text = "🧾 Your transactions:
+" + "
+".join(lines)
+        await message.answer(text, reply_markup=back_home_keyboard())
+
+
+@router.callback_query(F.data == "user_purchases")
+async def cb_user_purchases(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        stmt = select(Purchase).where(Purchase.user_tg_id == callback.from_user.id).limit(10)
+        res = await session.execute(stmt)
+        purchases = res.scalars().all()
+        if not purchases:
+            await callback.message.edit_text("No purchases yet.", reply_markup=back_home_keyboard())
+            return
+        lines = [f"Account #{p.account_id} – ₹{p.price}" for p in purchases]
+        text = "📜 Your purchases:
+" + "
+".join(lines)
+        await callback.message.edit_text(text, reply_markup=back_home_keyboard())
+
+
+@router.callback_query(F.data == "user_transactions")
+async def cb_user_transactions(callback: CallbackQuery):
+    async with async_session_maker() as session:
+        stmt = select(Transaction).where(Transaction.user_tg_id == callback.from_user.id).limit(10)
+        res = await session.execute(stmt)
+        txns = res.scalars().all()
+        if not txns:
+            await callback.message.edit_text("No transactions yet.", reply_markup=back_home_keyboard())
+            return
+        lines = [f"{t.type}: {'+' if t.amount>0 else ''}{t.amount:.2f}" for t in txns]
+        text = "🧾 Your transactions:
+" + "
+".join(lines)
+        await callback.message.edit_text(text, reply_markup=back_home_keyboard())
+
+
+# ---------- Errors ----------
+
+@router.errors()
+async def error_handler(event, exception):
+    print(f"Error: {exception}")
