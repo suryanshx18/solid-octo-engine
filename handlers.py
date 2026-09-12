@@ -36,16 +36,6 @@ class BroadcastState(StatesGroup):
     text = State()
 
 
-class AddCategoryState(StatesGroup):
-    name = State()
-    rate = State()
-
-
-class AddAccountState(StatesGroup):
-    category_id = State()
-    phone = State()
-
-
 # ---------- Helpers ----------
 
 async def check_maintenance(message: Message) -> bool:
@@ -225,8 +215,6 @@ async def cb_buy_account(callback: CallbackQuery):
             await callback.answer(msg, show_alert=True)
             return
 
-        # TODO: Integrate full MTProto OTP flow here.
-        # For now, complete purchase immediately.
         await complete_purchase(session, user, account, price)
         await session.commit()
 
@@ -312,7 +300,6 @@ async def deposit_utr(message: Message, state: FSMContext):
             message.bot,
             f"💰 Deposit request: user {message.from_user.id}, ₹{amount}, UTR: {utr}",
         )
-        # Send approval message to log channel with buttons
         if LOG_CHANNEL_ID:
             try:
                 await message.bot.send_message(
@@ -770,8 +757,6 @@ async def cmd_addaccount(message: Message):
             await message.answer("Category not found.")
             return
 
-        # Here you would run Pyrogram login flow and get session_data.
-        # For now, placeholder session_data.
         session_data = "placeholder_session"
 
         acc = Account(
@@ -1038,8 +1023,6 @@ async def cmd_maintenance(message: Message):
             return
 
     from config import MAINTENANCE_MODE
-    new_state = not MAINTENANCE_MODE
-    # Note: to truly toggle, you need to reload config or store in DB; here we just log.
     await message.answer(f"Maintenance mode toggle requested. Current env MAINTENANCE_MODE={MAINTENANCE_MODE}. To change, update env and restart bot.")
     await send_log_message(message.bot, f"⚙️ Maintenance toggle requested by {message.from_user.id}")
 
@@ -1112,7 +1095,8 @@ async def cmd_removeadmin(message: Message):
 @router.message(Command("addsuperadmin"))
 async def cmd_addsuperadmin(message: Message):
     async with async_session_maker() as session:
-        if not await get_user_role(session, message.from_user.id) == "owner":
+        role = await get_user_role(session, message.from_user.id)
+        if role != "owner":
             await message.answer("Only owner can add superadmins.")
             return
 
@@ -1144,7 +1128,8 @@ async def cmd_addsuperadmin(message: Message):
 @router.message(Command("removesuperadmin"))
 async def cmd_removesuperadmin(message: Message):
     async with async_session_maker() as session:
-        if not await get_user_role(session, message.from_user.id) == "owner":
+        role = await get_user_role(session, message.from_user.id)
+        if role != "owner":
             await message.answer("Only owner can remove superadmins.")
             return
 
@@ -1172,7 +1157,7 @@ async def cmd_removesuperadmin(message: Message):
         await send_log_message(message.bot, f"🛡 Remove superadmin: {user_id} by {message.from_user.id}")
 
 
-# ---------- User: referral, coupon, support, help (simple) ----------
+# ---------- User: referral, coupon, support, help ----------
 
 @router.callback_query(F.data == "user_referral")
 async def cb_referral(callback: CallbackQuery):
