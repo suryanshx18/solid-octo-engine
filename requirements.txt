@@ -8,3 +8,4 @@ python-dotenv>=1.0.0
 telethon>=1.36,<2
 aiohttp>=3.9,<4
 phonenumbers>=8.13
+psycopg[binary]>=3.2
