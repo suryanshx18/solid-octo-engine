@@ -206,9 +206,6 @@ def premium_button(
     if url is not None:
         kwargs["url"] = url
 
-    if emoji_id:
-        kwargs["icon_custom_emoji_id"] = emoji_id
-
     if style:
         kwargs["style"] = style
 
