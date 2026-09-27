@@ -1,960 +1,4405 @@
-import asyncio, logging, random, os
+#!/usr/bin/env python3
+
+import asyncio
+import html
+import json
+import logging
+import os
+import random
+import string
 from datetime import datetime
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CommandStart, CommandObject
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from telethon import TelegramClient, errors
-from telethon.sessions import StringSession
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, func
-from sqlalchemy.orm import declarative_base, sessionmaker
-import phonenumbers, aiohttp
+from typing import Any, Optional
 
-# ═══════════════ CONFIGURATION ═══════════════
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH")
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///marketplace.db")
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+from telegram.request import HTTPXRequest
 
-# ═══════════════ TRANSLATIONS ═══════════════
-TEXTS = {
-    "en": {"welcome": "🩸 **BLOODLINE TG ACCOUNT STORE** 🩸\n――――――――――――――――――――――――\n👋 Hey {name}!\n🆔 `{id}`\n\n💵 Balance: `${balance:.2f}`\n📝 Rank: `VIP1`\n――――――――――――――――――――――――\n🪄 Select an option below 🪄",
-           "buy_acc": "📦 Buy Accounts", "sell_acc": "📤 Sell Accounts", "top_up": "💳 Top up", "withdraw": "🏦 Withdrawal",
-           "profile": "👑 Profile", "referral": "🤝 Referrals", "api_key": "🔑 API Key", "wishlist": "⭐ Wishlist",
-           "daily_bonus": "🎁 Daily Bonus", "history": "📜 History", "support": "🛠️ Support", "language": "🌐 Language",
-           "official_channel": "📢 Official Channel", "developer": "🧑‍💻 Developer", "admin_panel": "🛠️ Admin Panel"},
-    "hi": {"welcome": "🩸 **BLOODLINE TG ACCOUNT STORE** 🩸\n――――――――――――――――――――――――\n👋 नमस्ते {name}!\n🆔 `{id}`\n\n💵 बैलेंस: `${balance:.2f}`\n📝 रैंक: `VIP1`\n――――――――――――――――――――――――\n🪄 नीचे से विकल्प चुनें 🪄",
-           "buy_acc": "📦 खाते खरीदें", "sell_acc": "📤 खाते बेचें", "top_up": "💳 टॉप अप", "withdraw": "🏦 निकासी",
-           "profile": "👑 प्रोफ़ाइल", "referral": "🤝 रेफरल", "api_key": "🔑 एपीआई कुंजी", "wishlist": "⭐ विशलिस्ट",
-           "daily_bonus": "🎁 दैनिक बोनस", "history": "📜 इतिहास", "support": "🛠️ सहायता", "language": "🌐 भाषा",
-           "official_channel": "📢 आधिकारिक चैनल", "developer": "🧑‍💻 डेवलपर", "admin_panel": "🛠️ एडमिन पैनल"},
-    "ru": {"welcome": "🩸 **BLOODLINE TG ACCOUNT STORE** 🩸\n――――――――――――――――――――――――\n👋 Привет {name}!\n🆔 `{id}`\n\n💵 Баланс: `${balance:.2f}`\n📝 Ранг: `VIP1`\n――――――――――――――――――――――――\n🪄 Выберите опцию ниже 🪄",
-           "buy_acc": "📦 Купить аккаунты", "sell_acc": "📤 Продать аккаунты", "top_up": "💳 Пополнить", "withdraw": "🏦 Вывод",
-           "profile": "👑 Профиль", "referral": "🤝 Рефералы", "api_key": "🔑 API Ключ", "wishlist": "⭐ Список желаний",
-           "daily_bonus": "🎁 Ежедневный бонус", "history": "📜 История", "support": "🛠️ Поддержка", "language": "🌐 Язык",
-           "official_channel": "📢 Официальный канал", "developer": "🧑‍💻 Разработчик", "admin_panel": "🛠️ Админ Панель"},
-    "ar": {"welcome": "🩸 **BLOODLINE TG ACCOUNT STORE** 🩸\n――――――――――――――――――――――――\n👋 مرحبا {name}!\n🆔 `{id}`\n\n💵 الرصيد: `${balance:.2f}`\n📝 الرتبة: `VIP1`\n――――――――――――――――――――――――\n🪄 اختر خيارًا أدناه 🪄",
-           "buy_acc": "📦 شراء حسابات", "sell_acc": "📤 بيع الحسابات", "top_up": "💳 شحن الرصيد", "withdraw": "🏦 سحب",
-           "profile": "👑 الملف الشخصي", "referral": "🤝 الإحالات", "api_key": "🔑 مفتاح API", "wishlist": "⭐ قائمة الرغبات",
-           "daily_bonus": "🎁 مكافأة يومية", "history": "📜 السجل", "support": "🛠️ الدعم", "language": "🌐 اللغة",
-           "official_channel": "📢 القناة الرسمية", "developer": "🧑‍💻 المطور", "admin_panel": "🛠️ لوحة التحكم"}
-}
 
-# ═══════════════ DATABASE SETUP ═══════════════
-Base = declarative_base()
-engine = create_engine(DATABASE_URL, echo=False)
-SessionLocal = sessionmaker(bind=engine)
-db = SessionLocal()
+# ============================================================
+# CONFIG
+# ============================================================
 
-PRICE_GUIDE = {"AL": 0.40, "AM": 0.45, "AR": 0.40, "AZ": 0.80, "CA": 0.18, "CG": 0.30, "CO": 0.20, "DZ": 0.30, "EG": 0.18, "ET": 0.19, "FR": 0.55, "GA": 0.50, "GF": 0.50, "GH": 0.30, "GL": 0.70, "HK": 0.35, "ID": 0.20, "IN": 0.16, "JO": 0.50, "KE": 0.22, "KG": 0.70, "KR": 1.40, "KZ": 0.50, "LK": 0.30, "LY": 0.35, "MA": 0.28, "MG": 0.15, "ML": 0.15, "MM": 0.20, "MN": 0.40, "MX": 0.50, "MY": 0.45, "NG": 0.18, "NL": 0.60, "NP": 0.30, "PG": 0.25, "PH": 0.20, "PK": 0.20, "PL": 0.38, "SA": 0.60, "SN": 0.25, "SY": 0.25, "TH": 0.25, "TR": 0.50, "UA": 1.00, "UZ": 0.40, "VE": 0.80, "YE": 0.35, "ZW": 0.20}
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_USERNAME = os.getenv("BOT_USERNAME").strip().lstrip("@")
 
-class User(Base):
-    __tablename__ = 'users'
-    id = Column(Integer, primary_key=True)
-    balance = Column(Float, default=0.0)
-    is_admin = Column(Boolean, default=False)
-    is_banned = Column(Boolean, default=False)
-    referrer_id = Column(Integer, nullable=True)
-    referral_earnings = Column(Float, default=0.0)
-    last_bonus_date = Column(DateTime, nullable=True)
-    joined_at = Column(DateTime, default=datetime.utcnow)
-    wishlist = Column(String, default="")
-    lang = Column(String, default="en")
+try:
+    OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+except ValueError:
+    OWNER_ID = 0
 
-class ApiKey(Base):
-    __tablename__ = 'api_keys'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, unique=True)
-    api_key = Column(String, unique=True)
-    status = Column(String, default="Active")
-    created_at = Column(DateTime, default=datetime.utcnow)
+DATA_FILE = os.getenv("DATA_FILE", "bot_data.json")
 
-class ForceJoinChannel(Base):
-    __tablename__ = 'force_join_channels'
-    id = Column(Integer, primary_key=True)
-    username = Column(String)
-    link = Column(String)
 
-class Product(Base):
-    __tablename__ = 'products'
-    id = Column(Integer, primary_key=True)
-    name = Column(String)
-    country = Column(String)
-    price_usd = Column(Float, default=0.0)
-    description = Column(String, nullable=True)
+# ============================================================
+# PREMIUM EMOJIS
+# ============================================================
 
-class StockAccount(Base):
-    __tablename__ = 'stock_accounts'
-    id = Column(Integer, primary_key=True)
-    product_id = Column(Integer, ForeignKey('products.id'))
-    phone = Column(String)
-    session_string = Column(String)
-    password_2fa = Column(String, nullable=True)
-    status = Column(String, default="Available")
+EMOJI_VOTE = "5267095979097610740"
+EMOJI_JOIN = "6237668294896131350"
+EMOJI_CANCEL = "6240245571626475799"
+EMOJI_MAIN_MENU = "6240245571626475799"
+EMOJI_BACK = "6217402478825049695"
+EMOJI_CREATE = "5208891329626521299"
+EMOJI_CONNECT = "5244710862953941180"
+EMOJI_MANAGE = "6237621548472081271"
+EMOJI_ADD_VOTES = "6240003971126139705"
+EMOJI_REMOVE_VOTES = "6240003971126139705"
+EMOJI_LEADERBOARD = "6240027791014765668"
+EMOJI_END_GIVEAWAY = "6240085923397114865"
+EMOJI_ADMIN = "6237595159329113605"
+EMOJI_BROADCAST = "6237668294896131350"
+EMOJI_STATS = "6239790794719370356"
+EMOJI_SETTINGS = "6237621548472081271"
+EMOJI_USERS = "6237867138997034625"
+EMOJI_BACKUP = "6237900592497302202"
+EMOJI_CLEAR = "6240152061598504832"
+EMOJI_CHANNEL = "6237510794150419802"
+EMOJI_NOTIFICATION = "6240073270423462835"
+EMOJI_CONFIRM = "6239815031219820750"
+EMOJI_REFRESH = "6240085923397114865"
+EMOJI_WELCOME = "6332080283176672910"
+EMOJI_FIRE = "6334449730734529256"
+EMOJI_ARROW = "6332591195306334733"
+EMOJI_CHART = "6332186798365612896"
+EMOJI_HEART = "6237558987978447573"
+EMOJI_ROCKET = "5188481279963715781"
+EMOJI_CROWN = "6332246180583447893"
+EMOJI_ERROR = "6334723470475139278"
+EMOJI_ENDED = "6237572882197650867"
+EMOJI_STAR = "6239815031219820750"
+EMOJI_ID = "6237547619200014867"
+EMOJI_GIFT = "6239894475229895983"
+EMOJI_WINE = "6237510794150419802"
+EMOJI_SMILE = "6237867138997034625"
+EMOJI_LOVE = "6334437167955188087"
+EMOJI_LIGHTNING = "6240073270423462835"
+EMOJI_POINTER = "6237732706520668707"
+EMOJI_ALERT = "6240152061598504832"
+EMOJI_CLOWN = "6237900592497302202"
+EMOJI_SEARCH = "6239790794719370356"
+EMOJI_SPEAKER = "5217968773071401144"
+EMOJI_LINK = "5289511602393984968"
+EMOJI_CONFETTI = "6240085923397114865"
+EMOJI_LOCATION = "6240101054566897479"
+EMOJI_RIGHT = "6240295371772271503"
+EMOJI_DIAMOND = "6240003971126139705"
+EMOJI_CALENDAR = "6240027791014765668"
+EMOJI_WINNER = "6332435498446888848"
+EMOJI_MONEY_BAG = "6332246180583447893"
+EMOJI_CELEBRATE = "6237621707385871360"
+EMOJI_INBOX = "6237973405077871246"
+EMOJI_LOCK = "6332490478323243268"
+EMOJI_SHIELD = "6237595159329113605"
 
-class SellRequest(Base):
-    __tablename__ = 'sell_requests'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer)
-    phone = Column(String)
-    session_string = Column(String)
-    price_usd = Column(Float)
-    status = Column(String, default="Pending")
 
-class TopUpRequest(Base):
-    __tablename__ = 'topup_requests'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer)
-    amount_inr = Column(Float)
-    amount_usd = Column(Float)
-    utr = Column(String, nullable=True)
-    screenshot_file_id = Column(String, nullable=True)
-    status = Column(String, default="Pending")
+# ============================================================
+# BUTTON STYLES
+# ============================================================
 
-class WithdrawRequest(Base):
-    __tablename__ = 'withdraw_requests'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer)
-    amount_usd = Column(Float)
-    upi_id = Column(String)
-    status = Column(String, default="Pending")
+BUTTON_STYLE_PRIMARY = "primary"
+BUTTON_STYLE_SUCCESS = "success"
+BUTTON_STYLE_DANGER = "danger"
 
-class Transaction(Base):
-    __tablename__ = 'transactions'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer)
-    type = Column(String)
-    amount = Column(Float)
-    status = Column(String)
-    date = Column(DateTime, default=datetime.utcnow)
 
-class Rating(Base):
-    __tablename__ = 'ratings'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer)
-    product_id = Column(Integer)
-    score = Column(Integer)
-    date = Column(DateTime, default=datetime.utcnow)
+# ============================================================
+# LOGGING
+# ============================================================
 
-class Setting(Base):
-    __tablename__ = 'settings'
-    key = Column(String, primary_key=True)
-    value = Column(String)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 
-Base.metadata.create_all(engine)
+logger = logging.getLogger(__name__)
 
-# ═══════════════ HELPERS ═══════════════
-def get_setting(key, default=None):
-    s = db.query(Setting).filter(Setting.key == key).first()
-    return s.value if s else default
 
-def set_setting(key, value):
-    s = db.query(Setting).filter(Setting.key == key).first()
-    if s: s.value = value
-    else: db.add(Setting(key=key, value=value))
-    db.commit()
+# ============================================================
+# GLOBAL DATA
+# ============================================================
 
-def get_user(user_id):
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        user = User(id=user_id, balance=0.0)
-        db.add(user); db.commit()
-    return user
+giveaways: dict[str, dict[str, Any]] = {}
+all_users: dict[str, dict[str, Any]] = {}
+user_sessions: dict[int, dict[str, Any]] = {}
+admin_sessions: dict[int, dict[str, Any]] = {}
+channel_history: dict[str, dict[str, Any]] = {}
 
-def log_transaction(user_id, t_type, amount, status="Completed"):
-    db.add(Transaction(user_id=user_id, type=t_type, amount=amount, status=status))
-    db.commit()
+# Runtime-only message map.
+# It is intentionally not saved in JSON because Telegram message IDs
+# can become stale and this data is only needed while the process runs.
+vote_messages: dict[str, dict[int, int]] = {}
 
-# ═══════════════ BOT SETUP ═══════════════
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-router = Router()
-dp.include_router(router)
 
-class AdminStates(StatesGroup):
-    add_prod_name = State(); add_prod_desc = State(); add_prod_price = State(); add_prod_country = State()
-    add_stock_phone = State(); add_stock_otp = State(); add_stock_2fa = State()
-    set_upi_id = State(); set_qr_code = State(); add_admin_id = State()
-    edit_name = State(); edit_price = State(); edit_country = State(); edit_desc = State()
-    add_balance = State(); deduct_balance = State(); target_user = State()
-    bulk_upload = State(); reply_ticket = State()
-    fj_username = State(); fj_link = State()
+# ============================================================
+# HELPERS
+# ============================================================
 
-class UserSellStates(StatesGroup):
-    sell_phone = State(); confirm_sell = State(); sell_otp = State(); sell_2fa = State()
+def now_iso() -> str:
+    return datetime.now().isoformat()
 
-class UserTopUpStates(StatesGroup):
-    amount_inr = State(); payment_proof = State()
 
-class UserWithdrawStates(StatesGroup):
-    amount = State(); upi_id = State()
+def safe_html(value: Any) -> str:
+    """Escape dynamic values before inserting them into Telegram HTML."""
+    if value is None:
+        return ""
+    return html.escape(str(value), quote=False)
 
-class UserSupportStates(StatesGroup):
-    waiting_message = State()
 
-# ═══════════════ TELETHON LOGIN ═══════════════
-async def start_telethon_login(phone, api_id, api_hash):
-    client = TelegramClient(StringSession(), int(api_id), api_hash)
-    await client.connect()
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
+
+
+def normalize_user_id(value: Any) -> Optional[int]:
+    """Convert a JSON-loaded ID into an integer."""
     try:
-        sent_code = await client.send_code_request(phone)
-        return client, sent_code.phone_code_hash
-    except Exception as e:
-        await client.disconnect(); raise e
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
-async def verify_telethon_otp(client, phone, otp, phone_code_hash):
-    await client.sign_in(phone, code=otp, phone_code_hash=phone_code_hash)
-    return client.session.save()
 
-async def verify_telethon_2fa(client, password):
-    await client.sign_in(password=password)
-    return client.session.save()
+def member_is_present(member: Any) -> bool:
+    """
+    Telegram can return:
+      member
+      administrator
+      creator
+      restricted
 
-async def fetch_otp_from_tgshark(phone):
-    url = "https://tgsharkapi.store/api/v1/get_otp"
-    params = {"api_key": TGSHARK_API_KEY, "phone": phone}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=15) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get("otp") or data.get("code") or data.get("message")
-                return None
-    except Exception as e: print(f"TG-Shark API Error: {e}"); return None
+    A restricted user can still be a member when is_member=True.
+    """
+    status = getattr(member, "status", None)
 
-# ═══════════════ KEYBOARDS ═══════════════
-async def is_user_joined(user_id):
-    channels = db.query(ForceJoinChannel).all()
-    if not channels: return True
-    for ch in channels:
-        try:
-            member = await bot.get_chat_member(chat_id=f"@{ch.username}", user_id=user_id)
-            if member.status not in ["member", "administrator", "creator"]: return False
-        except Exception: pass
-    return True
+    if status in ("member", "administrator", "creator"):
+        return True
 
-def get_join_keyboard():
-    channels = db.query(ForceJoinChannel).all()
-    kb = []
-    for ch in channels:
-        kb.append([InlineKeyboardButton(text=f"📢 Join {ch.username}", url=ch.link, style="primary")])
-    kb.append([InlineKeyboardButton(text="✅ I have Joined", callback_data="check_join", style="success")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
+    if status == "restricted":
+        return bool(getattr(member, "is_member", False))
 
-def user_main_menu_kb(user_id, is_admin=False, lang="en"):
-    t = TEXTS.get(lang, TEXTS["en"])
-    kb = [
-        [InlineKeyboardButton(text=t["buy_acc"], callback_data="buy_acc", style="primary"), InlineKeyboardButton(text=t["sell_acc"], callback_data="sell_acc", style="success")],
-        [InlineKeyboardButton(text=t["top_up"], callback_data="top_up", style="primary"), InlineKeyboardButton(text=t["withdraw"], callback_data="user_withdraw", style="danger")],
-        [InlineKeyboardButton(text=t["profile"], callback_data="user_profile", style="primary"), InlineKeyboardButton(text=t["referral"], callback_data="user_referral", style="success")],
-        [InlineKeyboardButton(text=t["api_key"], callback_data="api_key", style="primary"), InlineKeyboardButton(text=t["wishlist"], callback_data="user_wishlist", style="primary")],
-        [InlineKeyboardButton(text=t["daily_bonus"], callback_data="daily_bonus", style="success"), InlineKeyboardButton(text=t["history"], callback_data="user_history", style="primary")],
-        [InlineKeyboardButton(text=t["support"], callback_data="user_support", style="primary"), InlineKeyboardButton(text=t["language"], callback_data="language", style="primary")],
-        [InlineKeyboardButton(text=t["official_channel"], url="https://t.me/+PhI4EUQ5s3pmZTFl", style="primary"), InlineKeyboardButton(text=t["developer"], callback_data="developer_btn", style="primary")]
+    return False
+
+
+def premium_button(
+    text: str,
+    callback_data: Optional[str] = None,
+    url: Optional[str] = None,
+    emoji_id: Optional[str] = None,
+    style: Optional[str] = None,
+) -> InlineKeyboardButton:
+
+    kwargs: dict[str, Any] = {
+        "text": text,
+    }
+
+    if callback_data is not None:
+        kwargs["callback_data"] = callback_data
+
+    if url is not None:
+        kwargs["url"] = url
+
+    if emoji_id:
+        kwargs["icon_custom_emoji_id"] = emoji_id
+
+    if style:
+        kwargs["style"] = style
+
+    return InlineKeyboardButton(**kwargs)
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            premium_button(
+                "CONNECT",
+                url=(
+                    f"https://t.me/{BOT_USERNAME}"
+                    "?startchannel=true&admin=post_messages"
+                ),
+                emoji_id=EMOJI_CONNECT,
+                style=BUTTON_STYLE_SUCCESS,
+            )
+        ],
+        [
+            premium_button(
+                "CREATE",
+                callback_data="create_giveaway",
+                emoji_id=EMOJI_CREATE,
+                style=BUTTON_STYLE_PRIMARY,
+            ),
+            premium_button(
+                "MANAGE",
+                callback_data="my_giveaways",
+                emoji_id=EMOJI_MANAGE,
+                style=BUTTON_STYLE_PRIMARY,
+            ),
+        ],
     ]
-    if user_id == ADMIN_ID or is_admin:
-        kb.append([InlineKeyboardButton(text=t["admin_panel"], callback_data="admin_panel", style="danger")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
 
-def admin_panel_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Stats", callback_data="admin_stats", style="primary"), InlineKeyboardButton(text="🏆 Contest", callback_data="admin_contest", style="primary")],
-        [InlineKeyboardButton(text="📦 Manage Products", callback_data="admin_manage_prod", style="primary"), InlineKeyboardButton(text="📥 Manage Stock", callback_data="admin_manage_stock", style="primary")],
-        [InlineKeyboardButton(text="👤 Manage Users", callback_data="admin_manage_users", style="primary"), InlineKeyboardButton(text="📁 Bulk Stock", callback_data="admin_bulk_stock", style="primary")],
-        [InlineKeyboardButton(text="📦 Add Product", callback_data="admin_add_prod", style="success"), InlineKeyboardButton(text="📥 Add Stock", callback_data="admin_add_stock", style="success")],
-        [InlineKeyboardButton(text="👤 Sell Requests", callback_data="admin_sell_reqs", style="primary"), InlineKeyboardButton(text="💰 Top-up Requests", callback_data="admin_topup_reqs", style="primary")],
-        [InlineKeyboardButton(text="💸 Withdraw Requests", callback_data="admin_withdraw_reqs", style="danger"), InlineKeyboardButton(text="📱 Sold Accounts", callback_data="admin_sold_accs", style="danger")],
-        [InlineKeyboardButton(text="📢 Force Join", callback_data="admin_force_join", style="danger"), InlineKeyboardButton(text="💳 Set UPI ID", callback_data="admin_set_upi", style="primary")],
-        [InlineKeyboardButton(text="🖼️ Set QR Code", callback_data="admin_set_qr", style="primary"), InlineKeyboardButton(text="➕ Add Admin", callback_data="admin_add_admin", style="success")],
-        [InlineKeyboardButton(text="🔙 Back", callback_data="menu", style="danger")]
-    ])
+    return InlineKeyboardMarkup(keyboard)
 
-# ═══════════════ START HANDLER ═══════════════
-@router.message(CommandStart(deep_link=True))
-async def start_with_referral(message: Message, command: CommandObject):
-    user = get_user(message.from_user.id)
-    if user.is_banned: return await message.answer("🚫 You are banned.")
-    args = command.args
-    if args and args.startswith("REF_"):
-        referrer_id = int(args.split("_")[1])
-        if user.referrer_id is None and referrer_id != message.from_user.id:
-            user.referrer_id = referrer_id; db.commit()
-            await message.answer("🎉 Referral link applied!")
-    await send_welcome(message)
 
-@router.message(CommandStart())
-async def start_cmd(message: Message):
-    await send_welcome(message)
+def generate_giveaway_id() -> str:
+    """Generate an 8-character giveaway ID."""
+    while True:
+        giveaway_id = "".join(
+            random.choices(
+                string.ascii_letters + string.digits,
+                k=8,
+            )
+        )
 
-async def send_welcome(message: Message):
-    user = get_user(message.from_user.id)
-    if user.is_banned: return await message.answer("🚫 You are banned.")
-    if not await is_user_joined(message.from_user.id):
-        return await message.answer("⚠️ **Bot use karne ke liye pehle hamare Official Channels join karein!**", reply_markup=get_join_keyboard())
-    t = TEXTS.get(user.lang, TEXTS["en"])
-    text = t["welcome"].format(name=message.from_user.first_name, id=user.id, balance=user.balance)
-    await message.answer(text, reply_markup=user_main_menu_kb(user.id, user.is_admin, user.lang))
+        if giveaway_id not in giveaways:
+            return giveaway_id
 
-@router.callback_query(F.data == "check_join")
-async def check_join_cb(call: CallbackQuery):
-    if await is_user_joined(call.from_user.id):
-        await call.message.delete()
-        # Fix: Send welcome using call.message
-        user = get_user(call.from_user.id)
-        t = TEXTS.get(user.lang, TEXTS["en"])
-        text = t["welcome"].format(name=call.from_user.first_name, id=user.id, balance=user.balance)
-        await call.message.answer(text, reply_markup=user_main_menu_kb(user.id, user.is_admin, user.lang))
-    else: await call.answer("❌ Aapne abhi tak saare channels join nahi kiye!", show_alert=True)
 
-@router.callback_query(F.data == "menu")
-async def menu_cb(call: CallbackQuery):
-    await call.message.delete()
-    user = get_user(call.from_user.id)
-    t = TEXTS.get(user.lang, TEXTS["en"])
-    text = t["welcome"].format(name=call.from_user.first_name, id=user.id, balance=user.balance)
-    await call.message.answer(text, reply_markup=user_main_menu_kb(user.id, user.is_admin, user.lang))
+# ============================================================
+# JSON DATABASE
+# ============================================================
 
-# ═══════════════ USER HANDLERS ═══════════════
-@router.callback_query(F.data == "admin_panel")
-async def admin_panel_callback(call: CallbackQuery):
-    user = get_user(call.from_user.id)
-    if user.id != ADMIN_ID and not user.is_admin: return await call.answer("❌ Access Denied!", show_alert=True)
-    await call.message.edit_text("🩸 **Bloodline Admin Panel** 🩸", reply_markup=admin_panel_kb())
+def load_data() -> None:
+    """
+    Load JSON database and normalize numeric dictionary keys.
 
-@router.callback_query(F.data == "developer_btn")
-async def developer_info(call: CallbackQuery):
-    text = f"🧑‍💻 **Developer Info**\n\n👤 Name: Rudra\n📩 Telegram: @RudraBhagwanHun\n\n💬 Kisi bhi query ya support ke liye contact karein."
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Contact Developer", url="https://t.me/RudraBhagwanHun", style="primary")], [InlineKeyboardButton(text="🔙 Back", callback_data="menu", style="danger")]])
-    await call.message.answer(text, reply_markup=kb)
+    JSON always converts dictionary keys to strings. Telegram user IDs
+    are numeric, so we convert relevant keys back to int after loading.
+    """
 
-@router.callback_query(F.data == "user_profile")
-async def user_profile(call: CallbackQuery):
-    user = get_user(call.from_user.id)
-    text = f"👑 **Profile**\n\nID: `{user.id}`\nBalance: `${user.balance:.2f}`\nReferral Earnings: `${user.referral_earnings:.2f}`"
-    await call.message.answer(text)
+    global giveaways, all_users, channel_history
 
-@router.callback_query(F.data == "daily_bonus")
-async def daily_bonus(call: CallbackQuery):
-    user = get_user(call.from_user.id); now = datetime.utcnow()
-    if user.last_bonus_date and (now - user.last_bonus_date).days < 1:
-        return await call.answer("⏳ You already claimed today's bonus!", show_alert=True)
-    bonus = 0.01; user.balance += bonus; user.last_bonus_date = now; db.commit()
-    log_transaction(user.id, "Daily Bonus", bonus)
-    await call.message.answer(f"🎁 You claimed ${bonus:.2f} Daily Bonus!")
+    if not os.path.exists(DATA_FILE):
+        giveaways = {}
+        all_users = {}
+        channel_history = {}
+        return
 
-@router.callback_query(F.data == "user_referral")
-async def user_referral(call: CallbackQuery):
-    bot_info = await bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start=REF_{call.from_user.id}"
-    user = get_user(call.from_user.id)
-    text = f"🤝 **Referral Program**\n\nInvite friends and earn $0.01 per referral!\n\n🔗 Your Link:\n`{ref_link}`\n\n💰 Total Earnings: `${user.referral_earnings:.2f}`"
-    await call.message.answer(text)
-
-@router.callback_query(F.data == "api_key")
-async def show_api_key(call: CallbackQuery):
-    user_id = call.from_user.id
-    api_key_obj = db.query(ApiKey).filter(ApiKey.user_id == user_id).first()
-    if not api_key_obj:
-        new_key = f"BLD-{random.randint(1000,9999)}-{random.randint(1000,9999)}"
-        api_key_obj = ApiKey(user_id=user_id, api_key=new_key, status="Active")
-        db.add(api_key_obj); db.commit()
-    text = f"🔑 **Aapki API Key**\n\n`{api_key_obj.api_key}`\n\n📌 Status: {api_key_obj.status}\n\n📖 **Documentation:**\nEndpoint: `https://api.bloodline.com/v1/buy`\nHeaders: `X-API-Key: {api_key_obj.api_key}`\n\n⚠️ Kisi ke saath share na karein."
-    await call.message.answer(text)
-
-@router.callback_query(F.data == "language")
-async def language_menu(call: CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🇬🇧 English", callback_data="set_lang_en", style="primary"), InlineKeyboardButton(text="🇮🇳 Hindi", callback_data="set_lang_hi", style="success")],
-        [InlineKeyboardButton(text="🇷🇺 Russian", callback_data="set_lang_ru", style="primary"), InlineKeyboardButton(text="🇸🇦 Arabic", callback_data="set_lang_ar", style="success")],
-        [InlineKeyboardButton(text="🔙 Back", callback_data="menu", style="danger")]])
-    await call.message.edit_text("🌐 **Select Language / Bhasha Chunein**", reply_markup=kb)
-
-@router.callback_query(F.data.startswith("set_lang_"))
-async def set_language(call: CallbackQuery):
-    lang_code = call.data.split("_")[2]
-    user = get_user(call.from_user.id); user.lang = lang_code; db.commit()
-    await call.answer(f"✅ Language set successfully!", show_alert=True)
-    # Refresh menu
-    t = TEXTS.get(user.lang, TEXTS["en"])
-    text = t["welcome"].format(name=call.from_user.first_name, id=user.id, balance=user.balance)
-    await call.message.edit_text(text, reply_markup=user_main_menu_kb(user.id, user.is_admin, user.lang))
-
-# --- TOP UP ---
-@router.callback_query(F.data == "top_up")
-async def top_up_start(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("Enter amount in INR you want to deposit (e.g., 100, 500):"); await state.set_state(UserTopUpStates.amount_inr)
-
-@router.message(UserTopUpStates.amount_inr)
-async def process_topup_amount(message: Message, state: FSMContext):
-    try: inr_amount = float(message.text); usd_amount = inr_amount * 0.01
-    except ValueError: return await message.answer("❌ Invalid amount. Please enter a number.")
-    upi_id = get_setting("upi_id"); qr_code = get_setting("qr_code")
-    if not upi_id: return await message.answer("❌ Admin hasn't set UPI ID yet.")
-    await state.update_data(amount_inr=inr_amount, amount_usd=usd_amount)
-    text = f"💳 **Payment Details**\n\nAmount: **{inr_amount} INR**\nYou get: **${usd_amount:.2f}**\n\nUPI ID: `{upi_id}`\n\n👉 **Please pay and send the SCREENSHOT or UTR below.**"
-    if qr_code: await message.answer_photo(photo=qr_code, caption=text)
-    else: await message.answer(text)
-    await state.set_state(UserTopUpStates.payment_proof)
-
-@router.message(UserTopUpStates.payment_proof)
-async def process_payment_proof(message: Message, state: FSMContext):
-    data = await state.get_data()
-    screenshot_file_id = message.photo[-1].file_id if message.photo else None
-    utr_text = message.caption if message.photo else message.text
-    new_req = TopUpRequest(user_id=message.from_user.id, amount_inr=data['amount_inr'], amount_usd=data['amount_usd'], utr=utr_text, screenshot_file_id=screenshot_file_id)
-    db.add(new_req); db.commit()
-    admin_text = f"🔔 **New Top-Up Request!**\n\nUser ID: `{message.from_user.id}`\nAmount: **{data['amount_inr']} INR** (${data['amount_usd']:.2f})\nUTR/Note: `{utr_text}`"
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Approve", callback_data=f"topup_appr_{new_req.id}", style="success"), InlineKeyboardButton(text="❌ Reject", callback_data=f"topup_rej_{new_req.id}", style="danger")]])
-    if screenshot_file_id: await bot.send_photo(ADMIN_ID, photo=screenshot_file_id, caption=admin_text, reply_markup=admin_kb)
-    else: await bot.send_message(ADMIN_ID, admin_text, reply_markup=admin_kb)
-    await message.answer("✅ Request submitted! Admin will verify and add balance soon."); await state.clear()
-
-# --- WITHDRAW ---
-@router.callback_query(F.data == "user_withdraw")
-async def withdraw_start(call: CallbackQuery, state: FSMContext):
-    user = get_user(call.from_user.id)
-    await call.message.answer(f"Your Balance: ${user.balance:.2f}\n\nEnter amount in USD to withdraw (Min $0.50):"); await state.set_state(UserWithdrawStates.amount)
-
-@router.message(UserWithdrawStates.amount)
-async def process_withdraw_amount(message: Message, state: FSMContext):
     try:
-        amt = float(message.text); user = get_user(message.from_user.id)
-        if amt < 0.50 or amt > user.balance: return await message.answer("❌ Invalid amount or insufficient balance (Min $0.50).")
-        await state.update_data(amount=amt); await message.answer("Enter your UPI ID:"); await state.set_state(UserWithdrawStates.upi_id)
-    except ValueError: await message.answer("❌ Invalid number.")
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-@router.message(UserWithdrawStates.upi_id)
-async def process_withdraw_upi(message: Message, state: FSMContext):
-    data = await state.get_data()
-    req = WithdrawRequest(user_id=message.from_user.id, amount_usd=data['amount'], upi_id=message.text)
-    db.add(req); db.commit()
-    await bot.send_message(ADMIN_ID, f"🔔 **Withdraw Request**\nUser: `{message.from_user.id}`\nAmount: ${data['amount']:.2f}\nUPI: `{message.text}`",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Approve", callback_data=f"wd_appr_{req.id}", style="success"), InlineKeyboardButton(text="❌ Reject", callback_data=f"wd_rej_{req.id}", style="danger")]]))
-    await message.answer("✅ Withdrawal request sent to admin."); await state.clear()
+        giveaways = data.get("giveaways", {}) or {}
+        all_users = data.get("all_users", {}) or {}
+        channel_history = data.get("channel_history", {}) or {}
 
-# --- SELL ACCOUNT ---
-@router.callback_query(F.data == "sell_acc")
-async def sell_acc_start(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("Enter Your Phone Number (with country code, e.g., +919876543210):"); await state.set_state(UserSellStates.sell_phone)
+        # --------------------------------------------------------
+        # Normalize giveaway dictionaries
+        # --------------------------------------------------------
 
-@router.message(UserSellStates.sell_phone)
-async def sell_phone(message: Message, state: FSMContext):
-    phone = message.text
+        for giveaway_id, giveaway in giveaways.items():
+
+            giveaway.setdefault("users", {})
+            giveaway.setdefault("vote_counts", {})
+            giveaway.setdefault("voted_users", {})
+            giveaway.setdefault("ended", False)
+
+            # users
+            normalized_users = {}
+
+            for uid, name in giveaway["users"].items():
+                normalized_uid = normalize_user_id(uid)
+
+                if normalized_uid is not None:
+                    normalized_users[normalized_uid] = name
+
+            giveaway["users"] = normalized_users
+
+            # vote_counts
+            normalized_votes = {}
+
+            for uid, votes in giveaway["vote_counts"].items():
+                normalized_uid = normalize_user_id(uid)
+
+                if normalized_uid is not None:
+                    try:
+                        normalized_votes[normalized_uid] = max(0, int(votes))
+                    except (TypeError, ValueError):
+                        normalized_votes[normalized_uid] = 0
+
+            giveaway["vote_counts"] = normalized_votes
+
+            # voted_users
+            normalized_voters = {}
+
+            for target_uid, voters in giveaway["voted_users"].items():
+
+                normalized_target = normalize_user_id(target_uid)
+
+                if normalized_target is None:
+                    continue
+
+                # Older versions could have stored lists.
+                if isinstance(voters, list):
+                    voter_set = set()
+
+                    for voter in voters:
+                        normalized_voter = normalize_user_id(voter)
+
+                        if normalized_voter is not None:
+                            voter_set.add(normalized_voter)
+
+                    normalized_voters[normalized_target] = voter_set
+
+                elif isinstance(voters, set):
+                    normalized_voters[normalized_target] = {
+                        int(v)
+                        for v in voters
+                        if normalize_user_id(v) is not None
+                    }
+
+                else:
+                    normalized_voters[normalized_target] = set()
+
+            giveaway["voted_users"] = normalized_voters
+
+        logger.info(
+            "Loaded: %s giveaways, %s users, %s channels",
+            len(giveaways),
+            len(all_users),
+            len(channel_history),
+        )
+
+    except Exception as e:
+        logger.exception("Error loading database: %s", e)
+
+        # Do not destroy an existing file on a temporary read failure.
+        giveaways = {}
+        all_users = {}
+        channel_history = {}
+
+
+def make_json_safe(value: Any) -> Any:
+    """
+    Recursively convert sets and non-string dictionary keys into JSON-safe
+    values while keeping the runtime dictionaries untouched.
+    """
+
+    if isinstance(value, dict):
+        result = {}
+
+        for key, item in value.items():
+
+            if isinstance(key, int):
+                json_key = str(key)
+            else:
+                json_key = str(key)
+
+            result[json_key] = make_json_safe(item)
+
+        return result
+
+    if isinstance(value, set):
+        return [
+            make_json_safe(item)
+            for item in sorted(
+                value,
+                key=lambda x: str(x),
+            )
+        ]
+
+    if isinstance(value, list):
+        return [make_json_safe(item) for item in value]
+
+    if isinstance(value, tuple):
+        return [make_json_safe(item) for item in value]
+
+    return value
+
+
+def save_data() -> bool:
+    """
+    Atomically save the database.
+
+    The temporary file + os.replace approach prevents a process crash from
+    leaving bot_data.json half-written.
+    """
+
+    temp_file = f"{DATA_FILE}.tmp"
+
     try:
-        parsed = phonenumbers.parse(phone, None); country = phonenumbers.region_code_for_number(parsed)
-        price = PRICE_GUIDE.get(country, 0.20)
-    except: return await message.answer("❌ Invalid phone number. Use country code.")
-    await state.update_data(phone=phone, price=price, country=country)
-    text = f"🌍 Country: {country}\n💰 Our Offer: ${price:.2f}\n\nDo you want to sell?"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Accept", callback_data="confirm_sell_yes", style="success"), InlineKeyboardButton(text="❌ Cancel", callback_data="confirm_sell_no", style="danger")]])
-    await message.answer(text, reply_markup=kb); await state.set_state(UserSellStates.confirm_sell)
+        data = {
+            "giveaways": make_json_safe(giveaways),
+            "all_users": make_json_safe(all_users),
+            "channel_history": make_json_safe(channel_history),
+            "last_saved": now_iso(),
+        }
 
-@router.callback_query(F.data == "confirm_sell_yes")
-async def confirm_sell_yes(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data(); await call.message.edit_text("⏳ Sending OTP...")
+        with open(
+            temp_file,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                data,
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(temp_file, DATA_FILE)
+
+        return True
+
+    except Exception as e:
+        logger.exception("Error saving database: %s", e)
+
+        try:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        except Exception:
+            pass
+
+        return False
+
+
+# ============================================================
+# USER DATABASE
+# ============================================================
+
+def save_user(
+    user_id: int,
+    username: Optional[str],
+    first_name: str,
+    last_name: Optional[str] = None,
+    source: Optional[str] = None,
+) -> bool:
+
+    user_key = str(user_id)
+
+    if user_key not in all_users:
+
+        all_users[user_key] = {
+            "user_id": user_id,
+            "username": username,
+            "first_name": first_name,
+            "last_name": last_name,
+            "joined_at": now_iso(),
+            "last_active": now_iso(),
+            "source": source or "unknown",
+            "total_votes_given": 0,
+            "total_giveaways_joined": 0,
+        }
+
+    else:
+
+        user_data = all_users[user_key]
+
+        user_data["last_active"] = now_iso()
+
+        if username:
+            user_data["username"] = username
+
+        if first_name:
+            user_data["first_name"] = first_name
+
+        if last_name is not None:
+            user_data["last_name"] = last_name
+
+        if source:
+            user_data["source"] = source
+
+    return save_data()
+
+
+def update_user_stats(
+    user_id: int,
+    action: str,
+) -> None:
+
+    user_key = str(user_id)
+
+    if user_key not in all_users:
+        return
+
+    if action == "vote":
+
+        all_users[user_key]["total_votes_given"] = (
+            all_users[user_key].get("total_votes_given", 0) + 1
+        )
+
+    elif action == "join":
+
+        all_users[user_key]["total_giveaways_joined"] = (
+            all_users[user_key].get(
+                "total_giveaways_joined",
+                0,
+            ) + 1
+        )
+
+    save_data()
+
+
+# ============================================================
+# CHANNEL HISTORY
+# ============================================================
+
+def update_channel_history(
+    channel_identifier: str,
+    channel_display: str,
+    channel_id: int,
+    user_id: int,
+    user_name: str,
+    action: str,
+    giveaway_id: Optional[str] = None,
+) -> None:
+
+    channel_key = str(channel_identifier)
+
+    if channel_key not in channel_history:
+
+        channel_type = (
+            "public"
+            if str(channel_identifier).startswith("@")
+            else "private"
+        )
+
+        channel_history[channel_key] = {
+            "channel_identifier": channel_identifier,
+            "channel_display": channel_display,
+            "channel_id": channel_id,
+            "type": channel_type,
+            "total_giveaways": 0,
+            "giveaways": [],
+            "created_by": user_id,
+            "created_by_name": user_name,
+            "first_created": now_iso(),
+        }
+
+    channel_data = channel_history[channel_key]
+
+    if action == "create":
+
+        channel_data["total_giveaways"] = (
+            channel_data.get("total_giveaways", 0) + 1
+        )
+
+        channel_data.setdefault("giveaways", []).append(
+            {
+                "giveaway_id": giveaway_id,
+                "created_at": now_iso(),
+                "status": "active",
+                "participants": 0,
+            }
+        )
+
+        channel_data["last_giveaway"] = now_iso()
+
+    elif action == "end" and giveaway_id:
+
+        for giveaway_data in channel_data.get(
+            "giveaways",
+            [],
+        ):
+
+            if giveaway_data.get("giveaway_id") == giveaway_id:
+
+                giveaway_data["status"] = "ended"
+                giveaway_data["ended_at"] = now_iso()
+
+                break
+
+    save_data()
+
+
+# ============================================================
+# CHANNEL HELPERS
+# ============================================================
+
+async def get_channel_link(
+    context: ContextTypes.DEFAULT_TYPE,
+    channel_id: Any,
+    channel_identifier: str,
+) -> str:
+
+    identifier = str(channel_identifier or "")
+
+    # Public channel
+    if identifier.startswith("@"):
+        return f"https://t.me/{identifier[1:]}"
+
     try:
-        client, phone_code_hash = await start_telethon_login(data['phone'], API_ID, API_HASH)
-        await state.update_data(client=client, phone_code_hash=phone_code_hash)
-        await call.message.answer("Enter OTP:"); await state.set_state(UserSellStates.sell_otp)
-    except Exception as e: await call.message.answer(f"❌ Error: {e}"); await state.clear()
 
-@router.callback_query(F.data == "confirm_sell_no")
-async def confirm_sell_no(call: CallbackQuery, state: FSMContext): await call.message.edit_text("❌ Selling cancelled."); await state.clear()
+        chat = await context.bot.get_chat(channel_id)
 
-@router.message(UserSellStates.sell_otp)
-async def sell_otp(message: Message, state: FSMContext):
-    data = await state.get_data(); client = data['client']
+        # Existing invite link
+        if getattr(chat, "invite_link", None):
+            return chat.invite_link
+
+        # Try creating an invite link.
+        # This works only when the bot has the appropriate admin rights.
+        try:
+
+            invite = await context.bot.create_chat_invite_link(
+                chat_id=channel_id,
+                name="Giveaway Bot Invite",
+            )
+
+            if invite and invite.invite_link:
+                return invite.invite_link
+
+        except Exception as invite_error:
+            logger.warning(
+                "Could not create invite link for %s: %s",
+                channel_id,
+                invite_error,
+            )
+
+    except Exception as e:
+        logger.warning(
+            "Could not obtain channel link: %s",
+            e,
+        )
+
+    # Preserve the original fallback.
+    return f"https://t.me/{BOT_USERNAME}?startchannel=true"
+
+
+async def check_channel_membership(
+    context: ContextTypes.DEFAULT_TYPE,
+    channel_id: Any,
+    user_id: int,
+) -> bool:
+
+    if not channel_id:
+        return False
+
     try:
-        session = await verify_telethon_otp(client, data['phone'], message.text, data['phone_code_hash'])
-        await setup_new_2fa_and_save(client, data, message, session)
-    except errors.SessionPasswordNeededError:
-        await message.answer("🔐 2FA Detected. Enter current 2FA Password:"); await state.set_state(UserSellStates.sell_2fa)
-    except Exception as e: await message.answer(f"❌ Invalid OTP: {e}")
 
-@router.message(UserSellStates.sell_2fa)
-async def sell_2fa(message: Message, state: FSMContext):
-    data = await state.get_data(); client = data['client']
+        member = await context.bot.get_chat_member(
+            chat_id=channel_id,
+            user_id=user_id,
+        )
+
+        return member_is_present(member)
+
+    except Exception as e:
+
+        logger.warning(
+            "Membership check failed. Channel=%s User=%s Error=%s",
+            channel_id,
+            user_id,
+            e,
+        )
+
+        return False
+
+
+# ============================================================
+# OWNER NOTIFICATION
+# ============================================================
+
+async def send_notification_to_owner(
+    context: ContextTypes.DEFAULT_TYPE,
+    title: str,
+    message: str,
+) -> None:
+
+    if not OWNER_ID:
+        return
+
     try:
-        await client.sign_in(password=message.text); session = client.session.save()
-        await setup_new_2fa_and_save(client, data, message, session)
-    except Exception as e: await message.answer(f"❌ Wrong 2FA: {e}")
 
-async def setup_new_2fa_and_save(client, data, message, session):
-    new_2fa = str(random.randint(100000, 999999))
-    try: await client.edit_2fa(new_password=new_2fa)
-    except: pass
-    req = SellRequest(user_id=message.from_user.id, phone=data['phone'], session_string=session, price_usd=data['price'])
-    db.add(req); db.commit()
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Approve", callback_data=f"sell_appr_{req.id}", style="success"), InlineKeyboardButton(text="❌ Reject", callback_data=f"sell_rej_{req.id}", style="danger")]])
-    await bot.send_message(ADMIN_ID, f"🔔 **Sell Request**\nUser: `{message.from_user.id}`\nPhone: `{data['phone']}`\nPrice: ${data['price']:.2f}\nNew 2FA: `{new_2fa}`", reply_markup=admin_kb)
-    await message.answer(f"✅ Verified! 2FA set to `{new_2fa}`.\n\n👉 **Please LOGOUT from your Telegram app now.** Wait for admin approval.")
-    await state.clear(); await client.disconnect()
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                f"<b>{title}</b>\n\n"
+                f"{message}"
+            ),
+            parse_mode="HTML",
+        )
 
-# --- BUY ACCOUNT ---
-@router.callback_query(F.data == "buy_acc")
-async def buy_acc_menu(call: CallbackQuery):
-    products = db.query(Product).all()
-    if not products: return await call.message.answer("❌ No products available.")
-    kb = [[InlineKeyboardButton(text=f"{p.name} - ${p.price_usd:.2f}", callback_data=f"view_prod_{p.id}", style="primary")] for p in products]
-    await call.message.answer("🛒 Select a product:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    except Exception as e:
 
-@router.callback_query(F.data.startswith("view_prod_"))
-async def view_product(call: CallbackQuery):
-    prod_id = int(call.data.split("_")[2]); product = db.query(Product).filter(Product.id == prod_id).first()
-    if not product: return await call.answer("❌ Product not found.", show_alert=True)
-    text = (f"📦 **{product.name}**\n\n🌍 Country: {product.country}\n💵 Price: ${product.price_usd:.2f}\n\n📝 **Description:**\n{product.description or 'No description provided.'}")
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Confirm Buy", callback_data=f"confirm_buy_{prod_id}", style="success"), InlineKeyboardButton(text="❌ Cancel", callback_data="buy_acc", style="danger")], [InlineKeyboardButton(text="⭐ Add to Wishlist", callback_data=f"wishlist_add_{prod_id}", style="primary")]])
-    await call.message.edit_text(text, reply_markup=kb)
+        logger.error(
+            "Failed to send owner notification: %s",
+            e,
+        )
 
-@router.callback_query(F.data.startswith("confirm_buy_"))
-async def confirm_buy(call: CallbackQuery):
-    prod_id = int(call.data.split("_")[2]); product = db.query(Product).filter(Product.id == prod_id).first()
-    user = get_user(call.from_user.id)
-    if user.balance < product.price_usd: return await call.answer(f"❌ Insufficient balance! Need ${product.price_usd:.2f}", show_alert=True)
-    stock = db.query(StockAccount).filter(StockAccount.product_id == prod_id, StockAccount.status == "Available").order_by(func.random()).first()
-    if not stock: return await call.message.answer("😔 Out of stock.")
-    user.balance -= product.price_usd; stock.status = "Sold"; db.commit()
-    log_transaction(user.id, "Buy Account", -product.price_usd)
-    text = f"🎉 **Purchase Successful!**\n\nProduct: {product.name}\nPhone: `{stock.phone}`\n\nLogin with this number, and click Get OTP when needed."
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📩 Get OTP", callback_data=f"get_otp_{stock.id}", style="primary")]])
-    await call.message.edit_text(text, reply_markup=kb)
-    rating_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="1 ⭐", callback_data=f"rate_1_{product.id}", style="danger"), InlineKeyboardButton(text="2 ⭐", callback_data=f"rate_2_{product.id}", style="danger")], [InlineKeyboardButton(text="3 ⭐", callback_data=f"rate_3_{product.id}", style="primary"), InlineKeyboardButton(text="4 ⭐", callback_data=f"rate_4_{product.id}", style="success")], [InlineKeyboardButton(text="5 ⭐", callback_data=f"rate_5_{product.id}", style="success")]])
-    await bot.send_message(call.from_user.id, f"⭐ **Apna experience rate karein!**\n\nAapne `{product.name}` kharida. Kripya 1 se 5 star dein:", reply_markup=rating_kb)
 
-@router.callback_query(F.data.startswith("rate_"))
-async def save_rating(call: CallbackQuery):
-    parts = call.data.split("_"); score = int(parts[1]); prod_id = int(parts[2])
-    db.add(Rating(user_id=call.from_user.id, product_id=prod_id, score=score)); db.commit()
-    await call.message.edit_text(f"✅ Shukriya! Aapne {score} ⭐ diya.")
-    if score <= 2:
-        product = db.query(Product).filter(Product.id == prod_id).first()
-        await bot.send_message(ADMIN_ID, f"⚠️ **LOW RATING ALERT!**\n\n👤 User: `{call.from_user.id}`\n📦 Product: {product.name if product else 'Unknown'}\n⭐ Rating: {score} Star")
+# ============================================================
+# VOTE BUTTON UPDATE
+# ============================================================
 
-@router.callback_query(F.data.startswith("get_otp_"))
-async def fetch_otp(call: CallbackQuery):
-    stock_id = int(call.data.split("_")[2]); stock = db.query(StockAccount).filter(StockAccount.id == stock_id).first()
-    await call.message.answer("⏳ Checking OTP from TG-Shark API...")
-    otp = await fetch_otp_from_tgshark(stock.phone)
-    if otp:
-        resp = f"🔑 **OTP:** `{otp}`\n"
-        if stock.password_2fa: resp += f"🔐 **2FA Password:** `{stock.password_2fa}`"
-        await call.message.answer(resp)
-    else: await call.message.answer("❌ OTP abhi tak nahi aaya. 10 second wait karke dobara try karein.")
+async def update_vote_button_in_channel(
+    context: ContextTypes.DEFAULT_TYPE,
+    giveaway_id: str,
+    user_id: int,
+    new_votes: int,
+) -> bool:
 
-@router.callback_query(F.data == "user_history")
-async def user_history(call: CallbackQuery):
-    txs = db.query(Transaction).filter(Transaction.user_id == call.from_user.id).order_by(Transaction.date.desc()).limit(10).all()
-    if not txs: return await call.message.answer("📜 No transactions yet.")
-    text = "📜 **Last 10 Transactions**\n\n"
-    for t in txs: text += f"`{t.date.strftime('%m-%d %H:%M')}` | {t.type} | ${t.amount:.2f} | {t.status}\n"
-    await call.message.answer(text)
-
-@router.callback_query(F.data == "user_support")
-async def support_start(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("📩 **Support Ticket**\n\nApni problem ya query likh kar bhejein. Admin jald hi reply karega:"); await state.set_state(UserSupportStates.waiting_message)
-
-@router.message(UserSupportStates.waiting_message)
-async def support_send(message: Message, state: FSMContext):
-    await state.clear(); ticket_id = random.randint(1000, 9999)
-    admin_text = f"🎫 **New Support Ticket #{ticket_id}**\n\n👤 User: {message.from_user.first_name} (`{message.from_user.id}`)\n📝 Message: {message.text}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Reply", callback_data=f"reply_ticket_{message.from_user.id}", style="primary")]])
-    await bot.send_message(ADMIN_ID, admin_text, reply_markup=kb)
-    await message.answer(f"✅ Ticket #{ticket_id} submit ho gaya! Admin jald reply karega.")
-
-@router.callback_query(F.data.startswith("reply_ticket_"))
-async def admin_reply_ticket(call: CallbackQuery, state: FSMContext):
-    await state.update_data(reply_to=int(call.data.split("_")[2]))
-    await call.message.answer("✍️ User ko reply likhein:"); await state.set_state(AdminStates.reply_ticket)
-
-@router.message(AdminStates.reply_ticket)
-async def send_ticket_reply(message: Message, state: FSMContext):
-    data = await state.get_data()
     try:
-        await bot.send_message(data['reply_to'], f"📩 **Support Reply:**\n\n{message.text}"); await message.answer("✅ Reply bhej diya gaya!")
-    except Exception as e: await message.answer(f"❌ Error: {e}")
-    await state.clear()
 
-@router.callback_query(F.data.startswith("wishlist_add_"))
-async def add_to_wishlist(call: CallbackQuery):
-    prod_id = call.data.split("_")[2]; user = get_user(call.from_user.id)
-    wl = user.wishlist.split(",") if user.wishlist else []
-    if prod_id not in wl:
-        wl.append(prod_id); user.wishlist = ",".join(wl); db.commit(); await call.answer("⭐ Wishlist me add ho gaya!", show_alert=True)
-    else: await call.answer("Pehle se wishlist me hai!", show_alert=True)
+        giveaway = giveaways.get(giveaway_id)
 
-@router.callback_query(F.data == "user_wishlist")
-async def show_wishlist(call: CallbackQuery):
-    user = get_user(call.from_user.id)
-    if not user.wishlist: return await call.message.answer("⭐ Aapki wishlist khaali hai.")
-    text = "⭐ **Aapki Wishlist**\n\n"
-    for pid in user.wishlist.split(","):
-        p = db.query(Product).filter(Product.id == int(pid)).first()
-        if p: text += f"📦 {p.name} - ${p.price_usd:.2f}\n"
-    await call.message.answer(text)
+        if not giveaway:
+            return False
 
-# ═══════════════ ADMIN HANDLERS ═══════════════
-@router.callback_query(F.data == "admin_back")
-async def admin_back(call: CallbackQuery): await call.message.edit_text("🩸 **Bloodline Admin Panel** 🩸", reply_markup=admin_panel_kb())
+        message_map = vote_messages.get(
+            giveaway_id,
+            {},
+        )
 
-@router.callback_query(F.data == "admin_stats")
-async def admin_stats(call: CallbackQuery):
-    total_users = db.query(User).count(); total_balance = db.query(func.sum(User.balance)).scalar() or 0.0
-    total_sold = db.query(StockAccount).filter(StockAccount.status == "Sold").count()
-    pending_sells = db.query(SellRequest).filter(SellRequest.status == "Pending").count()
-    pending_topups = db.query(TopUpRequest).filter(TopUpRequest.status == "Pending").count()
-    pending_wd = db.query(WithdrawRequest).filter(WithdrawRequest.status == "Pending").count()
-    text = (f"📊 **Bot Statistics**\n\n👥 Users: `{total_users}`\n💰 Balance in System: `${total_balance:.2f}`\n📦 Accounts Sold: `{total_sold}`\n⏳ Pending Sells: `{pending_sells}`\n⏳ Pending Top-ups: `{pending_topups}`\n⏳ Pending Withdrawals: `{pending_wd}`")
-    await call.message.answer(text)
+        message_id = message_map.get(user_id)
 
-# --- FORCE JOIN MANAGEMENT ---
-@router.callback_query(F.data == "admin_force_join")
-async def admin_force_join(call: CallbackQuery):
-    channels = db.query(ForceJoinChannel).all()
-    text = f"📢 **Force Join Channels ({len(channels)}/4)**\n\n"
-    kb = []
-    if not channels: text += "Koi channel add nahi hai.\n"
-    for ch in channels:
-        text += f"• @{ch.username} — [Link]({ch.link})\n"
-        kb.append([InlineKeyboardButton(text=f"🗑️ Delete @{ch.username}", callback_data=f"del_fj_{ch.id}", style="danger")])
-    if len(channels) < 4:
-        kb.append([InlineKeyboardButton(text="➕ Add Channel", callback_data="add_fj", style="success")])
-    kb.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_panel", style="danger")])
-    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        if not message_id:
+            return False
 
-@router.callback_query(F.data == "add_fj")
-async def add_fj_start(call: CallbackQuery, state: FSMContext):
-    channels = db.query(ForceJoinChannel).all()
-    if len(channels) >= 4: return await call.answer("❌ Max 4 channels allowed!", show_alert=True)
-    await call.message.answer("Enter Channel Username (without @, e.g., BloodlineOfficial):"); await state.set_state(AdminStates.fj_username)
+        new_keyboard = [
+            [
+                premium_button(
+                    f"Vote - {new_votes}",
+                    callback_data=(
+                        f"vote_{giveaway_id}_{user_id}"
+                    ),
+                    emoji_id=EMOJI_VOTE,
+                    style=BUTTON_STYLE_SUCCESS,
+                )
+            ]
+        ]
 
-@router.message(AdminStates.fj_username)
-async def add_fj_username(message: Message, state: FSMContext):
-    await state.update_data(fj_username=message.text.replace("@", ""))
-    await message.answer("Enter Channel Link (e.g., https://t.me/BloodlineOfficial):"); await state.set_state(AdminStates.fj_link)
+        await context.bot.edit_message_reply_markup(
+            chat_id=giveaway["channel_id"],
+            message_id=message_id,
+            reply_markup=InlineKeyboardMarkup(
+                new_keyboard
+            ),
+        )
 
-@router.message(AdminStates.fj_link)
-async def add_fj_link(message: Message, state: FSMContext):
-    data = await state.get_data()
-    db.add(ForceJoinChannel(username=data['fj_username'], link=message.text)); db.commit()
-    await message.answer("✅ Channel added to Force Join!"); await state.clear()
+        return True
 
-@router.callback_query(F.data.startswith("del_fj_"))
-async def del_fj(call: CallbackQuery):
-    fj_id = int(call.data.split("_")[2])
-    db.query(ForceJoinChannel).filter(ForceJoinChannel.id == fj_id).delete(); db.commit()
-    await call.answer("🗑️ Channel deleted!", show_alert=True)
-    await admin_force_join(call)
+    except Exception as e:
 
-# --- ADD PRODUCT ---
-@router.callback_query(F.data == "admin_add_prod")
-async def add_prod_start(call: CallbackQuery, state: FSMContext): await call.message.answer("Enter Product Name:"); await state.set_state(AdminStates.add_prod_name)
+        logger.warning(
+            "Failed to update vote button: %s",
+            e,
+        )
 
-@router.message(AdminStates.add_prod_name)
-async def add_prod_name(message: Message, state: FSMContext):
-    await state.update_data(prod_name=message.text); await message.answer("Enter Product Description:"); await state.set_state(AdminStates.add_prod_desc)
+        return False
 
-@router.message(AdminStates.add_prod_desc)
-async def add_prod_desc(message: Message, state: FSMContext):
-    await state.update_data(prod_desc=message.text); await message.answer("Enter Price in INR (e.g., 30 for $0.30):"); await state.set_state(AdminStates.add_prod_price)
 
-@router.message(AdminStates.add_prod_price)
-async def add_prod_price(message: Message, state: FSMContext):
-    try: price_usd = float(message.text) * 0.01
-    except: return await message.answer("❌ Invalid price.")
-    await state.update_data(price_usd=price_usd); await message.answer("Enter Country Name:"); await state.set_state(AdminStates.add_prod_country)
+# ============================================================
+# START COMMAND
+# ============================================================
 
-@router.message(AdminStates.add_prod_country)
-async def add_prod_country(message: Message, state: FSMContext):
-    data = await state.get_data()
-    db.add(Product(name=data['prod_name'], country=message.text, price_usd=data['price_usd'], description=data.get('prod_desc')))
-    db.commit(); await message.answer("✅ Product added!"); await state.clear()
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
 
-# --- ADD STOCK ---
-@router.callback_query(F.data == "admin_add_stock")
-async def add_stock_start(call: CallbackQuery):
-    prods = db.query(Product).all()
-    if not prods: return await call.message.answer("❌ Add a product first.")
-    kb = [[InlineKeyboardButton(text=f"{p.name}", callback_data=f"stock_prod_{p.id}", style="primary")] for p in prods]
-    await call.message.answer("Select Product:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    if not update.effective_user or not update.message:
+        return
 
-@router.callback_query(F.data.startswith("stock_prod_"))
-async def add_stock_phone(call: CallbackQuery, state: FSMContext):
-    await state.update_data(product_id=int(call.data.split("_")[2])); await call.message.answer("Enter Phone Number:"); await state.set_state(AdminStates.add_stock_phone)
+    user = update.effective_user
 
-@router.message(AdminStates.add_stock_phone)
-async def add_stock_send_otp(message: Message, state: FSMContext):
-    phone = message.text; await state.update_data(phone=phone); await message.answer("⏳ Sending OTP...")
+    save_user(
+        user.id,
+        user.username,
+        user.first_name,
+        user.last_name,
+        source="/start",
+    )
+
+    if context.args:
+
+        giveaway_id = context.args[0].strip()
+
+        await handle_giveaway_link(
+            update,
+            context,
+            giveaway_id,
+        )
+
+        return
+
+    await update.message.reply_text(
+        text=(
+            f"<b><tg-emoji emoji-id='{EMOJI_WELCOME}'>🙂</tg-emoji> "
+            f"WELCOME TO NURROSUL VOTE GIVEAWAY BOT</b>\n\n"
+
+            f"<i><tg-emoji emoji-id='{EMOJI_FIRE}'>☄️</tg-emoji> "
+            f"Create Powerful Vote Giveaways</i>\n"
+
+            f"<i><tg-emoji emoji-id='{EMOJI_ARROW}'>🔜</tg-emoji> "
+            f"Real Time Vote System</i>\n"
+
+            f"<i><tg-emoji emoji-id='{EMOJI_CHART}'>📈</tg-emoji> "
+            f"Advanced Management Tools</i>\n"
+
+            f"<i><tg-emoji emoji-id='{EMOJI_HEART}'>❤️‍🔥</tg-emoji> "
+            f"Leaderboard & Analytics</i>\n\n"
+
+            f"<b><tg-emoji emoji-id='{EMOJI_ROCKET}'>🚀</tg-emoji> "
+            f"START CREATING NOW!</b>"
+        ),
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+# ============================================================
+# GIVEAWAY DEEP LINK
+# ============================================================
+
+async def handle_giveaway_link(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    giveaway_id: str,
+) -> None:
+
+    if not update.message:
+        return
+
+    if giveaway_id not in giveaways:
+
+        await update.message.reply_text(
+            (
+                f"<tg-emoji emoji-id='{EMOJI_ERROR}'>❌</tg-emoji> "
+                f"<b>INVALID LINK</b>"
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    giveaway = giveaways[giveaway_id]
+    user_id = update.effective_user.id
+
+    if giveaway.get("ended", False):
+
+        await update.message.reply_text(
+            (
+                f"<tg-emoji emoji-id='{EMOJI_ENDED}'>❌</tg-emoji> "
+                f"<b>GIVEAWAY ENDED</b>"
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    if user_id in giveaway.get("users", {}):
+
+        await update.message.reply_text(
+            (
+                f"<tg-emoji emoji-id='{EMOJI_STAR}'>🌟</tg-emoji> "
+                f"<b>ALREADY PARTICIPATED!</b>\n\n"
+
+                f"<tg-emoji emoji-id='{EMOJI_ID}'>💌</tg-emoji> "
+                f"<b>Your ID:</b> "
+                f"<code>{user_id}</code>"
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    channel_id = giveaway.get("channel_id")
+
+    is_member = await check_channel_membership(
+        context,
+        channel_id,
+        user_id,
+    )
+
+    channel_display = giveaway.get(
+        "channel_display",
+        giveaway.get("channel", "Channel"),
+    )
+
+    if is_member:
+
+        keyboard = [
+            [
+                premium_button(
+                    "JOIN GIVEAWAY",
+                    callback_data=f"join_{giveaway_id}",
+                    emoji_id=EMOJI_JOIN,
+                    style=BUTTON_STYLE_SUCCESS,
+                )
+            ]
+        ]
+
+        await update.message.reply_text(
+            (
+                f"<tg-emoji emoji-id='{EMOJI_GIFT}'>🎁</tg-emoji> "
+                f"<b>EXCLUSIVE GIVEAWAY</b>\n\n"
+
+                f"<tg-emoji emoji-id='{EMOJI_WINE}'>🍷</tg-emoji> "
+                f"<b>Hosted By:</b> "
+                f"{safe_html(channel_display)}\n"
+
+                f"<tg-emoji emoji-id='{EMOJI_SMILE}'>😎</tg-emoji> "
+                f"<b>Participants:</b> "
+                f"{len(giveaway.get('users', {}))}\n\n"
+
+                f"<tg-emoji emoji-id='{EMOJI_CONFIRM}'>✅</tg-emoji> "
+                f"<b>You are a member of the channel!</b>"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            ),
+        )
+
+        return
+
+    channel_identifier = giveaway.get(
+        "channel",
+        "",
+    )
+
+    channel_link = await get_channel_link(
+        context,
+        channel_id,
+        channel_identifier,
+    )
+
+    keyboard = [
+        [
+            premium_button(
+                "JOIN CHANNEL",
+                url=channel_link,
+                emoji_id=EMOJI_CHANNEL,
+                style=BUTTON_STYLE_SUCCESS,
+            )
+        ],
+        [
+            premium_button(
+                "TRY AGAIN",
+                callback_data=f"retry_join_{giveaway_id}",
+                emoji_id=EMOJI_REFRESH,
+                style=BUTTON_STYLE_PRIMARY,
+            )
+        ],
+    ]
+
+    await update.message.reply_text(
+        (
+            f"<tg-emoji emoji-id='{EMOJI_ALERT}'>⚠️</tg-emoji> "
+            f"<b>CHANNEL MEMBERSHIP REQUIRED</b>\n\n"
+
+            f"<tg-emoji emoji-id='{EMOJI_GIFT}'>🎁</tg-emoji> "
+            f"<b>Giveaway Host:</b> "
+            f"{safe_html(channel_display)}\n\n"
+
+            f"<i>You need to join the channel first to "
+            f"participate in this giveaway!</i>\n\n"
+
+            f"<b>Steps to join:</b>\n"
+            f"1️⃣ Click <b>JOIN CHANNEL</b> below\n"
+            f"2️⃣ Join the channel\n"
+            f"3️⃣ Click <b>TRY AGAIN</b> to verify membership"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+    )
+
+
+# ============================================================
+# RETRY JOIN
+# ============================================================
+
+async def retry_join(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    parts = query.data.split("_", 2)
+
+    if len(parts) != 3:
+        await query.answer(
+            "Invalid giveaway link!",
+            show_alert=True,
+        )
+        return
+
+    giveaway_id = parts[2]
+    user_id = query.from_user.id
+
+    if giveaway_id not in giveaways:
+
+        await query.edit_message_text(
+            (
+                f"<tg-emoji emoji-id='{EMOJI_ERROR}'>❌</tg-emoji> "
+                f"<b>Giveaway not found!</b>"
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    giveaway = giveaways[giveaway_id]
+
+    if giveaway.get("ended"):
+
+        await query.edit_message_text(
+            (
+                f"<tg-emoji emoji-id='{EMOJI_ENDED}'>❌</tg-emoji> "
+                f"<b>GIVEAWAY ENDED</b>"
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    channel_id = giveaway.get("channel_id")
+
+    is_member = await check_channel_membership(
+        context,
+        channel_id,
+        user_id,
+    )
+
+    channel_display = giveaway.get(
+        "channel_display",
+        giveaway.get("channel", "Channel"),
+    )
+
+    if is_member:
+
+        keyboard = [
+            [
+                premium_button(
+                    "JOIN GIVEAWAY",
+                    callback_data=f"join_{giveaway_id}",
+                    emoji_id=EMOJI_JOIN,
+                    style=BUTTON_STYLE_SUCCESS,
+                )
+            ]
+        ]
+
+        await query.edit_message_text(
+            (
+                f"<tg-emoji emoji-id='{EMOJI_GIFT}'>🎁</tg-emoji> "
+                f"<b>EXCLUSIVE GIVEAWAY</b>\n\n"
+
+                f"<tg-emoji emoji-id='{EMOJI_WINE}'>🍷</tg-emoji> "
+                f"<b>Hosted By:</b> "
+                f"{safe_html(channel_display)}\n"
+
+                f"<tg-emoji emoji-id='{EMOJI_SMILE}'>😎</tg-emoji> "
+                f"<b>Participants:</b> "
+                f"{len(giveaway.get('users', {}))}\n\n"
+
+                f"<tg-emoji emoji-id='{EMOJI_CONFIRM}'>✅</tg-emoji> "
+                f"<b>Membership verified! You can now join.</b>"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            ),
+        )
+
+        return
+
+    channel_identifier = giveaway.get(
+        "channel",
+        "",
+    )
+
+    channel_link = await get_channel_link(
+        context,
+        channel_id,
+        channel_identifier,
+    )
+
+    keyboard = [
+        [
+            premium_button(
+                "JOIN CHANNEL",
+                url=channel_link,
+                emoji_id=EMOJI_CHANNEL,
+                style=BUTTON_STYLE_SUCCESS,
+            )
+        ],
+        [
+            premium_button(
+                "TRY AGAIN",
+                callback_data=f"retry_join_{giveaway_id}",
+                emoji_id=EMOJI_REFRESH,
+                style=BUTTON_STYLE_PRIMARY,
+            )
+        ],
+    ]
+
+    await query.edit_message_text(
+        (
+            f"<tg-emoji emoji-id='{EMOJI_ALERT}'>⚠️</tg-emoji> "
+            f"<b>STILL NOT A MEMBER</b>\n\n"
+
+            f"<tg-emoji emoji-id='{EMOJI_GIFT}'>🎁</tg-emoji> "
+            f"<b>Giveaway Host:</b> "
+            f"{safe_html(channel_display)}\n\n"
+
+            f"<i>Please join the channel first!</i>\n\n"
+
+            f"<b>Steps to join:</b>\n"
+            f"1️⃣ Click <b>JOIN CHANNEL</b> below\n"
+            f"2️⃣ Join the channel\n"
+            f"3️⃣ Click <b>TRY AGAIN</b> to verify membership"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+    )
+
+
+# ============================================================
+# CREATE GIVEAWAY
+# ============================================================
+
+async def create_giveaway_flow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    user_sessions[user_id] = {
+        "step": "waiting_channel"
+    }
+
+    keyboard = [
+        [
+            premium_button(
+                "CANCEL",
+                callback_data="cancel_creation",
+                emoji_id=EMOJI_CANCEL,
+                style=BUTTON_STYLE_DANGER,
+            )
+        ]
+    ]
+
+    await query.edit_message_text(
+        text=(
+            f"<b><tg-emoji emoji-id='{EMOJI_LIGHTNING}'>⚡</tg-emoji> "
+            f"CREATE GIVEAWAY</b>\n\n"
+
+            f"<i><tg-emoji emoji-id='{EMOJI_POINTER}'>👈</tg-emoji> "
+            f"Send your channel information:</i>\n\n"
+
+            f"<b>Public:</b> "
+            f"<code>@username</code>\n"
+
+            f"<b>Private:</b> "
+            f"<code>-1001234567890</code>"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+    )
+
+
+async def cancel_creation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    user_sessions.pop(
+        user_id,
+        None,
+    )
+
+    await query.edit_message_text(
+        text="✅ <b>Cancelled!</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def process_channel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    if not update.message or not update.effective_user:
+        return
+
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name
+
+    session = user_sessions.get(user_id)
+
+    if not session:
+        return
+
+    if session.get("step") != "waiting_channel":
+        return
+
+    channel_input = update.message.text.strip()
+
+    loading_msg = await update.message.reply_text(
+        (
+            f"<tg-emoji emoji-id='{EMOJI_LIGHTNING}'>⚡</tg-emoji> "
+            f"<b>Verifying...</b>"
+        ),
+        parse_mode="HTML",
+    )
+
     try:
-        client, phone_code_hash = await start_telethon_login(phone, API_ID, API_HASH)
-        await state.update_data(client=client, phone_code_hash=phone_code_hash); await message.answer("Enter OTP:"); await state.set_state(AdminStates.add_stock_otp)
-    except Exception as e: await message.answer(f"❌ Error: {e}"); await state.clear()
 
-@router.message(AdminStates.add_stock_otp)
-async def add_stock_verify_otp(message: Message, state: FSMContext):
-    data = await state.get_data()
+        if channel_input.startswith("@"):
+
+            chat = await context.bot.get_chat(
+                chat_id=channel_input
+            )
+
+            channel_info = {
+                "identifier": channel_input,
+                "display_name": (
+                    chat.title
+                    or channel_input
+                ),
+                "chat_id": chat.id,
+                "type": "public",
+            }
+
+        else:
+
+            try:
+                numeric_channel_id = int(channel_input)
+            except ValueError:
+                raise ValueError("Invalid channel ID")
+
+            chat = await context.bot.get_chat(
+                chat_id=numeric_channel_id
+            )
+
+            channel_info = {
+                "identifier": str(channel_input),
+                "display_name": (
+                    chat.title
+                    or f"Channel {channel_input}"
+                ),
+                "chat_id": chat.id,
+                "type": "private",
+            }
+
+    except Exception as e:
+
+        logger.warning(
+            "Channel verification failed: %s",
+            e,
+        )
+
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
+
+        error = str(e).lower()
+
+        if (
+            "bot is not a member" in error
+            or "not enough rights" in error
+            or "administrator" in error
+            or "forbidden" in error
+        ):
+
+            await update.message.reply_text(
+                (
+                    f"🤖 <b>Bot is not admin!</b>\n\n"
+                    f"Please add @{BOT_USERNAME} as an admin "
+                    f"in the channel first."
+                ),
+                parse_mode="HTML",
+            )
+
+        else:
+
+            await update.message.reply_text(
+                (
+                    f"<tg-emoji emoji-id='{EMOJI_ERROR}'>❌</tg-emoji> "
+                    f"<b>Invalid channel!</b>"
+                ),
+                parse_mode="HTML",
+            )
+
+        user_sessions.pop(
+            user_id,
+            None,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Check duplicate active giveaway
+    # --------------------------------------------------------
+
+    for gid, gdata in giveaways.items():
+
+        if (
+            gdata.get("channel")
+            == channel_info["identifier"]
+            and not gdata.get("ended", False)
+        ):
+
+            await loading_msg.delete()
+
+            existing_link = (
+                f"https://t.me/{BOT_USERNAME}"
+                f"?start={gid}"
+            )
+
+            await update.message.reply_text(
+                (
+                    f"<tg-emoji emoji-id='{EMOJI_ALERT}'>🚨</tg-emoji> "
+                    f"<b>GIVEAWAY ALREADY ACTIVE!</b>\n\n"
+
+                    f"<b>Channel:</b> "
+                    f"{safe_html(channel_info['display_name'])}\n\n"
+
+                    f"<b>Active Link:</b>\n"
+                    f"<code>{existing_link}</code>"
+                ),
+                parse_mode="HTML",
+            )
+
+            user_sessions.pop(
+                user_id,
+                None,
+            )
+
+            return
+
+    # --------------------------------------------------------
+    # Test bot permissions
+    # --------------------------------------------------------
+
     try:
-        session = await verify_telethon_otp(data['client'], data['phone'], message.text, data['phone_code_hash'])
-        db.add(StockAccount(product_id=data['product_id'], phone=data['phone'], session_string=session)); db.commit()
-        await message.answer("✅ Stock added!"); await state.clear(); await data['client'].disconnect()
-    except errors.SessionPasswordNeededError: await message.answer("🔐 Enter 2FA Password:"); await state.set_state(AdminStates.add_stock_2fa)
-    except Exception as e: await message.answer(f"❌ Error: {e}")
 
-@router.message(AdminStates.add_stock_2fa)
-async def add_stock_verify_2fa(message: Message, state: FSMContext):
-    data = await state.get_data()
+        test_msg = await context.bot.send_message(
+            chat_id=channel_info["chat_id"],
+            text="✅ Bot connected!",
+        )
+
+        try:
+            await test_msg.delete()
+        except Exception:
+            pass
+
+    except Exception as e:
+
+        logger.warning(
+            "Bot permission test failed: %s",
+            e,
+        )
+
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
+
+        await update.message.reply_text(
+            (
+                f"🤖 <b>Bot is not admin!</b>\n\n"
+                f"Please add @{BOT_USERNAME} as an admin "
+                f"in the channel first."
+            ),
+            parse_mode="HTML",
+        )
+
+        user_sessions.pop(
+            user_id,
+            None,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Create giveaway
+    # --------------------------------------------------------
+
+    giveaway_id = generate_giveaway_id()
+
+    link = (
+        f"https://t.me/{BOT_USERNAME}"
+        f"?start={giveaway_id}"
+    )
+
+    giveaways[giveaway_id] = {
+        "channel": channel_info["identifier"],
+        "channel_display": channel_info["display_name"],
+        "channel_id": channel_info["chat_id"],
+        "users": {},
+        "vote_counts": {},
+        "voted_users": {},
+        "creator": user_id,
+        "creator_name": user_name,
+        "ended": False,
+        "created_at": now_iso(),
+    }
+
+    update_channel_history(
+        channel_identifier=channel_info["identifier"],
+        channel_display=channel_info["display_name"],
+        channel_id=channel_info["chat_id"],
+        user_id=user_id,
+        user_name=user_name,
+        action="create",
+        giveaway_id=giveaway_id,
+    )
+
+    vote_messages[giveaway_id] = {}
+
+    save_data()
+
+    # --------------------------------------------------------
+    # Notify owner
+    # --------------------------------------------------------
+
+    if user_id != OWNER_ID:
+
+        await send_notification_to_owner(
+            context,
+            "🔔 NEW GIVEAWAY CREATED!",
+            (
+                f"👤 {safe_html(user_name)}\n"
+                f"🆔 <code>{user_id}</code>\n"
+                f"📢 {safe_html(channel_info['display_name'])}\n"
+                f"🔗 <code>{link}</code>"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Send channel announcement
+    # --------------------------------------------------------
+
     try:
-        session = await verify_telethon_2fa(data['client'], message.text)
-        db.add(StockAccount(product_id=data['product_id'], phone=data['phone'], session_string=session, password_2fa=message.text)); db.commit()
-        await message.answer("✅ Stock with 2FA added!"); await state.clear(); await data['client'].disconnect()
-    except Exception as e: await message.answer(f"❌ Error: {e}")
 
-# --- BULK STOCK UPLOAD ---
-@router.callback_query(F.data == "admin_bulk_stock")
-async def bulk_stock_start(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("📁 **Bulk Stock Upload**\n\nEk `.txt` file bhejein jisme har line par ye format ho:\n`phone,session_string,2fa_password`")
-    await state.set_state(AdminStates.bulk_upload)
+        await context.bot.send_message(
+            chat_id=channel_info["chat_id"],
+            text=(
+                f"<b><tg-emoji emoji-id='{EMOJI_CONFETTI}'>🎉</tg-emoji> "
+                f"NEW GIVEAWAY STARTED!</b>\n\n"
 
-@router.message(AdminStates.bulk_upload, F.document)
-async def process_bulk_upload(message: Message, state: FSMContext):
-    if not message.document.file_name.endswith(".txt"): return await message.answer("❌ Sirf .txt file allowed hai!")
-    file = await bot.get_file(message.document.file_id); downloaded = await bot.download_file(file.file_path)
-    content = downloaded.read().decode("utf-8"); added = 0; failed = 0
-    for line in content.strip().split("\n"):
-        parts = line.split(",")
-        if len(parts) >= 2:
-            phone = parts[0].strip(); session = parts[1].strip(); two_fa = parts[2].strip() if len(parts) > 2 else None
-            db.add(StockAccount(product_id=1, phone=phone, session_string=session, password_2fa=two_fa)); added += 1
-        else: failed += 1
-    db.commit(); await message.answer(f"✅ **Bulk Upload Complete!**\n\n➕ Added: {added}\n❌ Failed: {failed}"); await state.clear()
+                f"<b><tg-emoji emoji-id='{EMOJI_RIGHT}'>➡️</tg-emoji> "
+                f"JOIN HERE:</b>\n"
+                f"{link}"
+            ),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
-# --- MANAGE PRODUCTS ---
-@router.callback_query(F.data == "admin_manage_prod")
-async def manage_prod_list(call: CallbackQuery):
-    prods = db.query(Product).all()
-    if not prods: return await call.message.answer("❌ No products.")
-    kb = [[InlineKeyboardButton(text=f"{p.name} (${p.price_usd:.2f})", callback_data=f"mng_prod_{p.id}", style="primary")] for p in prods]
-    kb.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_back", style="danger")])
-    await call.message.answer("Manage Products:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    except Exception as e:
 
-@router.callback_query(F.data.startswith("mng_prod_"))
-async def manage_prod_options(call: CallbackQuery):
-    pid = int(call.data.split("_")[2])
-    kb = [[InlineKeyboardButton(text="✏️ Name", callback_data=f"edit_pname_{pid}", style="primary"), InlineKeyboardButton(text="💵 Price", callback_data=f"edit_pprice_{pid}", style="primary")],
-          [InlineKeyboardButton(text="🌍 Country", callback_data=f"edit_pcountry_{pid}", style="primary"), InlineKeyboardButton(text="📝 Description", callback_data=f"edit_pdesc_{pid}", style="primary")],
-          [InlineKeyboardButton(text="🗑️ Delete", callback_data=f"del_prod_{pid}", style="danger")],
-          [InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_prod", style="danger")]]
-    await call.message.edit_text(f"Managing Product ID: `{pid}`", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        logger.warning(
+            "Could not send giveaway announcement: %s",
+            e,
+        )
 
-@router.callback_query(F.data.startswith("edit_pdesc_"))
-async def edit_pdesc(call: CallbackQuery, state: FSMContext):
-    await state.update_data(prod_id=int(call.data.split("_")[2])); await call.message.answer("Enter new Description:"); await state.set_state(AdminStates.edit_desc)
-
-@router.message(AdminStates.edit_desc)
-async def save_pdesc(message: Message, state: FSMContext):
-    data = await state.get_data(); prod = db.query(Product).filter(Product.id == data['prod_id']).first()
-    prod.description = message.text; db.commit(); await message.answer("✅ Description Updated!"); await state.clear()
-
-@router.callback_query(F.data.startswith("del_prod_"))
-async def del_prod(call: CallbackQuery):
-    pid = int(call.data.split("_")[2])
-    db.query(StockAccount).filter(StockAccount.product_id == pid).delete(); db.query(Product).filter(Product.id == pid).delete(); db.commit()
-    await call.message.answer("🗑️ Deleted!")
-
-# --- MANAGE STOCK ---
-@router.callback_query(F.data == "admin_manage_stock")
-async def manage_stock_list(call: CallbackQuery):
-    prods = db.query(Product).all(); kb = []
-    for p in prods:
-        cnt = db.query(StockAccount).filter(StockAccount.product_id == p.id, StockAccount.status == "Available").count()
-        kb.append([InlineKeyboardButton(text=f"{p.name} ({cnt} in stock)", callback_data=f"mng_stock_{p.id}", style="primary")])
-    kb.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_back", style="danger")])
-    await call.message.answer("Select product to view stock:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-@router.callback_query(F.data.startswith("mng_stock_"))
-async def view_stock(call: CallbackQuery):
-    pid = int(call.data.split("_")[2])
-    stocks = db.query(StockAccount).filter(StockAccount.product_id == pid, StockAccount.status == "Available").limit(10).all()
-    if not stocks: return await call.message.answer("❌ No stock.")
-    kb = [[InlineKeyboardButton(text=f"🗑️ {s.phone}", callback_data=f"del_stock_{s.id}", style="danger")] for s in stocks]
-    kb.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_stock", style="danger")])
-    await call.message.answer("Click to delete:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-@router.callback_query(F.data.startswith("del_stock_"))
-async def del_stock(call: CallbackQuery):
-    db.query(StockAccount).filter(StockAccount.id == int(call.data.split("_")[2])).delete(); db.commit(); await call.message.answer("🗑️ Stock deleted!")
-
-
-# --- MANAGE USERS ---
-@router.callback_query(F.data == "admin_manage_users")
-async def manage_users_start(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("Enter User's Telegram ID:"); await state.set_state(AdminStates.target_user)
-
-@router.message(AdminStates.target_user)
-async def show_user_profile(message: Message, state: FSMContext):
-    try: uid = int(message.text)
-    except: return await message.answer("❌ Invalid ID.")
-    user = get_user(uid); await state.update_data(target_uid=uid)
-    text = f"👤 **User Profile**\nID: `{user.id}`\nBalance: `${user.balance:.2f}`\nBanned: `{user.is_banned}`"
-    kb = [[InlineKeyboardButton(text="➕ Add Balance", callback_data="usr_add_bal", style="success"), InlineKeyboardButton(text="➖ Deduct Balance", callback_data="usr_ded_bal", style="danger")],
-          [InlineKeyboardButton(text="🚫 Ban", callback_data="usr_ban", style="danger"), InlineKeyboardButton(text="✅ Unban", callback_data="usr_unban", style="success")],
-          [InlineKeyboardButton(text="🔙 Back", callback_data="admin_back", style="danger")]]
-    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-@router.callback_query(F.data == "usr_ban")
-async def ban_user(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data(); user = get_user(data['target_uid']); user.is_banned = True; db.commit()
-    await call.message.answer("🚫 User Banned!"); await bot.send_message(user.id, "🚫 You have been banned.")
-
-@router.callback_query(F.data == "usr_unban")
-async def unban_user(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data(); user = get_user(data['target_uid']); user.is_banned = False; db.commit()
-    await call.message.answer("✅ User Unbanned!"); await bot.send_message(user.id, "✅ You have been unbanned.")
-
-@router.callback_query(F.data == "usr_add_bal")
-async def add_bal_start(call: CallbackQuery, state: FSMContext): await call.message.answer("Enter amount in USD to ADD:"); await state.set_state(AdminStates.add_balance)
-
-@router.message(AdminStates.add_balance)
-async def save_add_bal(message: Message, state: FSMContext):
-    data = await state.get_data(); user = get_user(data['target_uid'])
     try:
-        amt = float(message.text); user.balance += amt; db.commit(); log_transaction(user.id, "Admin Add", amt)
-        await message.answer(f"✅ Added ${amt:.2f}."); await bot.send_message(user.id, f"🎁 Admin added ${amt:.2f} to your balance!")
-    except: await message.answer("❌ Invalid amount.")
-    await state.clear()
+        await loading_msg.delete()
+    except Exception:
+        pass
 
-@router.callback_query(F.data == "usr_ded_bal")
-async def ded_bal_start(call: CallbackQuery, state: FSMContext): await call.message.answer("Enter amount in USD to DEDUCT:"); await state.set_state(AdminStates.deduct_balance)
+    success_text = (
+        f"<b><tg-emoji emoji-id='{EMOJI_CLOWN}'>✅</tg-emoji> "
+        f"GIVEAWAY CREATED!</b>\n\n"
 
-@router.message(AdminStates.deduct_balance)
-async def save_ded_bal(message: Message, state: FSMContext):
-    data = await state.get_data(); user = get_user(data['target_uid'])
+        f"<b><tg-emoji emoji-id='{EMOJI_SEARCH}'>🔍</tg-emoji> "
+        f"ID:</b> <code>{giveaway_id}</code>\n"
+
+        f"<b><tg-emoji emoji-id='{EMOJI_SPEAKER}'>📢</tg-emoji> "
+        f"Channel:</b> "
+        f"{safe_html(channel_info['display_name'])}\n\n"
+
+        f"<b><tg-emoji emoji-id='{EMOJI_LINK}'>🔗</tg-emoji> "
+        f"LINK:</b>\n"
+        f"<code>{link}</code>"
+    )
+
+    keyboard = [
+        [
+            premium_button(
+                "MANAGE",
+                callback_data=f"manage_{giveaway_id}",
+                emoji_id=EMOJI_MANAGE,
+                style=BUTTON_STYLE_PRIMARY,
+            ),
+            premium_button(
+                "MAIN MENU",
+                callback_data="main_menu",
+                emoji_id=EMOJI_MAIN_MENU,
+                style=BUTTON_STYLE_PRIMARY,
+            ),
+        ]
+    ]
+
+    await update.message.reply_text(
+        success_text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+    )
+
+    user_sessions.pop(
+        user_id,
+        None,
+    )
+
+
+# ============================================================
+# MANAGE GIVEAWAYS
+# ============================================================
+
+async def my_giveaways(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    text = (
+        f"<b><tg-emoji emoji-id='{EMOJI_CROWN}'>💰</tg-emoji> "
+        f"YOUR GIVEAWAYS</b>\n\n"
+    )
+
+    keyboard = []
+    found = False
+
+    for gid, gdata in giveaways.items():
+
+        if (
+            gdata.get("creator") == user_id
+            and not gdata.get("ended", False)
+        ):
+
+            found = True
+
+            keyboard.append(
+                [
+                    premium_button(
+                        text=(
+                            f"📢 "
+                            f"{gdata.get('channel_display', gdata.get('channel'))}"
+                        ),
+                        callback_data=f"manage_{gid}",
+                        emoji_id=EMOJI_MANAGE,
+                        style=BUTTON_STYLE_PRIMARY,
+                    )
+                ]
+            )
+
+    if not found:
+
+        text = (
+            f"<tg-emoji emoji-id='{EMOJI_ERROR}'>❌</tg-emoji> "
+            f"<b>No active giveaways!</b>"
+        )
+
+        keyboard.append(
+            [
+                premium_button(
+                    "CREATE NEW",
+                    callback_data="create_giveaway",
+                    emoji_id=EMOJI_CREATE,
+                    style=BUTTON_STYLE_PRIMARY,
+                )
+            ]
+        )
+
+    keyboard.append(
+        [
+            premium_button(
+                "MAIN MENU",
+                callback_data="main_menu",
+                emoji_id=EMOJI_MAIN_MENU,
+                style=BUTTON_STYLE_PRIMARY,
+            )
+        ]
+    )
+
+    await query.edit_message_text(
+        text=text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+    )
+
+
+async def manage_giveaway(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    giveaway_id = query.data.split("_", 1)[1]
+
+    if giveaway_id not in giveaways:
+
+        await query.edit_message_text(
+            (
+                f"<tg-emoji emoji-id='{EMOJI_ERROR}'>❌</tg-emoji> "
+                f"Not found!"
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    giveaway = giveaways[giveaway_id]
+
+    # Only creator or owner can manage.
+    if (
+        query.from_user.id != giveaway.get("creator")
+        and not is_owner(query.from_user.id)
+    ):
+
+        await query.answer(
+            "You don't have permission to manage this giveaway.",
+            show_alert=True,
+        )
+
+        return
+
+    status = (
+        "🟢 ACTIVE"
+        if not giveaway.get("ended")
+        else "🔴 ENDED"
+    )
+
+    keyboard = [
+        [
+            premium_button(
+                "ADD VOTES",
+                callback_data=f"addvotes_{giveaway_id}",
+                emoji_id=EMOJI_ADD_VOTES,
+                style=BUTTON_STYLE_PRIMARY,
+            ),
+            premium_button(
+                "REMOVE VOTES",
+                callback_data=f"removevotes_{giveaway_id}",
+                emoji_id=EMOJI_REMOVE_VOTES,
+                style=BUTTON_STYLE_DANGER,
+            ),
+        ],
+        [
+            premium_button(
+                "LEADERBOARD",
+                callback_data=f"leaderboard_{giveaway_id}",
+                emoji_id=EMOJI_LEADERBOARD,
+                style=BUTTON_STYLE_PRIMARY,
+            )
+        ],
+        [
+            premium_button(
+                "END GIVEAWAY",
+                callback_data=f"endgiveaway_{giveaway_id}",
+                emoji_id=EMOJI_END_GIVEAWAY,
+                style=BUTTON_STYLE_DANGER,
+            )
+        ],
+        [
+            premium_button(
+                "BACK",
+                callback_data="my_giveaways",
+                emoji_id=EMOJI_BACK,
+                style=BUTTON_STYLE_PRIMARY,
+            )
+        ],
+    ]
+
+    await query.edit_message_text(
+        text=(
+            f"<b><tg-emoji emoji-id='{EMOJI_ARROW}'>➡️</tg-emoji> "
+            f"MANAGEMENT PANEL</b>\n\n"
+
+            f"<b>Status:</b> {status}\n"
+
+            f"<b>Channel:</b> "
+            f"{safe_html(giveaway.get('channel_display', giveaway.get('channel')))}\n"
+
+            f"<b>Joined:</b> "
+            f"{len(giveaway.get('users', {}))}"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+    )
+
+
+# ============================================================
+# VOTE MANAGEMENT
+# ============================================================
+
+async def add_votes_flow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    giveaway_id = query.data.split("_", 1)[1]
+
+    if giveaway_id not in giveaways:
+        await query.answer(
+            "Giveaway not found!",
+            show_alert=True,
+        )
+        return
+
+    context.user_data["vote_giveaway"] = giveaway_id
+    context.user_data["vote_action"] = "add"
+
+    await query.edit_message_text(
+        text=(
+            f"<b><tg-emoji emoji-id='{EMOJI_DIAMOND}'>💎</tg-emoji> "
+            f"ADD VOTES</b>\n\n"
+
+            f"Send: <code>USER_ID VOTES</code>\n"
+            f"Example: <code>12345678 10</code>"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    premium_button(
+                        "BACK",
+                        callback_data=f"manage_{giveaway_id}",
+                        emoji_id=EMOJI_BACK,
+                        style=BUTTON_STYLE_PRIMARY,
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+async def remove_votes_flow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    giveaway_id = query.data.split("_", 1)[1]
+
+    if giveaway_id not in giveaways:
+        await query.answer(
+            "Giveaway not found!",
+            show_alert=True,
+        )
+        return
+
+    context.user_data["vote_giveaway"] = giveaway_id
+    context.user_data["vote_action"] = "remove"
+
+    await query.edit_message_text(
+        text=(
+            f"<b><tg-emoji emoji-id='{EMOJI_DIAMOND}'>💎</tg-emoji> "
+            f"REMOVE VOTES</b>\n\n"
+
+            f"Send: <code>USER_ID VOTES</code>\n"
+            f"Example: <code>12345678 5</code>"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    premium_button(
+                        "BACK",
+                        callback_data=f"manage_{giveaway_id}",
+                        emoji_id=EMOJI_BACK,
+                        style=BUTTON_STYLE_PRIMARY,
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+async def process_vote_change(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    if not update.message:
+        return
+
+    giveaway_id = context.user_data.get(
+        "vote_giveaway"
+    )
+
+    action = context.user_data.get(
+        "vote_action"
+    )
+
+    if not giveaway_id or giveaway_id not in giveaways:
+        return
+
     try:
-        amt = float(message.text); user.balance -= amt
-        if user.balance < 0: user.balance = 0.0
-        db.commit(); log_transaction(user.id, "Admin Deduct", -amt); await message.answer(f"✅ Deducted ${amt:.2f}.")
-    except: await message.answer("❌ Invalid amount.")
-    await state.clear()
 
-@router.callback_query(F.data.startswith("sell_appr_"))
-async def approve_sell(call: CallbackQuery):
-    req = db.query(SellRequest).filter(SellRequest.id == int(call.data.split("_")[2])).first()
-    if req and req.status == "Pending":
-        req.status = "Approved"; user = get_user(req.user_id); user.balance += req.price_usd; db.commit()
-        log_transaction(user.id, "Sell Account", req.price_usd)
-        db.add(StockAccount(product_id=1, phone=req.phone, session_string=req.session_string, status="Available")); db.commit()
-        await call.message.edit_text("✅ Approved & Added to Stock."); await bot.send_message(req.user_id, f"🎉 Account approved! ${req.price_usd:.2f} added to balance.")
+        parts = update.message.text.strip().split()
 
-@router.callback_query(F.data.startswith("sell_rej_"))
-async def reject_sell(call: CallbackQuery):
-    req = db.query(SellRequest).filter(SellRequest.id == int(call.data.split("_")[2])).first()
-    if req: req.status = "Rejected"; db.commit(); await call.message.edit_text("❌ Rejected."); await bot.send_message(req.user_id, "😔 Your account was rejected.")
+        if len(parts) != 2:
+            raise ValueError
 
-@router.callback_query(F.data.startswith("topup_appr_"))
-async def approve_topup(call: CallbackQuery):
-    req = db.query(TopUpRequest).filter(TopUpRequest.id == int(call.data.split("_")[2])).first()
-    if req and req.status == "Pending":
-        req.status = "Approved"; user = get_user(req.user_id); user.balance += req.amount_usd; db.commit()
-        log_transaction(user.id, "TopUp", req.amount_usd)
-        await call.message.edit_text(f"✅ Approved! Added ${req.amount_usd:.2f}."); await bot.send_message(req.user_id, f"🎉 Top-up approved! ${req.amount_usd:.2f} added.")
+        target_uid = int(parts[0])
+        votes = int(parts[1])
 
-@router.callback_query(F.data.startswith("topup_rej_"))
-async def reject_topup(call: CallbackQuery):
-    req = db.query(TopUpRequest).filter(TopUpRequest.id == int(call.data.split("_")[2])).first()
-    if req: req.status = "Rejected"; db.commit(); await call.message.edit_text("❌ Rejected."); await bot.send_message(req.user_id, "😔 Top-up rejected.")
+        if votes <= 0:
+            raise ValueError
 
-@router.callback_query(F.data.startswith("wd_appr_"))
-async def approve_wd(call: CallbackQuery):
-    req = db.query(WithdrawRequest).filter(WithdrawRequest.id == int(call.data.split("_")[2])).first()
-    if req and req.status == "Pending":
-        req.status = "Approved"; user = get_user(req.user_id); user.balance -= req.amount_usd; db.commit()
-        log_transaction(user.id, "Withdraw", -req.amount_usd); await call.message.edit_text("✅ Withdrawal Approved.")
-        await bot.send_message(req.user_id, f"✅ Withdrawal of ${req.amount_usd:.2f} approved! Admin will pay to your UPI soon.")
+    except (ValueError, TypeError):
 
-@router.callback_query(F.data == "admin_set_upi")
-async def set_upi_start(call: CallbackQuery, state: FSMContext):
-    await call.message.answer(f"Current UPI: `{get_setting('upi_id') or 'Not set'}`\nEnter new UPI ID:"); await state.set_state(AdminStates.set_upi_id)
+        await update.message.reply_text(
+            (
+                f"<tg-emoji emoji-id='{EMOJI_ALERT}'>🚨</tg-emoji> "
+                f"Invalid! Send "
+                f"<code>USER_ID VOTES</code>."
+            ),
+            parse_mode="HTML",
+        )
 
-@router.message(AdminStates.set_upi_id)
-async def save_upi(message: Message, state: FSMContext): set_setting("upi_id", message.text); await message.answer("✅ UPI ID Updated!"); await state.clear()
+        return
 
-@router.callback_query(F.data == "admin_set_qr")
-async def set_qr_start(call: CallbackQuery, state: FSMContext): await call.message.answer("Send the QR Code Image:"); await state.set_state(AdminStates.set_qr_code)
+    giveaway = giveaways[giveaway_id]
 
-@router.message(AdminStates.set_qr_code, F.photo)
-async def save_qr(message: Message, state: FSMContext): set_setting("qr_code", message.photo[-1].file_id); await message.answer("✅ QR Code Updated!"); await state.clear()
+    if target_uid not in giveaway.get("users", {}):
 
-@router.callback_query(F.data == "admin_sold_accs")
-async def list_sold_accounts(call: CallbackQuery):
-    accs = db.query(StockAccount).filter(StockAccount.status == "Sold").limit(10).all()
-    if not accs: return await call.message.answer("❌ No sold accounts.")
-    kb = [[InlineKeyboardButton(text=f"📱 {a.phone}", callback_data=f"admin_otp_{a.id}", style="primary")] for a in accs]
-    kb.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_back", style="danger")])
-    await call.message.answer("Select number to fetch OTP:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        await update.message.reply_text(
+            (
+                f"<tg-emoji emoji-id='{EMOJI_ERROR}'>❌</tg-emoji> "
+                f"User not found!"
+            ),
+            parse_mode="HTML",
+        )
 
-@router.callback_query(F.data.startswith("admin_otp_"))
-async def admin_fetch_otp(call: CallbackQuery):
-    acc = db.query(StockAccount).filter(StockAccount.id == int(call.data.split("_")[2])).first()
-    await call.message.answer(f"⏳ Fetching OTP for `{acc.phone}`..."); otp = await fetch_otp_from_tgshark(acc.phone)
-    if otp:
-        resp = f"✅ **OTP:** `{otp}`\n"
-        if acc.password_2fa: resp += f"🔐 **2FA:** `{acc.password_2fa}`"
-        await call.message.answer(resp)
-    else: await call.message.answer("❌ No OTP found. Wait a bit and try again.")
+        return
 
-@router.callback_query(F.data == "admin_add_admin")
-async def add_admin_start(call: CallbackQuery, state: FSMContext): await call.message.answer("Enter Telegram ID to make Admin:"); await state.set_state(AdminStates.add_admin_id)
+    if giveaway.get("ended"):
 
-@router.message(AdminStates.add_admin_id)
-async def save_admin(message: Message, state: FSMContext):
+        await update.message.reply_text(
+            "❌ This giveaway has already ended.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    old_votes = int(
+        giveaway.get(
+            "vote_counts",
+            {},
+        ).get(
+            target_uid,
+            0,
+        )
+    )
+
+    if action == "add":
+
+        giveaway["vote_counts"][target_uid] = (
+            old_votes + votes
+        )
+
+        msg = (
+            f"<tg-emoji emoji-id='{EMOJI_DIAMOND}'>💎</tg-emoji> "
+            f"Added +{votes} votes!"
+        )
+
+    else:
+
+        giveaway["vote_counts"][target_uid] = max(
+            0,
+            old_votes - votes,
+        )
+
+        msg = (
+            f"<tg-emoji emoji-id='{EMOJI_DIAMOND}'>💎</tg-emoji> "
+            f"Removed {votes} votes!"
+        )
+
+    new_votes = giveaway["vote_counts"][target_uid]
+
+    save_data()
+
+    await update_vote_button_in_channel(
+        context,
+        giveaway_id,
+        target_uid,
+        new_votes,
+    )
+
+    await update.message.reply_text(
+        (
+            f"{msg}\n"
+            f"<b>New Total:</b> {new_votes} votes"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    premium_button(
+                        "BACK",
+                        callback_data=f"manage_{giveaway_id}",
+                        emoji_id=EMOJI_BACK,
+                        style=BUTTON_STYLE_PRIMARY,
+                    )
+                ]
+            ]
+        ),
+    )
+
+    context.user_data.pop(
+        "vote_giveaway",
+        None,
+    )
+
+    context.user_data.pop(
+        "vote_action",
+        None,
+    )
+
+
+async def show_leaderboard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    giveaway_id = query.data.split("_", 1)[1]
+
+    if giveaway_id not in giveaways:
+        await query.answer(
+            "Giveaway not found!",
+            show_alert=True,
+        )
+        return
+
+    giveaway = giveaways[giveaway_id]
+
+    sorted_users = sorted(
+        giveaway.get(
+            "vote_counts",
+            {},
+        ).items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )[:10]
+
+    text = (
+        f"<b><tg-emoji emoji-id='{EMOJI_CALENDAR}'>🗓</tg-emoji> "
+        f"LEADERBOARD</b>\n\n"
+    )
+
+    if not sorted_users:
+
+        text += "<i>No votes yet.</i>"
+
+    else:
+
+        for idx, (uid, votes) in enumerate(
+            sorted_users,
+            1,
+        ):
+
+            name = giveaway.get(
+                "users",
+                {},
+            ).get(
+                uid,
+                f"User {uid}",
+            )
+
+            text += (
+                f"<b>{idx}.</b> "
+                f"{safe_html(name)} - "
+                f"<b>{votes} votes</b>\n"
+            )
+
+    await query.edit_message_text(
+        text=text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    premium_button(
+                        "BACK",
+                        callback_data=f"manage_{giveaway_id}",
+                        emoji_id=EMOJI_BACK,
+                        style=BUTTON_STYLE_PRIMARY,
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+# ============================================================
+# END GIVEAWAY
+# ============================================================
+
+async def end_giveaway(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    giveaway_id = query.data.split("_", 1)[1]
+
+    if giveaway_id not in giveaways:
+        await query.answer(
+            "Giveaway not found!",
+            show_alert=True,
+        )
+        return
+
+    await query.edit_message_text(
+        text=(
+            f"<b><tg-emoji emoji-id='{EMOJI_LOCK}'>⚠️</tg-emoji> "
+            f"End this giveaway?</b>"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    premium_button(
+                        "CONFIRM",
+                        callback_data=f"confirm_end_{giveaway_id}",
+                        emoji_id=EMOJI_CONFIRM,
+                        style=BUTTON_STYLE_DANGER,
+                    )
+                ],
+                [
+                    premium_button(
+                        "CANCEL",
+                        callback_data=f"manage_{giveaway_id}",
+                        emoji_id=EMOJI_CANCEL,
+                        style=BUTTON_STYLE_PRIMARY,
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+async def confirm_end_giveaway(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    giveaway_id = query.data.split("_", 2)[2]
+
+    if giveaway_id not in giveaways:
+        await query.answer(
+            "Giveaway not found!",
+            show_alert=True,
+        )
+        return
+
+    giveaway = giveaways[giveaway_id]
+
+    if (
+        query.from_user.id != giveaway.get("creator")
+        and not is_owner(query.from_user.id)
+    ):
+
+        await query.answer(
+            "You don't have permission.",
+            show_alert=True,
+        )
+
+        return
+
+    if giveaway.get("ended"):
+
+        await query.edit_message_text(
+            "⚠️ Giveaway is already ended.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    giveaway["ended"] = True
+
+    sorted_users = sorted(
+        giveaway.get(
+            "vote_counts",
+            {},
+        ).items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    winner_text = "No participants."
+
+    if sorted_users:
+
+        w_uid, w_votes = sorted_users[0]
+
+        winner_name = giveaway.get(
+            "users",
+            {},
+        ).get(
+            w_uid,
+            f"User {w_uid}",
+        )
+
+        winner_text = (
+            f"🏆 <b>WINNER:</b> "
+            f"{safe_html(winner_name)} "
+            f"with {w_votes} votes!"
+        )
+
+    update_channel_history(
+        channel_identifier=giveaway.get("channel"),
+        channel_display=giveaway.get("channel_display"),
+        channel_id=giveaway.get("channel_id"),
+        user_id=giveaway.get("creator"),
+        user_name=giveaway.get(
+            "creator_name",
+            "Unknown",
+        ),
+        action="end",
+        giveaway_id=giveaway_id,
+    )
+
+    save_data()
+
+    vote_messages.pop(
+        giveaway_id,
+        None,
+    )
+
     try:
-        uid = int(message.text); user = get_user(uid); user.is_admin = True; db.commit(); await message.answer(f"✅ User `{uid}` is now Admin!")
-    except: await message.answer("❌ Invalid ID.")
-    await state.clear()
 
-@router.callback_query(F.data == "admin_contest")
-async def contest_menu(call: CallbackQuery):
-    user = get_user(call.from_user.id)
-    if user.id != ADMIN_ID and not user.is_admin: return
-    contest_start = get_setting("contest_start_time"); status = "🟢 ACTIVE" if contest_start else "🔴 INACTIVE"
-    text = f"🏆 **Referral Contest**\n\nStatus: {status}\n\n1. **Start Contest:** Isse contest start hoga.\n2. **Leaderboard:** Top referrers ki list dekhein.\n3. **End Contest:** Contest end karein aur winner nikaalein."
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="▶️ Start Contest", callback_data="contest_start", style="success")], [InlineKeyboardButton(text="📊 Leaderboard", callback_data="contest_leaderboard", style="primary")], [InlineKeyboardButton(text="⏹️ End Contest", callback_data="contest_end", style="danger")], [InlineKeyboardButton(text="🔙 Back", callback_data="admin_panel", style="danger")]])
-    await call.message.edit_text(text, reply_markup=kb)
+        await context.bot.send_message(
+            chat_id=giveaway["channel_id"],
+            text=(
+                f"💰 <b>GIVEAWAY ENDED!</b>\n\n"
+                f"{winner_text}"
+            ),
+            parse_mode="HTML",
+        )
 
-@router.callback_query(F.data == "contest_start")
-async def start_contest(call: CallbackQuery): set_setting("contest_start_time", datetime.utcnow().isoformat()); await call.answer("✅ Contest Start ho gaya!", show_alert=True)
+    except Exception as e:
 
-@router.callback_query(F.data == "contest_end")
-async def end_contest(call: CallbackQuery):
-    start_time_str = get_setting("contest_start_time")
-    if not start_time_str: return await call.answer("❌ Koi active contest nahi hai!", show_alert=True)
-    start_time = datetime.fromisoformat(start_time_str)
-    top_referrers = db.query(User.referrer_id, func.count(User.id).label('count')).filter(User.joined_at >= start_time, User.referrer_id.isnot(None)).group_by(User.referrer_id).order_by(func.count(User.id).desc()).limit(5).all()
-    set_setting("contest_start_time", "")
-    if not top_referrers: return await call.message.edit_text("🏆 **Contest Ended!**\n\nKisi ne bhi refer nahi kiya.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_contest", style="danger")]]))
-    text = "🏆 **Contest Winners (Top 5)** 🏆\n\n"
-    for i, (uid, count) in enumerate(top_referrers, 1):
-        user_obj = get_user(uid); text += f"{i}. 👤 `{uid}` — **{count} Referrals** (Balance: ${user_obj.balance:.2f})\n"
-    text += "\n🎁 **Ab aap manually winner ko prize de sakte hain (Balance Add karke).**"
-    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_contest", style="danger")]]))
+        logger.warning(
+            "Failed to send ending announcement: %s",
+            e,
+        )
 
-@router.callback_query(F.data == "contest_leaderboard")
-async def contest_leaderboard(call: CallbackQuery):
-    start_time_str = get_setting("contest_start_time")
-    if start_time_str: start_time = datetime.fromisoformat(start_time_str); title = "📊 **Live Contest Leaderboard**\n\n"
-    else: start_time = datetime.min; title = "📊 **All-Time Leaderboard**\n\n"
-    top_referrers = db.query(User.referrer_id, func.count(User.id).label('count')).filter(User.joined_at >= start_time, User.referrer_id.isnot(None)).group_by(User.referrer_id).order_by(func.count(User.id).desc()).limit(10).all()
-    if not top_referrers: return await call.message.edit_text("📊 Koi data nahi hai.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_contest", style="danger")]]))
-    for i, (uid, count) in enumerate(top_referrers, 1): title += f"{i}. 👤 `{uid}` — **{count} Referrals**\n"
-    await call.message.edit_text(title, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_contest", style="danger")]]))
+    await query.edit_message_text(
+        text=(
+            f"✅ <b>Giveaway ended!</b>\n\n"
+            f"{winner_text}"
+        ),
+        parse_mode="HTML",
+    )
 
-# ═══════════════ MAIN ═══════════════
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    print("🩸 Bloodline TG Account Store is starting...")
-    await dp.start_polling(bot)
+
+# ============================================================
+# JOIN HANDLER
+# ============================================================
+
+async def handle_join(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    giveaway_id = query.data.split("_", 1)[1]
+    user = query.from_user
+
+    if giveaway_id not in giveaways:
+
+        await query.answer(
+            "Giveaway not found!",
+            show_alert=True,
+        )
+
+        return
+
+    giveaway = giveaways[giveaway_id]
+
+    if giveaway.get("ended"):
+
+        await query.answer(
+            "❌ This giveaway has already ended!",
+            show_alert=True,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Prevent duplicate registration
+    # --------------------------------------------------------
+
+    if user.id in giveaway.get("users", {}):
+
+        await query.answer(
+            "⚠️ Already Joined!",
+            show_alert=True,
+        )
+
+        return
+
+    save_user(
+        user.id,
+        user.username,
+        user.first_name,
+        user.last_name,
+        source="join",
+    )
+
+    # --------------------------------------------------------
+    # Membership check FIRST
+    # --------------------------------------------------------
+
+    is_member = await check_channel_membership(
+        context,
+        giveaway.get("channel_id"),
+        user.id,
+    )
+
+    if not is_member:
+
+        channel_display = giveaway.get(
+            "channel_display",
+            giveaway.get(
+                "channel",
+                "Channel",
+            ),
+        )
+
+        channel_identifier = giveaway.get(
+            "channel",
+            "",
+        )
+
+        channel_link = await get_channel_link(
+            context,
+            giveaway.get("channel_id"),
+            channel_identifier,
+        )
+
+        keyboard = [
+            [
+                premium_button(
+                    "JOIN CHANNEL",
+                    url=channel_link,
+                    emoji_id=EMOJI_CHANNEL,
+                    style=BUTTON_STYLE_SUCCESS,
+                )
+            ],
+            [
+                premium_button(
+                    "TRY AGAIN",
+                    callback_data=f"retry_join_{giveaway_id}",
+                    emoji_id=EMOJI_REFRESH,
+                    style=BUTTON_STYLE_PRIMARY,
+                )
+            ],
+        ]
+
+        await query.edit_message_text(
+            (
+                f"<tg-emoji emoji-id='{EMOJI_ALERT}'>⚠️</tg-emoji> "
+                f"<b>CHANNEL MEMBERSHIP REQUIRED</b>\n\n"
+
+                f"<tg-emoji emoji-id='{EMOJI_GIFT}'>🎁</tg-emoji> "
+                f"<b>Giveaway Host:</b> "
+                f"{safe_html(channel_display)}\n\n"
+
+                f"<i>You need to join the channel first "
+                f"to participate!</i>\n\n"
+
+                f"<b>Steps to join:</b>\n"
+                f"1️⃣ Click <b>JOIN CHANNEL</b> below\n"
+                f"2️⃣ Join the channel\n"
+                f"3️⃣ Click <b>TRY AGAIN</b> to verify membership"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            ),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Register participant
+    # --------------------------------------------------------
+
+    user_name = (
+        user.full_name
+        or user.first_name
+        or f"User {user.id}"
+    )
+
+    giveaway.setdefault(
+        "users",
+        {}
+    )
+
+    giveaway.setdefault(
+        "vote_counts",
+        {}
+    )
+
+    giveaway.setdefault(
+        "voted_users",
+        {}
+    )
+
+    giveaway["users"][user.id] = user_name
+    giveaway["vote_counts"][user.id] = 0
+    giveaway["voted_users"][user.id] = set()
+
+    update_user_stats(
+        user.id,
+        "join",
+    )
+
+    save_data()
+
+    await query.answer(
+        "✅ Registration Successful!",
+        show_alert=True,
+    )
+
+    channel_text = (
+        f"<tg-emoji emoji-id='{EMOJI_SMILE}'>😎</tg-emoji> "
+        f"<b>Name:</b> {safe_html(user_name)}\n"
+
+        f"<tg-emoji emoji-id='{EMOJI_ID}'>💌</tg-emoji> "
+        f"<b>ID:</b> <code>{user.id}</code>"
+    )
+
+    vote_keyboard = [
+        [
+            premium_button(
+                "Vote - 0",
+                callback_data=(
+                    f"vote_{giveaway_id}_{user.id}"
+                ),
+                emoji_id=EMOJI_VOTE,
+                style=BUTTON_STYLE_SUCCESS,
+            )
+        ]
+    ]
+
+    try:
+
+        sent_msg = await context.bot.send_message(
+            chat_id=giveaway["channel_id"],
+            text=channel_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                vote_keyboard
+            ),
+        )
+
+        vote_messages.setdefault(
+            giveaway_id,
+            {},
+        )
+
+        vote_messages[giveaway_id][user.id] = (
+            sent_msg.message_id
+        )
+
+    except Exception as e:
+
+        logger.error(
+            "Error sending participant to channel: %s",
+            e,
+        )
+
+    await query.edit_message_text(
+        text=(
+            f"✅ <b>Registration Successful!</b>\n\n"
+
+            f"😎 {safe_html(user_name)}\n"
+            f"💌 <code>{user.id}</code>\n\n"
+
+            f"📥 Profile shared in channel!"
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# VOTE HANDLER
+# ============================================================
+
+async def handle_vote(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    # Parse callback safely.
+    parts = query.data.split("_")
+
+    if len(parts) != 3:
+
+        await query.answer(
+            "Invalid vote button.",
+            show_alert=True,
+        )
+
+        return
+
+    giveaway_id = parts[1]
+
+    try:
+        target_user_id = int(parts[2])
+    except ValueError:
+
+        await query.answer(
+            "Invalid user ID.",
+            show_alert=True,
+        )
+
+        return
+
+    voter_id = query.from_user.id
+
+    if giveaway_id not in giveaways:
+
+        await query.answer(
+            "❌ Giveaway not active!",
+            show_alert=True,
+        )
+
+        return
+
+    giveaway = giveaways[giveaway_id]
+
+    if giveaway.get("ended"):
+
+        await query.answer(
+            "❌ This giveaway has ended!",
+            show_alert=True,
+        )
+
+        return
+
+    # Make sure target is an actual participant.
+    if target_user_id not in giveaway.get("users", {}):
+
+        await query.answer(
+            "❌ User is not participating.",
+            show_alert=True,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Check voter membership
+    # --------------------------------------------------------
+
+    is_member = await check_channel_membership(
+        context,
+        giveaway.get("channel_id"),
+        voter_id,
+    )
+
+    if not is_member:
+
+        await query.answer(
+            "⚠️ Only channel members can vote! "
+            "Please join the channel first.",
+            show_alert=True,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Make sure voter is registered in all_users
+    # --------------------------------------------------------
+
+    voter = query.from_user
+
+    save_user(
+        voter.id,
+        voter.username,
+        voter.first_name,
+        voter.last_name,
+        source="vote",
+    )
+
+    # --------------------------------------------------------
+    # Duplicate vote check
+    # --------------------------------------------------------
+
+    giveaway.setdefault(
+        "voted_users",
+        {}
+    )
+
+    giveaway["voted_users"].setdefault(
+        target_user_id,
+        set(),
+    )
+
+    voted_by = giveaway["voted_users"][
+        target_user_id
+    ]
+
+    # Convert legacy list to set if needed.
+    if isinstance(voted_by, list):
+
+        voted_by = {
+            int(v)
+            for v in voted_by
+            if normalize_user_id(v) is not None
+        }
+
+        giveaway["voted_users"][
+            target_user_id
+        ] = voted_by
+
+    if voter_id in voted_by:
+
+        await query.answer(
+            "⚠️ You have already voted for this user!",
+            show_alert=True,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Record vote
+    # --------------------------------------------------------
+
+    voted_by.add(voter_id)
+
+    giveaway.setdefault(
+        "vote_counts",
+        {}
+    )
+
+    giveaway["vote_counts"][target_user_id] = (
+        giveaway["vote_counts"].get(
+            target_user_id,
+            0,
+        ) + 1
+    )
+
+    new_votes = giveaway["vote_counts"][
+        target_user_id
+    ]
+
+    # Only count the vote after all validation succeeded.
+    update_user_stats(
+        voter_id,
+        "vote",
+    )
+
+    save_data()
+
+    await update_vote_button_in_channel(
+        context,
+        giveaway_id,
+        target_user_id,
+        new_votes,
+    )
+
+    await query.answer(
+        "🎉 Vote recorded!",
+        show_alert=False,
+    )
+
+
+# ============================================================
+# ADMIN COMMANDS
+# ============================================================
+
+async def admin_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    text = """
+<b>👑 ADMIN COMMANDS</b>
+
+<code>/admin</code> - Show this help menu
+<code>/broadcast &lt;msg&gt;</code> - Send message to all users
+<code>/bc &lt;msg&gt;</code> - Send message to all channels
+<code>/ball &lt;msg&gt;</code> - Send to all users + all channels
+<code>/stats</code> - Bot statistics
+<code>/users</code> - Recent users list
+<code>/channels</code> - Channel history
+<code>/backup</code> - Manual backup
+<code>/settings</code> - Bot settings
+<code>/testnotify</code> - Test notification
+<code>/clear</code> - Delete all data
+
+<code>/g_management &lt;giveaway_id&gt;</code> - Open giveaway management panel
+<code>/add_vote &lt;giveaway_id&gt; &lt;user_id&gt; &lt;votes&gt;</code> - Add votes to user
+<code>/remove_vote &lt;giveaway_id&gt; &lt;user_id&gt; &lt;votes&gt;</code> - Remove votes from user
+
+<b>📌 Note:</b> Owner can manage any giveaway secretly
+"""
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+    )
+
+
+async def bc_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "❌ Usage: /bc <message>"
+        )
+
+        return
+
+    msg = " ".join(context.args)
+
+    await update.message.reply_text(
+        (
+            f"🚀 <b>Sending to all channels...</b>\n\n"
+            f"Message: {safe_html(msg[:100])}..."
+        ),
+        parse_mode="HTML",
+    )
+
+    success = 0
+    fail = 0
+    channels_sent = set()
+
+    for gid, gdata in giveaways.items():
+
+        channel_id = gdata.get(
+            "channel_id"
+        )
+
+        if (
+            channel_id
+            and channel_id not in channels_sent
+            and not gdata.get("ended", False)
+        ):
+
+            channels_sent.add(channel_id)
+
+            try:
+
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text=msg,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+
+                success += 1
+
+            except Exception as e:
+
+                logger.error(
+                    "Failed to send to channel %s: %s",
+                    channel_id,
+                    e,
+                )
+
+                fail += 1
+
+            await asyncio.sleep(0.5)
+
+    await update.message.reply_text(
+        (
+            f"<b>✅ BROADCAST TO CHANNELS COMPLETED!</b>\n\n"
+
+            f"<b>✅ Sent:</b> <code>{success}</code>\n"
+            f"<b>❌ Failed:</b> <code>{fail}</code>\n"
+            f"<b>📊 Total Channels:</b> "
+            f"<code>{len(channels_sent)}</code>"
+        ),
+        parse_mode="HTML",
+    )
+
+
+async def ball_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "❌ Usage: /ball <message>"
+        )
+
+        return
+
+    msg = " ".join(context.args)
+
+    await update.message.reply_text(
+        (
+            f"🚀 <b>Sending to ALL USERS + ALL CHANNELS...</b>\n\n"
+            f"Message: {safe_html(msg[:100])}..."
+        ),
+        parse_mode="HTML",
+    )
+
+    user_success = 0
+    user_fail = 0
+
+    for uid in list(all_users.keys()):
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=int(uid),
+                text=msg,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+
+            user_success += 1
+
+        except Exception:
+
+            user_fail += 1
+
+        await asyncio.sleep(0.05)
+
+    channel_success = 0
+    channel_fail = 0
+    channels_sent = set()
+
+    for gid, gdata in giveaways.items():
+
+        channel_id = gdata.get(
+            "channel_id"
+        )
+
+        if (
+            channel_id
+            and channel_id not in channels_sent
+            and not gdata.get("ended", False)
+        ):
+
+            channels_sent.add(channel_id)
+
+            try:
+
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text=msg,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+
+                channel_success += 1
+
+            except Exception as e:
+
+                logger.error(
+                    "Failed to send to channel %s: %s",
+                    channel_id,
+                    e,
+                )
+
+                channel_fail += 1
+
+            await asyncio.sleep(0.5)
+
+    await update.message.reply_text(
+        (
+            f"<b>✅ BALL BROADCAST COMPLETED!</b>\n\n"
+
+            f"<b>📱 USERS:</b>\n"
+            f"   ✅ Sent: <code>{user_success}</code>\n"
+            f"   ❌ Failed: <code>{user_fail}</code>\n"
+            f"   📊 Total: <code>{len(all_users)}</code>\n\n"
+
+            f"<b>📺 CHANNELS:</b>\n"
+            f"   ✅ Sent: <code>{channel_success}</code>\n"
+            f"   ❌ Failed: <code>{channel_fail}</code>\n"
+            f"   📊 Total: <code>{len(channels_sent)}</code>"
+        ),
+        parse_mode="HTML",
+    )
+
+
+async def g_management_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "❌ Usage: /g_management <giveaway_id>"
+        )
+
+        return
+
+    giveaway_id = context.args[0]
+
+    if giveaway_id not in giveaways:
+
+        await update.message.reply_text(
+            f"❌ Giveaway '{safe_html(giveaway_id)}' not found!",
+            parse_mode="HTML",
+        )
+
+        return
+
+    giveaway = giveaways[giveaway_id]
+
+    status = (
+        "🟢 ACTIVE"
+        if not giveaway.get("ended")
+        else "🔴 ENDED"
+    )
+
+    keyboard = [
+        [
+            premium_button(
+                "ADD VOTES",
+                callback_data=f"addvotes_{giveaway_id}",
+                emoji_id=EMOJI_ADD_VOTES,
+                style=BUTTON_STYLE_PRIMARY,
+            ),
+            premium_button(
+                "REMOVE VOTES",
+                callback_data=f"removevotes_{giveaway_id}",
+                emoji_id=EMOJI_REMOVE_VOTES,
+                style=BUTTON_STYLE_DANGER,
+            ),
+        ],
+        [
+            premium_button(
+                "LEADERBOARD",
+                callback_data=f"leaderboard_{giveaway_id}",
+                emoji_id=EMOJI_LEADERBOARD,
+                style=BUTTON_STYLE_PRIMARY,
+            )
+        ],
+        [
+            premium_button(
+                "END GIVEAWAY",
+                callback_data=f"endgiveaway_{giveaway_id}",
+                emoji_id=EMOJI_END_GIVEAWAY,
+                style=BUTTON_STYLE_DANGER,
+            )
+        ],
+    ]
+
+    total_votes = sum(
+        giveaway.get(
+            "vote_counts",
+            {},
+        ).values()
+    )
+
+    await update.message.reply_text(
+        text=(
+            f"<b><tg-emoji emoji-id='{EMOJI_ARROW}'>➡️</tg-emoji> "
+            f"MANAGEMENT PANEL (ADMIN)</b>\n\n"
+
+            f"<b>Giveaway ID:</b> "
+            f"<code>{safe_html(giveaway_id)}</code>\n"
+
+            f"<b>Status:</b> {status}\n"
+
+            f"<b>Channel:</b> "
+            f"{safe_html(giveaway.get('channel_display', giveaway.get('channel')))}\n"
+
+            f"<b>Creator:</b> "
+            f"{safe_html(giveaway.get('creator_name', 'Unknown'))}\n"
+
+            f"<b>Joined:</b> "
+            f"{len(giveaway.get('users', {}))}\n"
+
+            f"<b>Total Votes:</b> {total_votes}"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+    )
+
+
+# ============================================================
+# ADD VOTE COMMAND
+# ============================================================
+
+async def add_vote_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    if len(context.args) != 3:
+
+        await update.message.reply_text(
+            "❌ Usage: /add_vote <giveaway_id> <user_id> <votes>"
+        )
+
+        return
+
+    giveaway_id = context.args[0]
+
+    try:
+
+        target_uid = int(context.args[1])
+        votes = int(context.args[2])
+
+        if votes <= 0:
+            raise ValueError
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ User ID and votes must be positive numbers."
+        )
+
+        return
+
+    if giveaway_id not in giveaways:
+
+        await update.message.reply_text(
+            f"❌ Giveaway '{giveaway_id}' not found!"
+        )
+
+        return
+
+    giveaway = giveaways[giveaway_id]
+
+    if target_uid not in giveaway.get("users", {}):
+
+        await update.message.reply_text(
+            f"❌ User {target_uid} not found in this giveaway!"
+        )
+
+        return
+
+    old_votes = giveaway.get(
+        "vote_counts",
+        {},
+    ).get(
+        target_uid,
+        0,
+    )
+
+    giveaway["vote_counts"][target_uid] = (
+        old_votes + votes
+    )
+
+    new_votes = giveaway["vote_counts"][target_uid]
+
+    save_data()
+
+    await update_vote_button_in_channel(
+        context,
+        giveaway_id,
+        target_uid,
+        new_votes,
+    )
+
+    await update.message.reply_text(
+        (
+            f"✅ <b>Votes Added!</b>\n\n"
+
+            f"<b>Giveaway:</b> "
+            f"<code>{giveaway_id}</code>\n"
+
+            f"<b>User:</b> "
+            f"<code>{target_uid}</code> "
+            f"({safe_html(giveaway['users'][target_uid])})\n"
+
+            f"<b>Added:</b> +{votes} votes\n"
+            f"<b>New Total:</b> {new_votes} votes"
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# REMOVE VOTE COMMAND
+# ============================================================
+
+async def remove_vote_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    if len(context.args) != 3:
+
+        await update.message.reply_text(
+            "❌ Usage: /remove_vote <giveaway_id> <user_id> <votes>"
+        )
+
+        return
+
+    giveaway_id = context.args[0]
+
+    try:
+
+        target_uid = int(context.args[1])
+        votes = int(context.args[2])
+
+        if votes <= 0:
+            raise ValueError
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ User ID and votes must be positive numbers."
+        )
+
+        return
+
+    if giveaway_id not in giveaways:
+
+        await update.message.reply_text(
+            f"❌ Giveaway '{giveaway_id}' not found!"
+        )
+
+        return
+
+    giveaway = giveaways[giveaway_id]
+
+    if target_uid not in giveaway.get("users", {}):
+
+        await update.message.reply_text(
+            f"❌ User {target_uid} not found in this giveaway!"
+        )
+
+        return
+
+    old_votes = giveaway.get(
+        "vote_counts",
+        {},
+    ).get(
+        target_uid,
+        0,
+    )
+
+    giveaway["vote_counts"][target_uid] = max(
+        0,
+        old_votes - votes,
+    )
+
+    new_votes = giveaway["vote_counts"][target_uid]
+
+    save_data()
+
+    await update_vote_button_in_channel(
+        context,
+        giveaway_id,
+        target_uid,
+        new_votes,
+    )
+
+    await update.message.reply_text(
+        (
+            f"✅ <b>Votes Removed!</b>\n\n"
+
+            f"<b>Giveaway:</b> "
+            f"<code>{giveaway_id}</code>\n"
+
+            f"<b>User:</b> "
+            f"<code>{target_uid}</code> "
+            f"({safe_html(giveaway['users'][target_uid])})\n"
+
+            f"<b>Removed:</b> -{votes} votes\n"
+            f"<b>New Total:</b> {new_votes} votes"
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# BROADCAST
+# ============================================================
+
+async def broadcast_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    if not context.args:
+
+        admin_sessions[OWNER_ID] = {
+            "step": "waiting_broadcast"
+        }
+
+        await update.message.reply_text(
+            (
+                "<b>📢 BROADCAST SYSTEM</b>\n\n"
+
+                "Send your message below.\n\n"
+
+                "<b>Supported HTML Tags:</b>\n"
+                "<code>&lt;b&gt;bold&lt;/b&gt;</code>\n"
+                "<code>&lt;i&gt;italic&lt;/i&gt;</code>\n"
+                "<code>&lt;u&gt;underline&lt;/u&gt;</code>\n"
+                "<code>&lt;s&gt;strikethrough&lt;/s&gt;</code>\n"
+                "<code>&lt;a href='URL'&gt;link&lt;/a&gt;</code>\n"
+                "<code>&lt;tg-emoji emoji-id='ID'&gt;🎁&lt;/tg-emoji&gt;</code>\n\n"
+
+                f"<b>Total Users:</b> "
+                f"<code>{len(all_users)}</code>\n\n"
+
+                "Send /cancel to abort."
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    msg = " ".join(context.args)
+
+    await update.message.reply_text(
+        (
+            f"🚀 <b>Broadcast started!</b>\n\n"
+            f"Total users: <code>{len(all_users)}</code>\n"
+            f"This may take some time..."
+        ),
+        parse_mode="HTML",
+    )
+
+    success = 0
+    fail = 0
+
+    for uid in list(all_users.keys()):
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=int(uid),
+                text=msg,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+
+            success += 1
+
+        except Exception:
+
+            fail += 1
+
+        await asyncio.sleep(0.05)
+
+    await update.message.reply_text(
+        (
+            f"<b>✅ BROADCAST COMPLETED!</b>\n\n"
+
+            f"<b>✅ Sent:</b> "
+            f"<code>{success}</code>\n"
+
+            f"<b>❌ Failed:</b> "
+            f"<code>{fail}</code>\n"
+
+            f"<b>📊 Total:</b> "
+            f"<code>{len(all_users)}</code>"
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    active = sum(
+        1
+        for g in giveaways.values()
+        if not g.get("ended", False)
+    )
+
+    participants = sum(
+        len(g.get("users", {}))
+        for g in giveaways.values()
+    )
+
+    votes = sum(
+        sum(
+            g.get(
+                "vote_counts",
+                {},
+            ).values()
+        )
+        for g in giveaways.values()
+    )
+
+    text = (
+        f"<b><tg-emoji emoji-id='{EMOJI_STATS}'>📊</tg-emoji> "
+        f"BOT STATISTICS</b>\n\n"
+
+        f"<b>👥 Users:</b> "
+        f"<code>{len(all_users)}</code>\n"
+
+        f"<b>🎁 Giveaways:</b> "
+        f"<code>{len(giveaways)}</code>\n"
+
+        f"<b>🟢 Active:</b> "
+        f"<code>{active}</code>\n"
+
+        f"<b>📺 Channels:</b> "
+        f"<code>{len(channel_history)}</code>\n"
+
+        f"<b>👤 Participants:</b> "
+        f"<code>{participants}</code>\n"
+
+        f"<b>🗳️ Votes:</b> "
+        f"<code>{votes}</code>"
+    )
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# USERS
+# ============================================================
+
+async def users_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    users_list = list(
+        all_users.values()
+    )[-15:]
+
+    users_list.reverse()
+
+    text = (
+        f"<b><tg-emoji emoji-id='{EMOJI_USERS}'>👥</tg-emoji> "
+        f"RECENT USERS</b>\n\n"
+    )
+
+    for u in users_list:
+
+        username = u.get(
+            "username"
+        )
+
+        username_display = (
+            f"@{username}"
+            if username
+            else "@no"
+        )
+
+        text += (
+            f"<b>👤 "
+            f"{safe_html(u.get('first_name', 'Unknown'))}</b>\n"
+
+            f"   🆔 "
+            f"<code>{u.get('user_id')}</code>\n"
+
+            f"   📝 "
+            f"{safe_html(username_display)}\n"
+
+            f"   📍 "
+            f"{safe_html(u.get('source', '?'))}\n\n"
+        )
+
+    text += (
+        f"\n<b>Total Users:</b> "
+        f"<code>{len(all_users)}</code>"
+    )
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# CHANNEL HISTORY
+# ============================================================
+
+async def channels_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    text = (
+        f"<b><tg-emoji emoji-id='{EMOJI_CHANNEL}'>📺</tg-emoji> "
+        f"CHANNEL GIVEAWAY HISTORY</b>\n\n"
+    )
+
+    text += (
+        "<b>🟢 ACTIVE GIVEAWAYS</b>\n"
+        "<code>─────────────────</code>\n"
+    )
+
+    active_found = False
+
+    for ch_key, ch_data in channel_history.items():
+
+        active_giveaways = [
+            g
+            for g in ch_data.get(
+                "giveaways",
+                [],
+            )
+            if g.get("status") == "active"
+        ]
+
+        if active_giveaways:
+
+            active_found = True
+
+            text += (
+                f"\n<b>📢 "
+                f"{safe_html(ch_data.get('channel_display', 'Unknown'))}"
+                f"</b>\n"
+            )
+
+            text += (
+                f"   🔍 Type: "
+                f"<code>"
+                f"{safe_html(ch_data.get('type', 'unknown')).upper()}"
+                f"</code>\n"
+            )
+
+            text += (
+                f"   🆔 ID: "
+                f"<code>{ch_data.get('channel_id', 'N/A')}</code>\n"
+            )
+
+            text += (
+                f"   👤 Owner: "
+                f"{safe_html(ch_data.get('created_by_name', 'Unknown'))}\n"
+            )
+
+            for g in active_giveaways:
+
+                text += (
+                    f"      • ID: "
+                    f"<code>{g.get('giveaway_id', 'N/A')}</code>\n"
+                )
+
+                text += (
+                    f"        📅 Created: "
+                    f"{g.get('created_at', '')[:10]}\n"
+                )
+
+    if not active_found:
+
+        text += "<i>No active giveaways</i>\n"
+
+    text += (
+        "\n<b>🔴 GIVEAWAY HISTORY</b>\n"
+        "<code>─────────────────</code>\n"
+    )
+
+    ended_found = False
+
+    for ch_key, ch_data in list(
+        channel_history.items()
+    )[-10:]:
+
+        ended_giveaways = [
+            g
+            for g in ch_data.get(
+                "giveaways",
+                [],
+            )
+            if g.get("status") == "ended"
+        ]
+
+        if ended_giveaways:
+
+            ended_found = True
+
+            text += (
+                f"\n<b>📢 "
+                f"{safe_html(ch_data.get('channel_display', 'Unknown'))}"
+                f"</b>\n"
+            )
+
+            text += (
+                f"   🔍 Type: "
+                f"<code>"
+                f"{safe_html(ch_data.get('type', 'unknown')).upper()}"
+                f"</code>\n"
+            )
+
+            text += (
+                f"   🆔 ID: "
+                f"<code>{ch_data.get('channel_id', 'N/A')}</code>\n"
+            )
+
+            text += (
+                f"   👤 Owner: "
+                f"{safe_html(ch_data.get('created_by_name', 'Unknown'))}\n"
+            )
+
+            text += (
+                f"   🎁 Total: "
+                f"<code>{ch_data.get('total_giveaways', 0)}</code> "
+                f"giveaways\n"
+            )
+
+    if not ended_found:
+
+        text += (
+            "<i>No giveaway history yet</i>\n"
+        )
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# BACKUP
+# ============================================================
+
+async def backup_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    success = save_data()
+
+    if success:
+
+        await update.message.reply_text(
+            (
+                f"<b>✅ BACKUP CREATED!</b>\n\n"
+
+                f"<b>💾 File:</b> "
+                f"<code>{safe_html(DATA_FILE)}</code>\n"
+
+                f"<b>👥 Users:</b> "
+                f"<code>{len(all_users)}</code>\n"
+
+                f"<b>🎁 Giveaways:</b> "
+                f"<code>{len(giveaways)}</code>\n"
+
+                f"<b>📺 Channels:</b> "
+                f"<code>{len(channel_history)}</code>\n\n"
+
+                "<i>Data is automatically saved on every change.</i>"
+            ),
+            parse_mode="HTML",
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "❌ Backup failed. Check the bot logs.",
+            parse_mode="HTML",
+        )
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+async def settings_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    await update.message.reply_text(
+        (
+            f"<b><tg-emoji emoji-id='{EMOJI_SETTINGS}'>⚙️</tg-emoji> "
+            f"SETTINGS</b>\n\n"
+
+            f"<b>Bot Username:</b> "
+            f"@{safe_html(BOT_USERNAME)}\n"
+
+            f"<b>Owner ID:</b> "
+            f"<code>{OWNER_ID}</code>\n"
+
+            f"<b>Data File:</b> "
+            f"<code>{safe_html(DATA_FILE)}</code>\n"
+
+            f"<b>Auto Save:</b> ✅ Enabled\n"
+            f"<b>User Tracking:</b> ✅ Enabled\n"
+            f"<b>Channel History:</b> ✅ Enabled\n"
+            f"<b>Auto Vote Update:</b> ✅ Enabled\n\n"
+
+            "<i>Settings are managed via bot configuration.</i>"
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# TEST NOTIFICATION
+# ============================================================
+
+async def testnotify_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    await send_notification_to_owner(
+        context,
+        "🔔 TEST NOTIFICATION",
+        (
+            "This is a test notification from your bot!\n\n"
+            "All systems working fine."
+        ),
+    )
+
+    await update.message.reply_text(
+        "✅ Test notification sent to owner!",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# CLEAR DATABASE
+# ============================================================
+
+async def clear_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ You are not the owner!"
+        )
+
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                premium_button(
+                    "✅ CONFIRM CLEAR",
+                    callback_data="confirm_clear",
+                    emoji_id=EMOJI_CLEAR,
+                    style=BUTTON_STYLE_DANGER,
+                ),
+                premium_button(
+                    "❌ CANCEL",
+                    callback_data="main_menu",
+                    emoji_id=EMOJI_CANCEL,
+                    style=BUTTON_STYLE_PRIMARY,
+                ),
+            ]
+        ]
+    )
+
+    await update.message.reply_text(
+        (
+            f"<b><tg-emoji emoji-id='{EMOJI_ALERT}'>⚠️</tg-emoji> "
+            f"DANGER ZONE</b>\n\n"
+
+            f"Are you sure you want to clear ALL data?\n\n"
+
+            f"This will delete:\n"
+            f"• <code>{len(all_users)}</code> users\n"
+            f"• <code>{len(giveaways)}</code> giveaways\n"
+            f"• <code>{len(channel_history)}</code> channel histories\n\n"
+
+            f"<b>This action cannot be undone!</b>"
+        ),
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def confirm_clear_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    global giveaways
+    global all_users
+    global channel_history
+    global vote_messages
+    global user_sessions
+    global admin_sessions
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    if not is_owner(user_id):
+
+        await query.edit_message_text(
+            "❌ You are not the owner!",
+            parse_mode="HTML",
+        )
+
+        return
+
+    giveaways = {}
+    all_users = {}
+    channel_history = {}
+
+    vote_messages = {}
+    user_sessions = {}
+    admin_sessions = {}
+
+    # Also clear the current Telegram context data.
+    context.user_data.clear()
+
+    save_data()
+
+    await query.edit_message_text(
+        (
+            "✅ <b>All data cleared successfully!</b>\n\n"
+            "Bot data has been reset."
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# BROADCAST SESSION
+# ============================================================
+
+async def process_broadcast(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    if not update.message:
+        return
+
+    user_id = update.effective_user.id
+
+    if (
+        user_id != OWNER_ID
+        or admin_sessions.get(
+            OWNER_ID,
+            {},
+        ).get("step")
+        != "waiting_broadcast"
+    ):
+        return
+
+    if update.message.text.strip().lower() == "/cancel":
+
+        admin_sessions.pop(
+            OWNER_ID,
+            None,
+        )
+
+        await update.message.reply_text(
+            "❌ Broadcast cancelled!",
+            parse_mode="HTML",
+        )
+
+        return
+
+    msg = update.message.text
+
+    await update.message.reply_text(
+        (
+            f"🚀 <b>Broadcast started!</b>\n\n"
+            f"Total users: <code>{len(all_users)}</code>\n"
+            f"This may take some time..."
+        ),
+        parse_mode="HTML",
+    )
+
+    success = 0
+    fail = 0
+
+    for uid in list(all_users.keys()):
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=int(uid),
+                text=msg,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+
+            success += 1
+
+        except Exception:
+
+            fail += 1
+
+        await asyncio.sleep(0.05)
+
+    admin_sessions.pop(
+        OWNER_ID,
+        None,
+    )
+
+    await update.message.reply_text(
+        (
+            f"<b>✅ BROADCAST COMPLETED!</b>\n\n"
+
+            f"<b>✅ Sent:</b> "
+            f"<code>{success}</code>\n"
+
+            f"<b>❌ Failed:</b> "
+            f"<code>{fail}</code>\n"
+
+            f"<b>📊 Total:</b> "
+            f"<code>{len(all_users)}</code>"
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# MAIN MENU
+# ============================================================
+
+async def main_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    await query.edit_message_text(
+        text="<b>🌐 MAIN MENU</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+# ============================================================
+# CALLBACK ROUTER
+# ============================================================
+
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    data = query.data or ""
+
+    logger.info(
+        "Button pressed by %s: %s",
+        query.from_user.id,
+        data,
+    )
+
+    try:
+
+        if data == "confirm_clear":
+
+            await confirm_clear_callback(
+                update,
+                context,
+            )
+
+        elif data == "create_giveaway":
+
+            await create_giveaway_flow(
+                update,
+                context,
+            )
+
+        elif data == "cancel_creation":
+
+            await cancel_creation(
+                update,
+                context,
+            )
+
+        elif data == "my_giveaways":
+
+            await my_giveaways(
+                update,
+                context,
+            )
+
+        elif data == "main_menu":
+
+            await main_menu(
+                update,
+                context,
+            )
+
+        elif data.startswith("retry_join_"):
+
+            await retry_join(
+                update,
+                context,
+            )
+
+        elif data.startswith("manage_"):
+
+            await manage_giveaway(
+                update,
+                context,
+            )
+
+        elif data.startswith("addvotes_"):
+
+            await add_votes_flow(
+                update,
+                context,
+            )
+
+        elif data.startswith("removevotes_"):
+
+            await remove_votes_flow(
+                update,
+                context,
+            )
+
+        elif data.startswith("leaderboard_"):
+
+            await show_leaderboard(
+                update,
+                context,
+            )
+
+        elif data.startswith("endgiveaway_"):
+
+            await end_giveaway(
+                update,
+                context,
+            )
+
+        elif data.startswith("confirm_end_"):
+
+            await confirm_end_giveaway(
+                update,
+                context,
+            )
+
+        elif data.startswith("join_"):
+
+            await handle_join(
+                update,
+                context,
+            )
+
+        elif data.startswith("vote_"):
+
+            await handle_vote(
+                update,
+                context,
+            )
+
+        else:
+
+            await query.answer(
+                "Unknown button.",
+                show_alert=True,
+            )
+
+    except Exception as e:
+
+        logger.exception(
+            "Callback error for %s: %s",
+            data,
+            e,
+        )
+
+        try:
+
+            await query.answer(
+                "⚠️ Something went wrong.",
+                show_alert=True,
+            )
+
+        except Exception:
+            pass
+
+
+# ============================================================
+# TEXT MESSAGE ROUTER
+# ============================================================
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    if not update.effective_user or not update.message:
+        return
+
+    user_id = update.effective_user.id
+
+    # Owner broadcast session
+    if (
+        user_id == OWNER_ID
+        and admin_sessions.get(
+            OWNER_ID,
+            {},
+        ).get("step")
+        == "waiting_broadcast"
+    ):
+
+        await process_broadcast(
+            update,
+            context,
+        )
+
+        return
+
+    # Giveaway creation session
+    if (
+        user_id in user_sessions
+        and user_sessions[user_id].get("step")
+        == "waiting_channel"
+    ):
+
+        await process_channel(
+            update,
+            context,
+        )
+
+        return
+
+    # Vote modification session
+    if "vote_giveaway" in context.user_data:
+
+        await process_vote_change(
+            update,
+            context,
+        )
+
+        return
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    logger.exception(
+        "Unhandled bot error: %s",
+        context.error,
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+
+    if not TOKEN:
+
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing."
+        )
+
+    if not OWNER_ID:
+
+        raise RuntimeError(
+            "OWNER_ID environment variable is missing or invalid."
+        )
+
+    load_data()
+
+    request = HTTPXRequest(
+        connect_timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=30,
+    )
+
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .request(request)
+        .build()
+    )
+
+    # --------------------------------------------------------
+    # USER COMMANDS
+    # --------------------------------------------------------
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
+
+    # --------------------------------------------------------
+    # ADMIN COMMANDS
+    # --------------------------------------------------------
+
+    app.add_handler(
+        CommandHandler(
+            "admin",
+            admin_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "broadcast",
+            broadcast_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "bc",
+            bc_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "ball",
+            ball_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "stats",
+            stats_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "users",
+            users_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "channels",
+            channels_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "backup",
+            backup_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "settings",
+            settings_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "testnotify",
+            testnotify_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "clear",
+            clear_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "g_management",
+            g_management_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "add_vote",
+            add_vote_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "remove_vote",
+            remove_vote_command,
+        )
+    )
+
+    # --------------------------------------------------------
+    # CALLBACKS
+    # --------------------------------------------------------
+
+    app.add_handler(
+        CallbackQueryHandler(
+            button_handler
+        )
+    )
+
+    # --------------------------------------------------------
+    # TEXT
+    # --------------------------------------------------------
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message,
+        )
+    )
+
+    # --------------------------------------------------------
+    # ERROR HANDLER
+    # --------------------------------------------------------
+
+    app.add_error_handler(
+        error_handler
+    )
+
+    # --------------------------------------------------------
+    # STARTUP LOG
+    # --------------------------------------------------------
+
+    print("=" * 60)
+    print("🤖 PREMIUM VOTE-GIVEAWAY BOT IS ACTIVE!")
+    print(f"📌 Bot Username: @{BOT_USERNAME}")
+    print(f"👑 Owner ID: {OWNER_ID}")
+    print(f"💾 Data File: {DATA_FILE}")
+    print("=" * 60)
+
+    print("\n✅ ADMIN COMMANDS:")
+    print("   /admin - Show all admin commands")
+    print("   /broadcast <msg> - Send to all users")
+    print("   /bc <msg> - Send to all channels")
+    print("   /ball <msg> - Send to all users + all channels")
+    print("   /stats - Bot statistics")
+    print("   /users - Recent users list")
+    print("   /channels - Channel history")
+    print("   /backup - Manual backup")
+    print("   /settings - Bot settings")
+    print("   /testnotify - Test notification")
+    print("   /clear - Delete all data")
+    print("   /g_management <id> - Open giveaway panel")
+    print("   /add_vote <id> <user_id> <votes> - Add votes")
+    print("   /remove_vote <id> <user_id> <votes> - Remove votes")
+
+    print("=" * 60)
+
+    print("\n✅ CHANNEL MEMBERSHIP SYSTEM:")
+    print("   • Checks membership before joining")
+    print("   • Shows JOIN CHANNEL button if not a member")
+    print("   • Shows TRY AGAIN button to re-check")
+    print("   • Supports member/administrator/creator/restricted")
+
+    print("=" * 60)
+
+    app.run_polling(
+        allowed_updates=[
+            "message",
+            "callback_query",
+        ]
+    )
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
