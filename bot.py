@@ -417,7 +417,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     welcome_text = (
-        f"<b><tg-emoji emoji-id='{EMOJI_WELCOME}'>🙂</tg-emoji> WELCOME TO NURROSUL VOTE GIVEAWAY BOT</b>\n\n"
+        f"<b><tg-emoji emoji-id='{EMOJI_WELCOME}'>🙂</tg-emoji> WELCOME TO HUH VOTE GIVEAWAY BOT</b>\n\n"
         f"<i><tg-emoji emoji-id='{EMOJI_FIRE}'>☄️</tg-emoji> Create Powerful Vote Giveaways</i>\n"
         f"<i><tg-emoji emoji-id='{EMOJI_ARROW}'>🔜</tg-emoji> Real Time Vote System</i>\n"
         f"<i><tg-emoji emoji-id='{EMOJI_CHART}'>📈</tg-emoji> Advanced Management Tools</i>\n"
